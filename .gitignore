@@ -1,0 +1,19 @@
+# macOS / shell
+.DS_Store
+.Rhistory
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Virtual envs
+.venv/
+venv/
+
+# Local app state
+.agenttrader/
