@@ -1,0 +1,10 @@
+include README.md
+include CHANGELOG.md
+include LICENSE
+include pyproject.toml
+include alembic.ini
+include agenttrader/db/alembic.ini
+recursive-include alembic *.py *.mako
+recursive-include agenttrader/dashboard/static *
+recursive-include agenttrader/db/migrations *.py
+recursive-include agenttrader/db/migrations/versions *.py

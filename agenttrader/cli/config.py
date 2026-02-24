@@ -1,8 +1,10 @@
 # DO NOT import dome_api_sdk here. Use agenttrader.data.dome_client only.
 from __future__ import annotations
 
-import subprocess
+from pathlib import Path
 
+from alembic import command as alembic_command
+from alembic.config import Config
 import click
 import yaml
 
@@ -13,18 +15,29 @@ from agenttrader.cli.utils import ensure_initialized, json_errors
 @click.command("init")
 @json_errors
 def init_cmd() -> None:
+    """Initialize ~/.agenttrader/ directory and database."""
     ensure_app_dir()
     if not CONFIG_PATH.exists():
         write_default_config()
     elif not CONFIG_PATH.read_text(encoding="utf-8").strip():
         write_default_config()
 
-    # Run migrations through Alembic.
-    subprocess.run(["alembic", "upgrade", "head"], check=True)
+    # Run Alembic migrations programmatically from package-local alembic.ini.
+    package_dir = Path(__file__).resolve().parent.parent
+    alembic_ini = package_dir / "db" / "alembic.ini"
+    if not alembic_ini.exists():
+        raise click.ClickException(f"Packaged alembic.ini not found at: {alembic_ini}")
+
+    db_path = APP_DIR / "db.sqlite"
+    alembic_cfg = Config(str(alembic_ini))
+    alembic_cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    alembic_command.upgrade(alembic_cfg, "head")
 
     # Ensure db file exists even if alembic wasn't available.
     DB_PATH.touch(exist_ok=True)
     click.echo(f"Initialized {APP_DIR}/")
+    click.echo(f"Database: {db_path}")
+    click.echo("Next step: agenttrader config set dome_api_key <YOUR_KEY>")
 
 
 @click.group("config")

@@ -4,11 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agenttrader"
-version = "0.1.0"
+version = "0.1.1"
 description = "Prediction market strategy research, backtesting, and paper trading toolkit"
-readme = "README.md"
+readme = { file = "README.md", content-type = "text/markdown" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
-authors = [{ name = "agenttrader" }]
+authors = [{ name = "Finn Fujimura" }]
+keywords = [
+  "trading",
+  "prediction-markets",
+  "polymarket",
+  "kalshi",
+  "backtesting",
+  "mcp",
+  "agents",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Office/Business :: Financial :: Investment",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
   "dome-api-sdk>=1.0.0",
   "click>=8.1",
@@ -35,6 +55,11 @@ dev = [
   "mypy>=1.10",
 ]
 
+[project.urls]
+Homepage = "https://github.com/finnfujimura/agenttrader"
+Repository = "https://github.com/finnfujimura/agenttrader"
+Issues = "https://github.com/finnfujimura/agenttrader/issues"
+
 [project.scripts]
 agenttrader = "agenttrader.cli.main:cli"
 
@@ -45,4 +70,10 @@ include-package-data = true
 include = ["agenttrader*"]
 
 [tool.setuptools.package-data]
-agenttrader = ["dashboard/static/*"]
+agenttrader = [
+  "db/alembic.ini",
+  "db/migrations/*.py",
+  "db/migrations/versions/*.py",
+  "dashboard/static/*",
+  "dashboard/static/**/*",
+]
