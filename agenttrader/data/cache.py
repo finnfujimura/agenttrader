@@ -44,18 +44,27 @@ class DataCache:
             )
 
     def upsert_price_point(self, market_id: str, platform: str, point: PricePoint) -> None:
-        payload = {
-            "market_id": market_id,
-            "platform": platform,
-            "timestamp": point.timestamp,
-            "yes_price": point.yes_price,
-            "no_price": point.no_price,
-            "volume": point.volume,
-        }
-        stmt = insert(PriceHistory).values(**payload)
-        stmt = stmt.on_conflict_do_nothing(index_elements=[PriceHistory.market_id, PriceHistory.timestamp])
+        self.upsert_price_points_batch(market_id, platform, [point])
+
+    def upsert_price_points_batch(self, market_id: str, platform: str, points: list[PricePoint]) -> None:
+        if not points:
+            return
+        rows = [
+            {
+                "market_id": market_id,
+                "platform": platform,
+                "timestamp": p.timestamp,
+                "yes_price": p.yes_price,
+                "no_price": p.no_price,
+                "volume": p.volume,
+            }
+            for p in points
+        ]
         with self._engine.begin() as conn:
-            conn.execute(stmt)
+            for row in rows:
+                stmt = insert(PriceHistory).values(**row)
+                stmt = stmt.on_conflict_do_nothing(index_elements=[PriceHistory.market_id, PriceHistory.timestamp])
+                conn.execute(stmt)
 
     def get_markets(
         self,
@@ -131,7 +140,39 @@ class DataCache:
             return None
         return self._to_price_point(row)
 
-    def list_backtest_runs(self, limit: int = 100) -> list[BacktestRun]:
+    def list_backtest_runs(self, limit: int = 100, lightweight: bool = False) -> list[BacktestRun]:
+        if lightweight:
+            cols = [
+                BacktestRun.id,
+                BacktestRun.strategy_path,
+                BacktestRun.strategy_hash,
+                BacktestRun.start_date,
+                BacktestRun.end_date,
+                BacktestRun.initial_cash,
+                BacktestRun.status,
+                BacktestRun.error,
+                BacktestRun.created_at,
+                BacktestRun.completed_at,
+            ]
+            q = select(*cols).order_by(BacktestRun.created_at.desc()).limit(limit)
+            with get_session(self._engine) as session:
+                rows = session.execute(q).all()
+            result = []
+            for row in rows:
+                obj = BacktestRun()
+                obj.id = row.id
+                obj.strategy_path = row.strategy_path
+                obj.strategy_hash = row.strategy_hash
+                obj.start_date = row.start_date
+                obj.end_date = row.end_date
+                obj.initial_cash = row.initial_cash
+                obj.status = row.status
+                obj.error = row.error
+                obj.results_json = None
+                obj.created_at = row.created_at
+                obj.completed_at = row.completed_at
+                result.append(obj)
+            return result
         q = select(BacktestRun).order_by(BacktestRun.created_at.desc()).limit(limit)
         with get_session(self._engine) as session:
             return list(session.scalars(q).all())

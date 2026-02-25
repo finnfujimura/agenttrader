@@ -82,8 +82,7 @@ def sync_cmd(
                 end_time=end_ts,
                 interval=interval_map[granularity],
             )
-            for p in candles:
-                cache.upsert_price_point(market.id, market.platform.value, p)
+            cache.upsert_price_points_batch(market.id, market.platform.value, candles)
             price_points_fetched += len(candles)
 
             orderbooks = client.get_orderbook_snapshots(

@@ -51,8 +51,8 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(name="get_price", description="Get latest cached price", inputSchema={"type": "object", "properties": {"market_id": {"type": "string"}}, "required": ["market_id"]}),
         types.Tool(name="get_history", description="Get cached price history", inputSchema={"type": "object", "properties": {"market_id": {"type": "string"}, "days": {"type": "integer", "default": 7}}, "required": ["market_id"]}),
         types.Tool(name="match_markets", description="Match markets across platforms", inputSchema={"type": "object", "properties": {"polymarket_slug": {"type": "string"}, "kalshi_ticker": {"type": "string"}}}),
-        types.Tool(name="run_backtest", description="Run a strategy backtest", inputSchema={"type": "object", "properties": {"strategy_path": {"type": "string"}, "start_date": {"type": "string"}, "end_date": {"type": "string"}, "initial_cash": {"type": "number", "default": 10000}}, "required": ["strategy_path", "start_date", "end_date"]}),
-        types.Tool(name="get_backtest", description="Get backtest by run id", inputSchema={"type": "object", "properties": {"run_id": {"type": "string"},}, "required": ["run_id"]}),
+        types.Tool(name="run_backtest", description="Run a strategy backtest. Returns metrics only by default. Set include_curve=true to also return the full equity curve and trades array.", inputSchema={"type": "object", "properties": {"strategy_path": {"type": "string"}, "start_date": {"type": "string"}, "end_date": {"type": "string"}, "initial_cash": {"type": "number", "default": 10000}, "include_curve": {"type": "boolean", "default": False, "description": "If true, include full equity_curve and trades arrays in response"}}, "required": ["strategy_path", "start_date", "end_date"]}),
+        types.Tool(name="get_backtest", description="Get backtest by run id. Returns metrics only by default. Set include_curve=true to also return the full equity curve and trades array.", inputSchema={"type": "object", "properties": {"run_id": {"type": "string"}, "include_curve": {"type": "boolean", "default": False, "description": "If true, include full equity_curve and trades arrays in response"}}, "required": ["run_id"]}),
         types.Tool(name="list_backtests", description="List recent backtest runs", inputSchema={"type": "object", "properties": {}}),
         types.Tool(name="validate_strategy", description="Validate strategy file", inputSchema={"type": "object", "properties": {"strategy_path": {"type": "string"}}, "required": ["strategy_path"]}),
         types.Tool(name="start_paper_trade", description="Start paper trading daemon", inputSchema={"type": "object", "properties": {"strategy_path": {"type": "string"}, "initial_cash": {"type": "number", "default": 10000}}, "required": ["strategy_path"]}),
@@ -152,16 +152,25 @@ async def call_tool(name: str, arguments: dict):
                 row.completed_at = int(datetime.now(tz=UTC).timestamp())
                 session.commit()
 
+        if not args.get("include_curve", False):
+            result.pop("equity_curve", None)
+            result.pop("trades", None)
         return _text(result)
 
     if name == "get_backtest":
         row = cache.get_backtest_run(args["run_id"])
         if not row:
             return _text({"ok": False, "error": "NotFound", "message": "run not found"})
-        return _text(json.loads(row.results_json) if row.results_json else {"ok": True, "status": row.status})
+        if row.results_json:
+            data = json.loads(row.results_json)
+            if not args.get("include_curve", False):
+                data.pop("equity_curve", None)
+                data.pop("trades", None)
+            return _text(data)
+        return _text({"ok": True, "status": row.status})
 
     if name == "list_backtests":
-        rows = cache.list_backtest_runs(limit=100)
+        rows = cache.list_backtest_runs(limit=100, lightweight=True)
         return _text({"ok": True, "runs": [{"id": r.id, "status": r.status, "strategy_path": r.strategy_path} for r in rows]})
 
     if name == "start_paper_trade":
@@ -273,8 +282,7 @@ async def call_tool(name: str, arguments: dict):
         for m in markets:
             cache.upsert_market(m)
             candles = client.get_candlesticks(m.condition_id, m.platform, start_ts, end_ts, 60)
-            for p in candles:
-                cache.upsert_price_point(m.id, m.platform.value, p)
+            cache.upsert_price_points_batch(m.id, m.platform.value, candles)
             pp += len(candles)
             ob = client.get_orderbook_snapshots(m.id, m.platform, start_ts, end_ts, 100)
             ob_files += ob_store.write(m.platform.value, m.id, ob)
