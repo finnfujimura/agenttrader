@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -110,6 +111,8 @@ class BacktestEngine:
 
         raw = context.compile_results()
         metrics = self._compute_metrics(raw["equity_curve"], raw["trades"])
+        resolution_accuracy = self._compute_resolution_accuracy(raw["trades"])
+        by_category = self._compute_by_category(raw["trades"], markets_by_id, config.initial_cash)
         return {
             "ok": True,
             "strategy_path": config.strategy_path,
@@ -118,6 +121,8 @@ class BacktestEngine:
             "initial_cash": config.initial_cash,
             "final_value": raw["final_value"],
             "metrics": metrics,
+            "resolution_accuracy": resolution_accuracy,
+            "by_category": by_category,
             "equity_curve": raw["equity_curve"],
             "trades": raw["trades"],
         }
@@ -185,3 +190,62 @@ class BacktestEngine:
             "total_trades": len(trades),
             "avg_slippage": round(float(np.mean(slippage)) if slippage else 0.0, 6),
         }
+
+    def _compute_resolution_accuracy(self, trades: list[dict]) -> dict:
+        bought_yes = [
+            t
+            for t in trades
+            if t.get("action") == "buy"
+            and str(t.get("side", "")).lower() == "yes"
+            and t.get("resolved_correctly") is not None
+        ]
+        bought_no = [
+            t
+            for t in trades
+            if t.get("action") == "buy"
+            and str(t.get("side", "")).lower() == "no"
+            and t.get("resolved_correctly") is not None
+        ]
+
+        sample_size = len(bought_yes) + len(bought_no)
+        if sample_size == 0:
+            return {
+                "bought_yes_resolved_yes_pct": None,
+                "bought_no_resolved_no_pct": None,
+                "sample_size": None,
+                "note": "No markets resolved in this date range. Use --resolved flag when syncing to increase sample.",
+            }
+
+        yes_correct = sum(1 for t in bought_yes if t.get("resolved_correctly") is True)
+        no_correct = sum(1 for t in bought_no if t.get("resolved_correctly") is True)
+        return {
+            "bought_yes_resolved_yes_pct": round(yes_correct / len(bought_yes), 3) if bought_yes else None,
+            "bought_no_resolved_no_pct": round(no_correct / len(bought_no), 3) if bought_no else None,
+            "sample_size": sample_size,
+        }
+
+    def _compute_by_category(self, trades: list[dict], markets: dict[str, Market], initial_cash: float) -> dict:
+        buckets = defaultdict(lambda: {"trades": 0, "wins": 0, "pnl": 0.0})
+
+        for trade in trades:
+            if trade.get("action") not in {"sell", "resolution"}:
+                continue
+            pnl = float(trade.get("pnl") or 0.0)
+            market = markets.get(str(trade.get("market_id", "")))
+            category = (market.category if market is not None else "") or "unknown"
+
+            buckets[category]["trades"] += 1
+            if pnl > 0:
+                buckets[category]["wins"] += 1
+            buckets[category]["pnl"] += pnl
+
+        result: dict[str, dict] = {}
+        for category in sorted(buckets.keys()):
+            data = buckets[category]
+            trade_count = data["trades"]
+            result[category] = {
+                "trades": trade_count,
+                "win_rate": round(data["wins"] / trade_count, 3) if trade_count > 0 else None,
+                "return_pct": round((data["pnl"] / initial_cash) * 100.0, 2) if initial_cash > 0 else None,
+            }
+        return result

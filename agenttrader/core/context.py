@@ -203,6 +203,7 @@ class BacktestContext(ExecutionContext):
                 "slippage": fill.slippage,
                 "filled_at": self._current_ts,
                 "pnl": None,
+                "resolved_correctly": None,
             }
         )
         self._slippage_samples.append(fill.slippage)
@@ -274,6 +275,17 @@ class BacktestContext(ExecutionContext):
         payout_price = 1.0 if outcome == pos.side else 0.0
         pnl = pos.contracts * (payout_price - pos.avg_cost)
         self._cash += pos.contracts * payout_price
+        resolved_correctly = pnl > 0
+        for trade in self._trades:
+            if trade.get("action") != "buy":
+                continue
+            if trade.get("market_id") != market_id:
+                continue
+            if trade.get("side") != pos.side:
+                continue
+            if trade.get("resolved_correctly") is None:
+                trade["resolved_correctly"] = resolved_correctly
+
         trade_id = str(uuid.uuid4())
         self._trades.append(
             {

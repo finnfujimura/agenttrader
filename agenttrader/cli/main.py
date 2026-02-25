@@ -8,6 +8,7 @@ import click
 from agenttrader.cli.backtest import backtest_cmd
 from agenttrader.cli.config import config_group, init_cmd
 from agenttrader.cli.dashboard import dashboard_cmd
+from agenttrader.cli.experiments import experiments_group
 from agenttrader.cli.markets import markets_group
 from agenttrader.cli.paper import paper_group
 from agenttrader.cli.prune import prune_cmd
@@ -35,6 +36,7 @@ cli.add_command(markets_group)
 cli.add_command(validate_cmd)
 cli.add_command(backtest_cmd)
 cli.add_command(paper_group)
+cli.add_command(experiments_group)
 cli.add_command(dashboard_cmd)
 cli.add_command(prune_cmd)
 

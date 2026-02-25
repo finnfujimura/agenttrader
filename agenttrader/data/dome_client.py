@@ -25,53 +25,66 @@ class DomeClient:
         category: str | None = None,
         tags: list[str] | None = None,
         market_ids: list[str] | None = None,
+        resolved: bool = False,
         min_volume: float | None = None,
         limit: int = 100,
     ) -> list[Market]:
-        results: list[Market] = []
+        results_by_id: dict[str, Market] = {}
+        wanted_tags = {t.lower() for t in tags} if tags else None
 
         if platform in ("all", "polymarket"):
-            params: dict[str, Any] = {"status": "open", "limit": limit}
-            if tags:
-                params["tags"] = tags
-            if min_volume is not None:
-                params["min_volume"] = min_volume
-            if market_ids and len(market_ids) == 1:
-                params["token_id"] = market_ids[0]
+            statuses = ["closed"] if resolved else ["open"]
+            for status in statuses:
+                params: dict[str, Any] = {"status": status, "limit": limit}
+                if tags:
+                    params["tags"] = tags
+                if min_volume is not None:
+                    params["min_volume"] = min_volume
+                if market_ids and len(market_ids) == 1:
+                    params["token_id"] = market_ids[0]
 
-            poly_markets = self._fetch_paginated(
-                self._sdk.polymarket.markets.get_markets,
-                params,
-                items_attr="markets",
-                max_items=limit,
-            )
-            for item in poly_markets:
-                market = self._to_market(item, Platform.POLYMARKET)
-                if category and market.category != category:
-                    continue
-                results.append(market)
+                poly_markets = self._fetch_paginated(
+                    self._sdk.polymarket.markets.get_markets,
+                    params,
+                    items_attr="markets",
+                    max_items=limit,
+                )
+                for item in poly_markets:
+                    market = self._to_market(item, Platform.POLYMARKET)
+                    if resolved and not market.resolved:
+                        continue
+                    if category and not self._matches_category(market, category):
+                        continue
+                    if wanted_tags and not wanted_tags.issubset({t.lower() for t in market.tags}):
+                        continue
+                    results_by_id[market.id] = market
 
         if platform in ("all", "kalshi"):
-            params = {"status": "open", "limit": limit}
-            if min_volume is not None:
-                params["min_volume"] = min_volume
-            if market_ids and len(market_ids) == 1:
-                params["market_ticker"] = market_ids[0]
+            statuses = ["finalized"] if resolved else ["open"]
+            for status in statuses:
+                params = {"status": status, "limit": limit}
+                if min_volume is not None:
+                    params["min_volume"] = min_volume
+                if market_ids and len(market_ids) == 1:
+                    params["market_ticker"] = market_ids[0]
 
-            kalshi_markets = self._fetch_paginated(
-                self._sdk.kalshi.markets.get_markets,
-                params,
-                items_attr="markets",
-                max_items=limit,
-            )
-            for item in kalshi_markets:
-                market = self._to_market(item, Platform.KALSHI)
-                if category and market.category != category:
-                    continue
-                if tags and not set(t.lower() for t in tags).issubset({t.lower() for t in market.tags}):
-                    continue
-                results.append(market)
+                kalshi_markets = self._fetch_paginated(
+                    self._sdk.kalshi.markets.get_markets,
+                    params,
+                    items_attr="markets",
+                    max_items=limit,
+                )
+                for item in kalshi_markets:
+                    market = self._to_market(item, Platform.KALSHI)
+                    if resolved and not market.resolved:
+                        continue
+                    if category and not self._matches_category(market, category):
+                        continue
+                    if wanted_tags and not wanted_tags.issubset({t.lower() for t in market.tags}):
+                        continue
+                    results_by_id[market.id] = market
 
+        results = sorted(results_by_id.values(), key=lambda m: m.volume, reverse=True)
         if market_ids:
             wanted = set(market_ids)
             results = [m for m in results if m.id in wanted]
@@ -353,11 +366,12 @@ class DomeClient:
         return out
 
     def _to_market(self, item: Any, platform: Platform) -> Market:
+        status = str(getattr(item, "status", "open")).lower()
+        resolved = self._is_resolved_status(platform, status)
         if platform == Platform.POLYMARKET:
             tags = [str(t) for t in (getattr(item, "tags", []) or [])]
             category = tags[0].lower() if tags else ""
-            winning_side = getattr(item, "winning_side", None)
-            resolution = getattr(winning_side, "label", None)
+            resolution = self._extract_resolution(item, platform)
             market_id = str(getattr(getattr(item, "side_a", None), "id", getattr(item, "market_slug", "")))
             return Market(
                 id=market_id,
@@ -369,8 +383,8 @@ class DomeClient:
                 market_type=MarketType.BINARY,
                 volume=float(getattr(item, "volume_total", 0.0) or 0.0),
                 close_time=int(getattr(item, "close_time", None) or getattr(item, "end_time", 0) or 0),
-                resolved=str(getattr(item, "status", "open")).lower() != "open",
-                resolution=str(resolution).lower() if resolution is not None else None,
+                resolved=resolved,
+                resolution=resolution,
                 scalar_low=None,
                 scalar_high=None,
             )
@@ -386,11 +400,47 @@ class DomeClient:
             market_type=MarketType.BINARY,
             volume=float(getattr(item, "volume", 0.0) or 0.0),
             close_time=int(getattr(item, "close_time", None) or getattr(item, "end_time", 0) or 0),
-            resolved=str(getattr(item, "status", "open")).lower() != "open",
-            resolution=(str(getattr(item, "result", "")).lower() if getattr(item, "result", None) is not None else None),
+            resolved=resolved,
+            resolution=self._extract_resolution(item, platform),
             scalar_low=None,
             scalar_high=None,
         )
+
+    @staticmethod
+    def _is_resolved_status(platform: Platform, status: str) -> bool:
+        status = str(status or "").lower()
+        if platform == Platform.POLYMARKET:
+            return status in {"resolved", "closed", "settled", "finalized"}
+        return status in {"finalized", "resolved", "settled", "closed"}
+
+    @staticmethod
+    def _extract_resolution(item: Any, platform: Platform) -> str | None:
+        if platform == Platform.POLYMARKET:
+            winning_side = getattr(item, "winning_side", None)
+            if winning_side is not None:
+                label = getattr(winning_side, "label", None)
+                if label is not None:
+                    return str(label).lower()
+            for attr in ("result", "resolution", "winning_outcome", "outcome"):
+                value = getattr(item, attr, None)
+                if value is not None and str(value).strip() != "":
+                    return str(value).lower()
+            return None
+
+        for attr in ("result", "resolution", "winning_outcome", "outcome"):
+            value = getattr(item, attr, None)
+            if value is not None and str(value).strip() != "":
+                return str(value).lower()
+        return None
+
+    @staticmethod
+    def _matches_category(market: Market, category: str) -> bool:
+        wanted = str(category).strip().lower()
+        if not wanted:
+            return True
+        if str(market.category or "").lower() == wanted:
+            return True
+        return wanted in {str(tag).lower() for tag in market.tags}
 
     @staticmethod
     def _to_dict(value: Any) -> dict[str, Any]:

@@ -7,11 +7,13 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import and_, select
 
 from agenttrader import __version__
 from agenttrader.config import DB_PATH
 from agenttrader.data.cache import DataCache
-from agenttrader.db import get_engine
+from agenttrader.db import get_engine, get_session
+from agenttrader.db.schema import Trade
 
 
 app = FastAPI(title="agenttrader dashboard")
@@ -20,6 +22,44 @@ static_dir = Path(__file__).resolve().parent / "static"
 
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+
+def _portfolio_stats(portfolio):
+    open_positions = cache.get_open_positions(portfolio.id)
+    mtm = 0.0
+    for pos in open_positions:
+        latest = cache.get_latest_price(pos.market_id)
+        if latest is None:
+            mark = float(pos.avg_cost)
+        elif str(pos.side).lower() == "no":
+            mark = float(latest.no_price) if latest.no_price is not None else (1.0 - float(latest.yes_price))
+        else:
+            mark = float(latest.yes_price)
+        mtm += float(pos.contracts) * mark
+
+    portfolio_value = float(portfolio.cash_balance) + mtm
+    unrealized_pnl = portfolio_value - float(portfolio.initial_cash)
+    unrealized_pnl_pct = (unrealized_pnl / float(portfolio.initial_cash) * 100.0) if float(portfolio.initial_cash) else 0.0
+
+    with get_session(cache._engine) as session:
+        trades = list(
+            session.scalars(
+                select(Trade).where(and_(Trade.portfolio_id == portfolio.id, Trade.action.in_(["buy", "sell"])))
+            ).all()
+        )
+    sells = [t for t in trades if str(t.action).lower() == "sell"]
+    winning_sells = [t for t in sells if t.pnl is not None and float(t.pnl) > 0.0]
+    avg_pnl = sum(float(t.pnl or 0.0) for t in sells) / len(sells) if sells else 0.0
+
+    return {
+        "portfolio_value": portfolio_value,
+        "unrealized_pnl": unrealized_pnl,
+        "unrealized_pnl_pct": round(unrealized_pnl_pct, 4),
+        "total_trades": len(trades),
+        "win_rate": round((len(winning_sells) / len(sells)), 4) if sells else 0.0,
+        "avg_pnl_per_trade": round(avg_pnl, 4),
+        "open_positions": len(open_positions),
+    }
 
 
 @app.get("/api/status")
@@ -35,7 +75,7 @@ def api_portfolios():
     return {
         "ok": True,
         "portfolios": [
-            {
+            ({
                 "id": p.id,
                 "strategy_path": p.strategy_path,
                 "status": p.status,
@@ -45,7 +85,7 @@ def api_portfolios():
                 "initial_cash": p.initial_cash,
                 "reload_count": p.reload_count or 0,
                 "last_reload": p.last_reload,
-            }
+            } | _portfolio_stats(p))
             for p in portfolios
         ],
     }

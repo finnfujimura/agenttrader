@@ -335,6 +335,7 @@ agenttrader config show
 agenttrader sync                                          # top 100 markets, 90 days
 agenttrader sync --platform polymarket --days 7
 agenttrader sync --platform kalshi --days 7
+agenttrader sync --resolved --days 365 --platform polymarket --json   # resolved/expired markets
 agenttrader sync --markets <id1> --markets <id2>          # specific markets
 agenttrader sync --json
 ```
@@ -347,9 +348,15 @@ agenttrader markets list --platform polymarket --limit 20 --json
 agenttrader markets list --category politics --min-volume 50000
 agenttrader markets price <market_id> --json
 agenttrader markets history <market_id> --days 30 --json
+agenttrader markets screen --condition "current_price < 0.30" --json
+agenttrader markets screen --condition "price_vs_7d_avg < -0.10" --platform polymarket --limit 20 --json
 agenttrader markets match --polymarket-slug "<slug>"
 agenttrader markets match --kalshi-ticker "<ticker>"
 ```
+
+`markets screen` runs only on local cache data (SQLite) and supports fixed metric expressions:
+
+`price_vs_7d_avg`, `current_price`, `volume`, `days_until_close`, `price_change_24h` with operators `<`, `>`, `<=`, `>=`, `==`.
 
 ### Validate
 
@@ -383,6 +390,15 @@ Backtest results include:
     "avg_slippage": 0.008,
     "total_trades": 47
   },
+  "resolution_accuracy": {
+    "bought_yes_resolved_yes_pct": 0.64,
+    "bought_no_resolved_no_pct": 0.58,
+    "sample_size": 47
+  },
+  "by_category": {
+    "politics": { "trades": 23, "win_rate": 0.65, "return_pct": 18.2 },
+    "sports": { "trades": 14, "win_rate": 0.43, "return_pct": -4.1 }
+  },
   "equity_curve": [...],
   "trades": [...]
 }
@@ -396,11 +412,28 @@ agenttrader paper start ./strategy.py --cash 5000 --json
 agenttrader paper start ./strategy.py --no-daemon --json   # blocking, for testing
 agenttrader paper list --json
 agenttrader paper status <portfolio_id> --json
+agenttrader paper compare <portfolio_id_1> <portfolio_id_2> --json
+agenttrader paper compare --all --json
 agenttrader paper stop <portfolio_id> --json
 agenttrader paper stop --all --json
 ```
 
 **Hot-reload:** edit `strategy.py` while a paper trade is running — the daemon detects the change and reloads automatically. Portfolio state is preserved. No restart needed. `paper status` shows `reload_count` to confirm it happened.
+
+`paper compare` computes side-by-side stats per portfolio from existing SQLite tables (`paper_portfolios`, `positions`, `trades`): portfolio value, unrealized PnL, win rate, avg PnL per sell trade, open positions, and reload count.
+
+### Experiments
+
+```bash
+agenttrader experiments log <backtest_run_id> --note "baseline" --tags "politics,mean-reversion" --json
+agenttrader experiments log --portfolio <portfolio_id> --note "live run snapshot" --json
+agenttrader experiments list --json
+agenttrader experiments note <experiment_id> "updated note" --json
+agenttrader experiments show <experiment_id> --json
+agenttrader experiments compare <exp_id_1> <exp_id_2> --json
+```
+
+Experiments are persisted in `~/.agenttrader/experiments.json` and are sorted newest-first in `experiments list`.
 
 ### Dashboard
 
@@ -410,6 +443,14 @@ agenttrader dashboard --port 9090
 ```
 
 Read-only local dashboard showing active paper trades, positions, trade history, strategy logs, and backtest results with equity curves.
+
+Dashboard routes include:
+
+- `#/` overview
+- `#/paper` paper portfolios
+- `#/compare` side-by-side stats for all running paper portfolios
+- `#/backtests` backtest runs
+- `#/markets` cached markets
 
 ### Maintenance
 
@@ -426,6 +467,7 @@ agenttrader prune --older-than 90d --json
 ~/.agenttrader/
 ├── config.yaml        # API key and preferences
 ├── db.sqlite          # markets, backtests, positions, trade ledger
+├── experiments.json   # experiment memory/log for strategy iterations
 └── orderbooks/        # compressed orderbook snapshots by market/day
 ```
 

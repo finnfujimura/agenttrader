@@ -65,6 +65,36 @@ const routes = {
         .join("")}</tbody></table>`;
   },
 
+  async "/compare"() {
+    const data = await fetchJson("/api/portfolios");
+    const rows = (data.portfolios || []).filter((p) => p.status === "running");
+    if (rows.length === 0) {
+      app.innerHTML = "<div class='card'>No running portfolios to compare.</div>";
+      return;
+    }
+
+    app.innerHTML = `<table><thead><tr>
+      <th>Strategy</th><th>Status</th><th>Started</th><th>Initial Cash</th><th>Portfolio Value</th>
+      <th>Unrealized PnL</th><th>Total Trades</th><th>Win Rate</th><th>Avg PnL / Trade</th><th>Open Positions</th><th>Reload Count</th>
+      </tr></thead><tbody>${rows
+        .map(
+          (p) => `<tr>
+            <td>${p.strategy_path.split("/").pop()}</td>
+            <td>${p.status}</td>
+            <td>${fmtTs(p.started_at)}</td>
+            <td>${fmt(p.initial_cash)}</td>
+            <td>${fmt(p.portfolio_value)}</td>
+            <td>${(p.unrealized_pnl >= 0 ? "+" : "") + fmt(p.unrealized_pnl)} (${fmt(p.unrealized_pnl_pct)}%)</td>
+            <td>${p.total_trades ?? 0}</td>
+            <td>${((p.win_rate ?? 0) * 100).toFixed(2)}%</td>
+            <td>${fmt(p.avg_pnl_per_trade)}</td>
+            <td>${p.open_positions ?? 0}</td>
+            <td>${p.reload_count || 0}</td>
+          </tr>`
+        )
+        .join("")}</tbody></table>`;
+  },
+
   async "/backtests"() {
     const data = await fetchJson("/api/backtests");
     app.innerHTML = `<table><thead><tr><th>ID</th><th>Strategy</th><th>Range</th><th>Status</th><th>Return %</th><th>Sharpe</th></tr></thead>
@@ -110,9 +140,10 @@ const routes = {
 };
 
 async function renderRoute() {
-  const hash = location.hash.slice(1) || "/";
+  const hash = location.hash.slice(1);
+  const hashOrPath = hash || (location.pathname && location.pathname !== "/" ? location.pathname : "/");
 
-  const mPaper = hash.match(/^\/paper\/([^/]+)$/);
+  const mPaper = hashOrPath.match(/^\/paper\/([^/]+)$/);
   if (mPaper) {
     const id = mPaper[1];
     const [detail, logs] = await Promise.all([
@@ -146,7 +177,7 @@ async function renderRoute() {
     return;
   }
 
-  const mBacktest = hash.match(/^\/backtests\/([^/]+)$/);
+  const mBacktest = hashOrPath.match(/^\/backtests\/([^/]+)$/);
   if (mBacktest) {
     const id = mBacktest[1];
     const data = await fetchJson(`/api/backtests/${id}`);
@@ -171,14 +202,20 @@ async function renderRoute() {
     return;
   }
 
-  const route = routes[hash] || routes["/"];
+  const route = routes[hashOrPath] || routes["/"];
   await route();
 }
 
 window.addEventListener("hashchange", renderRoute);
 renderRoute();
 setInterval(() => {
-  if (["#/", "#/paper", "#/backtests", "#/markets"].includes(location.hash) || location.hash === "") {
+  const hash = location.hash;
+  const pathname = location.pathname || "/";
+  if (
+    ["#/", "#/paper", "#/compare", "#/backtests", "#/markets"].includes(hash) ||
+    hash === "" ||
+    ["/", "/paper", "/compare", "/backtests", "/markets"].includes(pathname)
+  ) {
     renderRoute();
   }
 }, 10000);

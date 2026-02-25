@@ -1,6 +1,8 @@
 # DO NOT import dome_api_sdk here. Use agenttrader.data.dome_client only.
 from __future__ import annotations
 
+import operator
+import re
 import time
 from datetime import UTC, datetime
 
@@ -11,7 +13,22 @@ from rich.table import Table
 from agenttrader.cli.utils import emit_json, ensure_initialized, json_errors
 from agenttrader.data.cache import DataCache
 from agenttrader.db import get_engine
-from agenttrader.errors import MarketNotCachedError
+from agenttrader.errors import AgentTraderError, MarketNotCachedError
+
+
+OPERATORS = {
+    "<": operator.lt,
+    ">": operator.gt,
+    "<=": operator.le,
+    ">=": operator.ge,
+    "==": operator.eq,
+}
+
+CONDITION_PATTERN = re.compile(
+    r"^(price_vs_7d_avg|current_price|volume|days_until_close|price_change_24h)"
+    r"\s*(<=|>=|==|<|>)\s*"
+    r"(-?\d+\.?\d*)$"
+)
 
 
 @click.group("markets")
@@ -204,3 +221,120 @@ def markets_match(polymarket_slug: str | None, kalshi_ticker: str | None, json_o
         for m in matched:
             table.add_row(m["base_title"][:50], m["match_title"][:50], f"{m['base_platform']} -> {m['match_platform']}")
         Console().print(table)
+
+
+def _parse_condition(condition_str: str) -> tuple[str, object, float]:
+    match = CONDITION_PATTERN.match(str(condition_str).strip())
+    if not match:
+        raise AgentTraderError(
+            "InvalidCondition",
+            (
+                f"Invalid condition: '{condition_str}'. Supported metrics: "
+                "price_vs_7d_avg, current_price, volume, days_until_close, price_change_24h"
+            ),
+        )
+    metric, op_str, value = match.group(1), match.group(2), float(match.group(3))
+    return metric, OPERATORS[op_str], value
+
+
+def _compute_market_metrics(market_id: str, cache: DataCache) -> dict:
+    now = int(time.time())
+    market = cache.get_market(market_id)
+    latest = cache.get_latest_price(market_id)
+    history_7d = cache.get_price_history(market_id, now - 7 * 86400, now)
+    history_24h = cache.get_price_history(market_id, now - 86400, now)
+
+    current_price = float(latest.yes_price) if latest is not None else None
+    avg_7d = (sum(float(p.yes_price) for p in history_7d) / len(history_7d)) if history_7d else None
+    oldest_24h = float(history_24h[0].yes_price) if history_24h else None
+
+    return {
+        "current_price": current_price,
+        "price_vs_7d_avg": (current_price - avg_7d) if (current_price is not None and avg_7d is not None) else None,
+        "price_change_24h": (current_price - oldest_24h) if (current_price is not None and oldest_24h is not None) else None,
+        "volume": float(market.volume or 0.0) if market else None,
+        "days_until_close": ((int(market.close_time) - now) / 86400.0) if market and market.close_time else None,
+    }
+
+
+@markets_group.command("screen")
+@click.option("--condition", required=True)
+@click.option("--platform", default="all")
+@click.option("--category", default=None)
+@click.option("--min-volume", type=float, default=None)
+@click.option("--min-history-days", type=int, default=7)
+@click.option("--limit", type=int, default=20)
+@click.option("--json", "json_output", is_flag=True)
+@json_errors
+def markets_screen(
+    condition: str,
+    platform: str,
+    category: str | None,
+    min_volume: float | None,
+    min_history_days: int,
+    limit: int,
+    json_output: bool,
+) -> None:
+    ensure_initialized()
+    metric_name, op_fn, threshold = _parse_condition(condition)
+    cache = DataCache(get_engine())
+    now = int(time.time())
+
+    markets = cache.get_markets(platform=platform, category=category, min_volume=min_volume, limit=5000)
+    matches = []
+
+    for market in markets:
+        history = cache.get_price_history(market.id, now - max(min_history_days, 1) * 86400, now)
+        if not history:
+            continue
+
+        metrics = _compute_market_metrics(market.id, cache)
+        metric_value = metrics.get(metric_name)
+        if metric_value is None:
+            continue
+        if not op_fn(metric_value, threshold):
+            continue
+
+        matches.append(
+            {
+                "id": market.id,
+                "title": market.title,
+                "platform": market.platform.value,
+                "category": market.category,
+                "current_price": metrics["current_price"],
+                "price_vs_7d_avg": metrics["price_vs_7d_avg"],
+                "price_change_24h": metrics["price_change_24h"],
+                "volume": metrics["volume"],
+                "days_until_close": metrics["days_until_close"],
+            }
+        )
+        if len(matches) >= limit:
+            break
+
+    payload = {"ok": True, "condition": condition, "count": len(matches), "markets": matches}
+    if json_output:
+        emit_json(payload)
+        return
+
+    table = Table(title=f"Market Screener ({condition})")
+    table.add_column("Market")
+    table.add_column("Platform")
+    table.add_column("Category")
+    table.add_column("Current")
+    table.add_column("vs 7d Avg")
+    table.add_column("24h Chg")
+    table.add_column("Volume")
+    table.add_column("Days to Close")
+
+    for m in matches:
+        table.add_row(
+            m["title"][:50],
+            m["platform"],
+            m["category"] or "",
+            f"{m['current_price']:.3f}" if m["current_price"] is not None else "-",
+            f"{m['price_vs_7d_avg']:.3f}" if m["price_vs_7d_avg"] is not None else "-",
+            f"{m['price_change_24h']:.3f}" if m["price_change_24h"] is not None else "-",
+            f"{float(m['volume'] or 0.0):,.0f}",
+            f"{m['days_until_close']:.2f}" if m["days_until_close"] is not None else "-",
+        )
+    Console().print(table)
