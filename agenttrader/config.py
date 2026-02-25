@@ -1,4 +1,4 @@
-# DO NOT import dome_api_sdk here. Use agenttrader.data.dome_client only.
+# DO NOT import pmxt here. Use agenttrader.data.pmxt_client only.
 from __future__ import annotations
 
 from pathlib import Path
@@ -13,7 +13,6 @@ DB_PATH = APP_DIR / "db.sqlite"
 ORDERBOOK_DIR = APP_DIR / "orderbooks"
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "dome_api_key": "",
     "schedule_interval_minutes": 15,
     "default_initial_cash": 10000.0,
     "sync_granularity": "hourly",

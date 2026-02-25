@@ -30,7 +30,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-  "dome-api-sdk>=1.0.0",
+  "pmxt>=2.17.9",
   "click>=8.1",
   "mcp>=1.0.0",
   "sqlalchemy>=2.0",

@@ -4,7 +4,7 @@
 
 Give an agent a goal. It handles everything: discovering markets on Polymarket and Kalshi, analyzing price history, writing strategy code, running the backtesting loop, and starting a live paper trading daemon. Running strategies hot-reload automatically when the strategy file changes — agents can iterate on live deployments without restarting.
 
-All market data flows through the [Dome API](https://domeapi.io), unified across Polymarket and Kalshi.
+All market data flows through [pmxt](https://github.com/Polymarket/pmxt), unified across Polymarket and Kalshi.
 
 **Primary users:** AI coding agents (Claude Code, Codex, OpenCode, Cursor).  
 **Secondary users:** Developers who want to write and test strategies manually.
@@ -40,7 +40,7 @@ agenttrader paper start   ← deploy as background daemon
 [agent edits strategy.py] ← daemon hot-reloads, no restart needed
 ```
 
-All state lives locally in `~/.agenttrader/`. No cloud backend. No app account required. (A Dome API key is still required for market data access.)
+All state lives locally in `~/.agenttrader/`. No cloud backend. No app account required. PMXT market data does not require an API key.
 
 ---
 
@@ -53,14 +53,18 @@ python --version    # 3.12+ required
 pip --version
 ```
 
-Get a free Dome API key at [dashboard.domeapi.io](https://dashboard.domeapi.io).
+Install PMXT dependencies (Python package + Node.js sidecar):
+
+```bash
+pip install pmxt
+npm install -g pmxtjs
+```
 
 ### Install
 
 ```bash
 pip install agenttrader
 agenttrader init
-agenttrader config set dome_api_key <YOUR_DOME_KEY>
 ```
 
 ### Verify it works
@@ -314,7 +318,7 @@ self.set_state(key, value)              # persist state across calls
 self.get_state(key, default)
 ```
 
-Do not call the Dome API directly from a strategy. Do not import `requests`, `httpx`, or any networking library. All data access goes through `self.*` methods.
+Do not call PMXT directly from a strategy. Do not import `requests`, `httpx`, `pmxt`, or any networking library. All data access goes through `self.*` methods.
 
 ---
 
@@ -324,8 +328,6 @@ Do not call the Dome API directly from a strategy. Do not import `requests`, `ht
 
 ```bash
 agenttrader init
-agenttrader config set dome_api_key <YOUR_DOME_KEY>
-agenttrader config get dome_api_key
 agenttrader config show
 ```
 
@@ -465,7 +467,7 @@ agenttrader prune --older-than 90d --json
 
 ```
 ~/.agenttrader/
-├── config.yaml        # API key and preferences
+├── config.yaml        # scheduler and sync preferences
 ├── db.sqlite          # markets, backtests, positions, trade ledger
 ├── experiments.json   # experiment memory/log for strategy iterations
 └── orderbooks/        # compressed orderbook snapshots by market/day
@@ -473,7 +475,7 @@ agenttrader prune --older-than 90d --json
 
 `db.sqlite` is a standard SQLite file. Agents can query it directly with SQL for custom analysis — for example, `SELECT * FROM markets WHERE volume > 10000 ORDER BY volume DESC`.
 
-The Dome API key in `config.yaml` grants access to market data only — no funds or wallets are involved.
+PMXT market-data calls are unauthenticated; no API key is required for sync, backtest, or paper trading workflows.
 
 ---
 
@@ -483,7 +485,6 @@ The Dome API key in `config.yaml` grants access to market data only — no funds
 |---------|-----|
 | `agenttrader: command not found` | Activate your virtual environment: `source .venv/bin/activate` |
 | Not initialized | `agenttrader init` |
-| Missing API key | `agenttrader config set dome_api_key <key>` |
 | Market not in cache | `agenttrader sync ...` |
 | Strategy validation errors | `agenttrader validate ./strategy.py --json` — read `errors` array |
 | Backtest has no trades | Date range has no price movement — try wider range or sync more markets |
@@ -503,8 +504,8 @@ pip install -e ".[dev]"
 ruff check agenttrader tests
 python -m compileall agenttrader tests
 
-# Integration tests (requires real API key)
-DOME_API_KEY=<key> python tests/integration/test_full_workflow.py
+# Integration tests
+python tests/integration/test_full_workflow.py
 ```
 
 ---

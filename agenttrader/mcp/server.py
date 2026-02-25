@@ -1,4 +1,4 @@
-# DO NOT import dome_api_sdk here. Use agenttrader.data.dome_client only.
+# DO NOT import pmxt here. Use agenttrader.data.pmxt_client only.
 from __future__ import annotations
 
 import hashlib
@@ -19,7 +19,7 @@ from agenttrader.core.backtest_engine import BacktestConfig, BacktestEngine
 from agenttrader.core.base_strategy import BaseStrategy
 from agenttrader.core.paper_daemon import PaperDaemon
 from agenttrader.data.cache import DataCache
-from agenttrader.data.dome_client import DomeClient
+from agenttrader.data.pmxt_client import PmxtClient
 from agenttrader.data.orderbook_store import OrderBookStore
 from agenttrader.db import get_engine, get_session
 from agenttrader.db.schema import BacktestRun, PaperPortfolio
@@ -59,7 +59,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(name="get_portfolio", description="Get paper portfolio status", inputSchema={"type": "object", "properties": {"portfolio_id": {"type": "string"}}, "required": ["portfolio_id"]}),
         types.Tool(name="stop_paper_trade", description="Stop paper trading daemon", inputSchema={"type": "object", "properties": {"portfolio_id": {"type": "string"}}, "required": ["portfolio_id"]}),
         types.Tool(name="list_paper_trades", description="List paper portfolios", inputSchema={"type": "object", "properties": {}}),
-        types.Tool(name="sync_data", description="Sync data from Dome", inputSchema={"type": "object", "properties": {"days": {"type": "integer", "default": 7}, "platform": {"type": "string", "default": "all"}, "market_ids": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "default": 100}}}),
+        types.Tool(name="sync_data", description="Sync data from PMXT", inputSchema={"type": "object", "properties": {"days": {"type": "integer", "default": 7}, "platform": {"type": "string", "default": "all"}, "market_ids": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "default": 100}}}),
     ]
 
 
@@ -93,8 +93,7 @@ async def call_tool(name: str, arguments: dict):
         return _text({"ok": True, "market_id": market_id, "history": [h.__dict__ for h in history]})
 
     if name == "match_markets":
-        cfg = load_config()
-        client = DomeClient(str(cfg.get("dome_api_key", "")))
+        client = PmxtClient()
         matches = client.get_matching_markets(args.get("polymarket_slug"), args.get("kalshi_ticker"))
         return _text({"ok": True, "matches": matches})
 
@@ -264,8 +263,7 @@ async def call_tool(name: str, arguments: dict):
         return _text({"ok": True, "portfolios": [{"id": p.id, "status": p.status, "pid": p.pid} for p in rows]})
 
     if name == "sync_data":
-        cfg = load_config()
-        client = DomeClient(str(cfg.get("dome_api_key", "")))
+        client = PmxtClient()
         days = int(args.get("days", 7))
         platform = args.get("platform", "all")
         market_ids = args.get("market_ids")

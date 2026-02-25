@@ -1,4 +1,4 @@
-# DO NOT import dome_api_sdk here. Use agenttrader.data.dome_client only.
+# DO NOT import pmxt here. Use agenttrader.data.pmxt_client only.
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING
@@ -16,7 +16,7 @@ class BaseStrategy(ABC):
     paper trader) imports your class and calls the lifecycle hooks below.
 
     RULES:
-    - Do NOT import dome_api_sdk or make network calls directly.
+    - Do NOT import pmxt or make network calls directly.
     - Do NOT import requests, httpx, or any networking library.
     - All data access must go through self.* methods.
     - All order placement must go through self.buy() and self.sell().

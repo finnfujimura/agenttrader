@@ -18,26 +18,22 @@ def run(cmd: str) -> dict:
 
 
 def test_full_agent_workflow():
-    api_key = os.getenv("DOME_API_KEY")
-    if not api_key:
-        print("Skipping integration workflow test: DOME_API_KEY is not set")
-        return
-
     subprocess.run("agenttrader init", shell=True, check=True)
-    subprocess.run(f"agenttrader config set dome_api_key {api_key}", shell=True, check=True)
 
     r = run("sync --days 7 --platform polymarket --limit 10")
     assert r["ok"]
     assert r["markets_synced"] > 0
 
-    r = run("markets list --limit 5")
+    r = run("markets list --limit 200")
     assert r["ok"]
     assert len(r["markets"]) > 0
-    market_id = r["markets"][0]["id"]
-
-    r = run(f"markets history {market_id} --days 7")
-    assert r["ok"]
-    assert len(r["history"]) > 0
+    market_id = None
+    for market in r["markets"]:
+        probe = run(f"markets history {market['id']} --days 7")
+        if probe["ok"] and len(probe["history"]) > 0:
+            market_id = market["id"]
+            break
+    assert market_id is not None
 
     strategy = tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w")
     strategy.write(

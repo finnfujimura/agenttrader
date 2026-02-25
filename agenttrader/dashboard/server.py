@@ -1,4 +1,4 @@
-# DO NOT import dome_api_sdk here. Use agenttrader.data.dome_client only.
+# DO NOT import pmxt here. Use agenttrader.data.pmxt_client only.
 from __future__ import annotations
 
 import json

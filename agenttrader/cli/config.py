@@ -1,4 +1,4 @@
-# DO NOT import dome_api_sdk here. Use agenttrader.data.dome_client only.
+# DO NOT import pmxt here. Use agenttrader.data.pmxt_client only.
 from __future__ import annotations
 
 from pathlib import Path
@@ -37,7 +37,7 @@ def init_cmd() -> None:
     DB_PATH.touch(exist_ok=True)
     click.echo(f"Initialized {APP_DIR}/")
     click.echo(f"Database: {db_path}")
-    click.echo("Next step: agenttrader config set dome_api_key <YOUR_KEY>")
+    click.echo("Next step: agenttrader sync --platform polymarket --days 7")
 
 
 @click.group("config")

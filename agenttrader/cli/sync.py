@@ -1,4 +1,4 @@
-# DO NOT import dome_api_sdk here. Use agenttrader.data.dome_client only.
+# DO NOT import pmxt here. Use agenttrader.data.pmxt_client only.
 from __future__ import annotations
 
 import os
@@ -9,14 +9,13 @@ import click
 from agenttrader.cli.utils import emit_json, ensure_initialized, json_errors
 from agenttrader.config import APP_DIR, load_config
 from agenttrader.data.cache import DataCache
-from agenttrader.data.dome_client import DomeClient
+from agenttrader.data.pmxt_client import PmxtClient
 from agenttrader.data.orderbook_store import OrderBookStore
 from agenttrader.db import get_engine
-from agenttrader.errors import AgentTraderError
 
 
 def _get_candlesticks_with_chunking(
-    client: DomeClient,
+    client: PmxtClient,
     market,
     start_ts: int,
     end_ts: int,
@@ -83,12 +82,6 @@ def sync_cmd(
 ) -> None:
     ensure_initialized()
     cfg = load_config()
-    api_key = str(cfg.get("dome_api_key", ""))
-    if not api_key:
-        raise AgentTraderError(
-            "ConfigError",
-            "dome_api_key not set. Run: agenttrader config set dome_api_key <key>",
-        )
 
     if days is None:
         days = int(cfg.get("max_sync_days", 90))
@@ -103,7 +96,7 @@ def sync_cmd(
     engine = get_engine()
     cache = DataCache(engine)
     ob_store = OrderBookStore()
-    client = DomeClient(api_key)
+    client = PmxtClient()
 
     start_ts = int(time.time()) - days * 24 * 3600
     end_ts = int(time.time())
