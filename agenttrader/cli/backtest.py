@@ -20,6 +20,7 @@ from agenttrader.cli.validate import validate_strategy_file
 from agenttrader.config import load_config
 from agenttrader.core.backtest_engine import BacktestConfig, BacktestEngine
 from agenttrader.core.base_strategy import BaseStrategy
+from agenttrader.data.backtest_artifacts import read_backtest_artifact, write_backtest_artifact
 from agenttrader.data.cache import DataCache
 from agenttrader.data.orderbook_store import OrderBookStore
 from agenttrader.data.parquet_adapter import ParquetDataAdapter
@@ -64,6 +65,8 @@ def _backtest_run(strategy_path: str, args: list[str]) -> None:
     from_date = None
     to_date = None
     initial_cash = None
+    max_markets = None
+    fidelity = "exact_trade"
     json_output = False
     i = 0
     while i < len(args):
@@ -78,6 +81,16 @@ def _backtest_run(strategy_path: str, args: list[str]) -> None:
             continue
         if token == "--cash" and i + 1 < len(args):
             initial_cash = float(args[i + 1])
+            i += 2
+            continue
+        if token == "--max-markets" and i + 1 < len(args):
+            max_markets = int(args[i + 1])
+            i += 2
+            continue
+        if token == "--fidelity" and i + 1 < len(args):
+            fidelity = str(args[i + 1]).strip()
+            if fidelity not in {"exact_trade", "bar_1h", "bar_1d"}:
+                raise click.UsageError("--fidelity must be one of: exact_trade, bar_1h, bar_1d")
             i += 2
             continue
         if token == "--json":
@@ -152,8 +165,20 @@ def _backtest_run(strategy_path: str, args: list[str]) -> None:
                 end_date=to_date,
                 initial_cash=initial_cash,
                 schedule_interval_minutes=int(cfg.get("schedule_interval_minutes", 15)),
+                max_markets=max_markets,
+                fidelity=fidelity,
             ),
         )
+        if results.get("ok") is False:
+            raise AgentTraderError(results.get("error", "BacktestError"), results.get("message", "Backtest failed"), results)
+        artifact_payload = results.pop("_artifact_payload", None)
+        if artifact_payload is not None:
+            equity_curve = artifact_payload.get("equity_curve", [])
+            trades = artifact_payload.get("trades", [])
+        else:
+            equity_curve = results.pop("equity_curve", [])
+            trades = results.pop("trades", [])
+        results["artifact_path"] = write_backtest_artifact(run_id, equity_curve, trades)
         results["run_id"] = run_id
         results["status"] = "complete"
 
@@ -169,7 +194,9 @@ def _backtest_run(strategy_path: str, args: list[str]) -> None:
             emit_json(results)
         else:
             click.echo(f"Backtest complete: {run_id}")
-            if results.get("data_source") == "parquet":
+            if results.get("data_source") == "normalized-index":
+                click.echo("Data source: normalized backtest index (DuckDB)")
+            elif results.get("data_source") == "parquet":
                 click.echo("Data source: Jon Becker dataset (parquet) — 2021-present")
             else:
                 click.echo("Data source: local sync cache (SQLite) — run 'agenttrader dataset download' for full history")
@@ -263,6 +290,11 @@ def _backtest_show(args: list[str]) -> None:
 
     if row.status == "complete" and row.results_json:
         data = json.loads(row.results_json)
+        artifact = read_backtest_artifact(run_id)
+        if artifact.get("equity_curve") or "equity_curve" not in data:
+            data["equity_curve"] = artifact.get("equity_curve", [])
+        if artifact.get("trades") or "trades" not in data:
+            data["trades"] = artifact.get("trades", [])
     else:
         data = {
             "ok": True,

@@ -64,11 +64,12 @@ class IntegrationTestStrategy(BaseStrategy):
     r = run(f"backtest {strategy.name} --from 2024-01-01 --to 2024-01-07 --cash 1000")
     assert r["ok"]
     assert "metrics" in r
-    assert "equity_curve" in r
+    assert "equity_curve" not in r
     run_id = r["run_id"]
 
     r = run(f"backtest show {run_id}")
     assert r["ok"]
+    assert "equity_curve" in r
     assert "trades" in r
 
     r = run(f"paper start {strategy.name} --cash 1000")

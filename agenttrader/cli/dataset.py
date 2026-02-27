@@ -1,6 +1,7 @@
 # DO NOT import pmxt here. Use agenttrader.data.pmxt_client only.
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import tarfile
@@ -66,7 +67,7 @@ def _extract_with_python(archive_path: Path, dest: Path) -> None:
     click.echo("Extraction complete.")
 
 
-def download_dataset() -> None:
+def download_dataset() -> bool:
     """Download and extract the Jon Becker prediction market parquet dataset."""
     ensure_app_dir()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -89,7 +90,7 @@ def download_dataset() -> None:
     except Exception as exc:
         click.echo(f"\nDownload failed: {exc}")
         click.echo("Try again with: agenttrader dataset download")
-        return
+        return False
 
     click.echo("Extracting...")
     try:
@@ -117,6 +118,7 @@ def download_dataset() -> None:
     archive_path.unlink(missing_ok=True)
     click.echo(f"\nDataset ready at {DATA_DIR}")
     click.echo("Run 'agenttrader dataset verify' to confirm all files are present.")
+    return True
 
 
 @click.group("dataset")
@@ -150,3 +152,36 @@ def dataset_verify_cmd() -> None:
         click.echo("\nDataset OK. Ready for backtesting.")
     else:
         click.echo("\nDataset incomplete. Run: agenttrader dataset download")
+
+
+@dataset_group.command("build-index")
+@click.option("--force", is_flag=True, default=False, help="Rebuild index even if it already exists")
+@click.option("--json", "json_output", is_flag=True, default=False)
+@json_errors
+def build_index_cmd(force: bool, json_output: bool) -> None:
+    """
+    One-time normalization of raw parquet files into a fast DuckDB index.
+    Run once after 'agenttrader dataset download'.
+    Stored at ~/.agenttrader/backtest_index.duckdb
+    """
+    from agenttrader.data.index_builder import build_index
+
+    result = build_index(force=force)
+    if json_output:
+        click.echo(json.dumps(result, default=str))
+        return
+
+    if result.get("skipped"):
+        click.echo(result.get("message", "Index already exists."))
+        click.echo("Use --force to rebuild.")
+        return
+
+    if result.get("ok"):
+        stats = result.get("stats", {})
+        click.echo("Index built successfully.")
+        click.echo(f"  Polymarket trades: {int(stats.get('polymarket_trades', 0)):,}")
+        click.echo(f"  Kalshi trades:     {int(stats.get('kalshi_trades', 0)):,}")
+        click.echo(f"  Markets indexed:   {int(stats.get('markets_indexed', 0)):,}")
+        return
+
+    click.echo(f"Error: {result.get('message', 'unknown error')}")

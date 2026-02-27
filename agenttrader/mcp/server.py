@@ -23,6 +23,7 @@ from agenttrader.config import is_initialized, load_config
 from agenttrader.core.backtest_engine import BacktestConfig, BacktestEngine
 from agenttrader.core.base_strategy import BaseStrategy
 from agenttrader.core.paper_daemon import PaperDaemon
+from agenttrader.data.backtest_artifacts import read_backtest_artifact, write_backtest_artifact
 from agenttrader.data.cache import DataCache
 from agenttrader.errors import AgentTraderError
 from agenttrader.data.pmxt_client import PmxtClient
@@ -125,9 +126,61 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(name="get_price", description="Get latest cached price", inputSchema={"type": "object", "properties": {"market_id": {"type": "string"}}, "required": ["market_id"]}),
         types.Tool(name="get_history", description="Get cached market history analytics. Raw history is omitted by default; set include_raw=true to include points.", inputSchema={"type": "object", "properties": {"market_id": {"type": "string"}, "days": {"type": "integer", "default": 7}, "include_raw": {"type": "boolean", "default": False}}, "required": ["market_id"]}),
         types.Tool(name="match_markets", description="Match markets across platforms", inputSchema={"type": "object", "properties": {"polymarket_slug": {"type": "string"}, "kalshi_ticker": {"type": "string"}}}),
-        types.Tool(name="run_backtest", description="Run a strategy backtest. Returns metrics only by default. Set include_curve=true to also return the full equity curve and trades array.", inputSchema={"type": "object", "properties": {"strategy_path": {"type": "string"}, "start_date": {"type": "string"}, "end_date": {"type": "string"}, "initial_cash": {"type": "number", "default": 10000}, "include_curve": {"type": "boolean", "default": False, "description": "If true, include full equity_curve and trades arrays in response"}}, "required": ["strategy_path", "start_date", "end_date"]}),
+        types.Tool(
+            name="run_backtest",
+            description=(
+                "Run a strategy backtest. By default this runs all subscribed markets with exact_trade fidelity. "
+                "Set include_curve=true to return full equity/trades arrays. "
+                "Use max_markets and fidelity for faster exploratory runs."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "strategy_path": {"type": "string"},
+                    "start_date": {"type": "string"},
+                    "end_date": {"type": "string"},
+                    "initial_cash": {"type": "number", "default": 10000},
+                    "max_markets": {
+                        "type": "integer",
+                        "description": "Optional. Cap number of markets. Default: no limit.",
+                    },
+                    "fidelity": {
+                        "type": "string",
+                        "enum": ["exact_trade", "bar_1h", "bar_1d"],
+                        "default": "exact_trade",
+                        "description": (
+                            "exact_trade: every trade (default, most accurate). "
+                            "bar_1h: hourly bars (faster). "
+                            "bar_1d: daily bars (fastest, least accurate)."
+                        ),
+                    },
+                    "include_curve": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "If true, include full equity_curve and trades arrays in response",
+                    },
+                },
+                "required": ["strategy_path", "start_date", "end_date"],
+            },
+        ),
         types.Tool(name="research_markets", description="Compound research workflow: sync cache, list filtered markets, and return history analytics for each market.", inputSchema={"type": "object", "properties": {"days": {"type": "integer", "default": 7}, "platform": {"type": "string", "enum": ["polymarket", "kalshi", "all"], "default": "all"}, "category": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "market_ids": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "default": 20}, "sync_limit": {"type": "integer", "default": 100}, "include_raw": {"type": "boolean", "default": False}}}),
-        types.Tool(name="validate_and_backtest", description="Compound workflow: validate a strategy file then run backtest when valid.", inputSchema={"type": "object", "properties": {"strategy_path": {"type": "string"}, "start_date": {"type": "string"}, "end_date": {"type": "string"}, "initial_cash": {"type": "number", "default": 10000}, "include_curve": {"type": "boolean", "default": False}}, "required": ["strategy_path", "start_date", "end_date"]}),
+        types.Tool(
+            name="validate_and_backtest",
+            description="Compound workflow: validate a strategy file then run backtest when valid.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "strategy_path": {"type": "string"},
+                    "start_date": {"type": "string"},
+                    "end_date": {"type": "string"},
+                    "initial_cash": {"type": "number", "default": 10000},
+                    "max_markets": {"type": "integer"},
+                    "fidelity": {"type": "string", "enum": ["exact_trade", "bar_1h", "bar_1d"], "default": "exact_trade"},
+                    "include_curve": {"type": "boolean", "default": False},
+                },
+                "required": ["strategy_path", "start_date", "end_date"],
+            },
+        ),
         types.Tool(name="get_backtest", description="Get backtest by run id. Returns metrics only by default. Set include_curve=true to also return the full equity curve and trades array.", inputSchema={"type": "object", "properties": {"run_id": {"type": "string"}, "include_curve": {"type": "boolean", "default": False, "description": "If true, include full equity_curve and trades arrays in response"}}, "required": ["run_id"]}),
         types.Tool(name="list_backtests", description="List recent backtest runs", inputSchema={"type": "object", "properties": {}}),
         types.Tool(name="validate_strategy", description="Validate strategy file", inputSchema={"type": "object", "properties": {"strategy_path": {"type": "string"}}, "required": ["strategy_path"]}),
@@ -297,8 +350,20 @@ async def call_tool(name: str, arguments: dict):
                         end_date=args["end_date"],
                         initial_cash=float(args.get("initial_cash", 10000.0)),
                         schedule_interval_minutes=int(load_config().get("schedule_interval_minutes", 15)),
+                        max_markets=int(args["max_markets"]) if args.get("max_markets") is not None else None,
+                        fidelity=str(args.get("fidelity", "exact_trade")),
                     ),
                 )
+                if result.get("ok") is False:
+                    raise RuntimeError(result.get("message", "Backtest failed"))
+                artifact_payload = result.pop("_artifact_payload", None)
+                if artifact_payload is not None:
+                    equity_curve = artifact_payload.get("equity_curve", [])
+                    trades = artifact_payload.get("trades", [])
+                else:
+                    equity_curve = result.pop("equity_curve", [])
+                    trades = result.pop("trades", [])
+                result["artifact_path"] = write_backtest_artifact(run_id, equity_curve, trades)
                 result["run_id"] = run_id
 
                 with get_session(get_engine()) as session:
@@ -309,9 +374,10 @@ async def call_tool(name: str, arguments: dict):
                         row.completed_at = int(datetime.now(tz=UTC).timestamp())
                         session.commit()
 
-                if not args.get("include_curve", False):
-                    result.pop("equity_curve", None)
-                    result.pop("trades", None)
+                if args.get("include_curve", False):
+                    artifact = read_backtest_artifact(run_id)
+                    result["equity_curve"] = artifact.get("equity_curve", [])
+                    result["trades"] = artifact.get("trades", [])
                 return _respond(result)
             except Exception as exc:
                 with get_session(get_engine()) as session:
@@ -448,9 +514,12 @@ async def call_tool(name: str, arguments: dict):
                 )
             if row.results_json:
                 data = json.loads(row.results_json)
-                if not args.get("include_curve", False):
-                    data.pop("equity_curve", None)
-                    data.pop("trades", None)
+                if args.get("include_curve", False):
+                    artifact = read_backtest_artifact(run_id)
+                    if artifact.get("equity_curve") or "equity_curve" not in data:
+                        data["equity_curve"] = artifact.get("equity_curve", [])
+                    if artifact.get("trades") or "trades" not in data:
+                        data["trades"] = artifact.get("trades", [])
                 return _respond(data)
             return _respond({"ok": True, "status": row.status})
 

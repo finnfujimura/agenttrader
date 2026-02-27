@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import uuid
 from abc import ABC, abstractmethod
+from collections import defaultdict, deque
 from datetime import UTC, datetime
 from typing import Any
 
@@ -349,6 +350,296 @@ class BacktestContext(ExecutionContext):
 
         market = self._markets.get(market_id)
         return market.market_type if market else MarketType.BINARY
+
+
+class StreamingBacktestContext(ExecutionContext):
+    """
+    ExecutionContext for the streaming backtest engine.
+    Uses O(1) price cursors and rolling history buffers.
+    """
+
+    def __init__(
+        self,
+        initial_cash: float,
+        market_map: dict[str, Market],
+        fill_model: FillModel,
+        history_buffer_hours: int = 168,
+    ):
+        self._cash = float(initial_cash)
+        self._initial_cash = float(initial_cash)
+        self._market_map = dict(market_map)
+        self._fill_model = fill_model
+        self._current_ts = 0
+        self._history_buffer_hours = int(history_buffer_hours)
+        self._active_market_id: str | None = None
+        self._portfolio_changed = False
+
+        # O(1) price lookup
+        self._price_cursors: dict[str, float] = {}
+        self._price_cursor_ts: dict[str, int] = {}
+
+        # Rolling history buffer per market (~5-min avg frequency)
+        max_buffer = max(self._history_buffer_hours * 12, 1)
+        self._history: dict[str, deque[PricePoint]] = defaultdict(lambda: deque(maxlen=max_buffer))
+
+        self._positions: dict[str, PositionModel] = {}
+        self._trades: list[dict[str, Any]] = []
+        self._equity_curve: list[dict[str, float | int]] = []
+        self._slippage_samples: list[float] = []
+        self._logs: list[dict[str, Any]] = []
+        self._state: dict[str, Any] = {}
+        self._subscriptions: set[str] = set()
+
+    # --- Time and cursor management (called by engine) ---
+
+    def advance_time(self, ts: int) -> None:
+        if ts < self._current_ts:
+            raise AgentTraderError("TimeOrderViolation", f"Time must advance: {ts} < {self._current_ts}")
+        self._current_ts = ts
+
+    def set_active_market(self, market_id: str | None) -> None:
+        self._active_market_id = market_id
+
+    def set_price_cursor(self, market_id: str, price: float) -> None:
+        self._price_cursors[market_id] = float(price)
+        self._price_cursor_ts[market_id] = int(self._current_ts)
+
+    def push_history(self, market_id: str, point: PricePoint) -> None:
+        self._history[market_id].append(point)
+
+    def get_market(self, market_id: str) -> Market | None:
+        return self._market_map.get(market_id)
+
+    def portfolio_changed_since_last_check(self) -> bool:
+        changed = self._portfolio_changed
+        self._portfolio_changed = False
+        return changed
+
+    def record_snapshot(self, ts: int | None = None) -> None:
+        if ts is not None:
+            self._current_ts = int(ts)
+        self._equity_curve.append({"timestamp": self._current_ts, "value": self.get_portfolio_value()})
+
+    # --- ExecutionContext interface (called by strategy) ---
+
+    def subscribe(self, platform="all", category=None, tags=None, market_ids=None) -> None:
+        # No-op: streaming engine resolves subscriptions ahead of runtime.
+        return None
+
+    def search_markets(self, query, platform="all") -> list[Market]:
+        q = str(query or "").lower()
+        return [
+            m
+            for m in self._market_map.values()
+            if q in m.title.lower() and (platform == "all" or m.platform.value == platform)
+        ]
+
+    def get_price(self, market_id: str) -> float:
+        if market_id not in self._price_cursors:
+            raise MarketNotCachedError(market_id)
+
+        # Prevent cross-market look-ahead on same-timestamp events.
+        if self._active_market_id is not None and market_id != self._active_market_id:
+            cursor_ts = self._price_cursor_ts.get(market_id)
+            if cursor_ts is None or cursor_ts >= self._current_ts:
+                for point in reversed(self._history[market_id]):
+                    if point.timestamp < self._current_ts:
+                        return point.yes_price
+                raise MarketNotCachedError(market_id)
+
+        return self._price_cursors[market_id]
+
+    def get_history(self, market_id: str, lookback_hours: int = 24) -> list[PricePoint]:
+        cutoff = self._current_ts - int(lookback_hours * 3600)
+        return [p for p in self._history[market_id] if cutoff <= p.timestamp <= self._current_ts]
+
+    def get_orderbook(self, market_id: str) -> OrderBook:
+        price = self._price_cursors.get(market_id, 0.5)
+        return self._synthesize_orderbook(price, market_id)
+
+    def get_position(self, market_id: str) -> PositionModel | None:
+        return self._positions.get(market_id)
+
+    def get_cash(self) -> float:
+        return self._cash
+
+    def get_portfolio_value(self) -> float:
+        value = self._cash
+        for pos in self._positions.values():
+            try:
+                mark = self.get_price(pos.market_id)
+            except AgentTraderError:
+                mark = pos.avg_cost
+            value += pos.contracts * mark
+        return value
+
+    def buy(self, market_id, contracts, side="yes", order_type="market", limit_price=None) -> str:
+        contracts = float(contracts)
+        if contracts <= 0:
+            raise AgentTraderError("InvalidOrder", "contracts must be > 0")
+        ob = self.get_orderbook(market_id)
+        fill = self._fill_model.simulate_buy(contracts, ob, order_type=order_type, limit_price=limit_price)
+        if not fill.filled or fill.contracts <= 0:
+            raise AgentTraderError("OrderNotFilled", f"Buy not filled for market {market_id}")
+
+        cost = fill.contracts * fill.fill_price
+        if self._cash < cost:
+            raise AgentTraderError("InsufficientCashError", f"Insufficient cash for buy: need {cost:.2f}")
+        self._cash -= cost
+
+        market = self._market_map.get(market_id)
+        if market is None:
+            raise MarketNotCachedError(market_id)
+
+        current = self._positions.get(market_id)
+        if current is None:
+            current = PositionModel(
+                id=str(uuid.uuid4()),
+                market_id=market_id,
+                platform=market.platform,
+                side=side,
+                contracts=fill.contracts,
+                avg_cost=fill.fill_price,
+                opened_at=self._current_ts,
+            )
+        else:
+            total_contracts = current.contracts + fill.contracts
+            current.avg_cost = ((current.avg_cost * current.contracts) + cost) / total_contracts
+            current.contracts = total_contracts
+        self._positions[market_id] = current
+
+        trade_id = str(uuid.uuid4())
+        self._trades.append(
+            {
+                "id": trade_id,
+                "market_id": market_id,
+                "market_title": market.title,
+                "action": "buy",
+                "side": side,
+                "contracts": fill.contracts,
+                "price": fill.fill_price,
+                "slippage": fill.slippage,
+                "filled_at": self._current_ts,
+                "pnl": None,
+                "resolved_correctly": None,
+            }
+        )
+        self._slippage_samples.append(fill.slippage)
+        self._portfolio_changed = True
+        return trade_id
+
+    def sell(self, market_id, contracts=None) -> str:
+        position = self._positions.get(market_id)
+        if not position:
+            raise AgentTraderError("NoPositionError", f"No open position for market {market_id}")
+        contracts_to_sell = float(contracts if contracts is not None else position.contracts)
+        contracts_to_sell = min(contracts_to_sell, position.contracts)
+        if contracts_to_sell <= 0:
+            raise AgentTraderError("InvalidOrder", "contracts must be > 0")
+
+        ob = self.get_orderbook(market_id)
+        fill = self._fill_model.simulate_sell(contracts_to_sell, ob)
+        if not fill.filled:
+            raise AgentTraderError("OrderNotFilled", f"Sell not filled for market {market_id}")
+
+        proceeds = fill.contracts * fill.fill_price
+        cost_basis = fill.contracts * position.avg_cost
+        pnl = proceeds - cost_basis
+        self._cash += proceeds
+
+        position.contracts -= fill.contracts
+        if position.contracts <= 0:
+            self._positions.pop(market_id, None)
+        else:
+            self._positions[market_id] = position
+
+        market = self._market_map.get(market_id)
+        trade_id = str(uuid.uuid4())
+        self._trades.append(
+            {
+                "id": trade_id,
+                "market_id": market_id,
+                "market_title": market.title if market else market_id,
+                "action": "sell",
+                "side": position.side,
+                "contracts": fill.contracts,
+                "price": fill.fill_price,
+                "slippage": fill.slippage,
+                "filled_at": self._current_ts,
+                "pnl": pnl,
+            }
+        )
+        self._slippage_samples.append(fill.slippage)
+        self._portfolio_changed = True
+        return trade_id
+
+    def settle_positions(self, market_id: str, outcome: str) -> float:
+        pos = self._positions.get(market_id)
+        if not pos:
+            return 0.0
+        payout_price = 1.0 if outcome == pos.side else 0.0
+        pnl = pos.contracts * (payout_price - pos.avg_cost)
+        self._cash += pos.contracts * payout_price
+        resolved_correctly = pnl > 0
+        for trade in self._trades:
+            if trade.get("action") != "buy":
+                continue
+            if trade.get("market_id") != market_id:
+                continue
+            if trade.get("side") != pos.side:
+                continue
+            if trade.get("resolved_correctly") is None:
+                trade["resolved_correctly"] = resolved_correctly
+
+        market = self._market_map.get(market_id)
+        trade_id = str(uuid.uuid4())
+        self._trades.append(
+            {
+                "id": trade_id,
+                "market_id": market_id,
+                "market_title": market.title if market else market_id,
+                "action": "resolution",
+                "side": pos.side,
+                "contracts": pos.contracts,
+                "price": payout_price,
+                "slippage": 0.0,
+                "filled_at": self._current_ts,
+                "pnl": pnl,
+            }
+        )
+        self._positions.pop(market_id, None)
+        self._portfolio_changed = True
+        return pnl
+
+    def log(self, message: str) -> None:
+        self._logs.append({"timestamp": self._current_ts, "message": message})
+
+    def set_state(self, key: str, value) -> None:
+        self._state[key] = value
+
+    def get_state(self, key: str, default=None):
+        return self._state.get(key, default)
+
+    def compile_results(self) -> dict:
+        return {
+            "initial_cash": self._initial_cash,
+            "final_value": self.get_portfolio_value(),
+            "equity_curve": self._equity_curve,
+            "trades": self._trades,
+            "logs": self._logs,
+            "avg_slippage": (sum(self._slippage_samples) / len(self._slippage_samples)) if self._slippage_samples else 0.0,
+        }
+
+    def _synthesize_orderbook(self, price: float, market_id: str) -> OrderBook:
+        from agenttrader.data.models import OrderLevel
+
+        spread = 0.01
+        return OrderBook(
+            market_id=market_id,
+            timestamp=self._current_ts,
+            bids=[OrderLevel(price=max(0.0, price - spread), size=1_000_000.0)],
+            asks=[OrderLevel(price=min(1.0, price + spread), size=1_000_000.0)],
+        )
 
 
 class LiveContext(ExecutionContext):

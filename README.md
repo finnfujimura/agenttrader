@@ -1,538 +1,336 @@
 # agenttrader
 
-`agenttrader` is a toolkit that lets AI agents autonomously research, write, backtest, and deploy prediction market trading strategies — without human intervention.
+`agenttrader` is a local toolkit for agent-driven prediction market research, backtesting, and paper trading across Polymarket and Kalshi.
 
-Give an agent a goal. It handles everything: discovering markets on Polymarket and Kalshi, analyzing price history, writing strategy code, running the backtesting loop, and starting a live paper trading daemon. Running strategies hot-reload automatically when the strategy file changes — agents can iterate on live deployments without restarting.
+It is built for coding agents first (Codex, Claude Code, Cursor, OpenCode), while still being easy to use directly from the CLI.
 
-All market data flows through [pmxt](https://github.com/Polymarket/pmxt), unified across Polymarket and Kalshi.
+## What Changed Recently
 
-**Primary users:** AI coding agents (Claude Code, Codex, OpenCode, Cursor).  
-**Secondary users:** Developers who want to write and test strategies manually.
+- Migrated market connectivity to **PMXT**.
+- Added **dataset index build** (`agenttrader dataset build-index`) for faster full-history backtests.
+- Added **streaming backtest engine** with lower memory usage.
+- Added **artifact-backed backtest storage**:
+  - `backtest` returns summary metrics.
+  - `backtest show <run_id>` loads full `equity_curve` and `trades` from artifact files.
+- Added optional backtest guardrails:
+  - `--max-markets`
+  - `--fidelity exact_trade|bar_1h|bar_1d`
+- Added `sync --resolved` for resolved/expired market syncing.
+- Added `resolution_accuracy` and `by_category` to backtest output.
+- Added paper trading comparison:
+  - `paper compare <id1> <id2>`
+  - `paper compare --all`
+- Added market screener:
+  - `markets screen --condition "..."`
+- Added experiment tracking in `~/.agenttrader/experiments.json`.
+- Added MCP compound tools (`research_markets`, `validate_and_backtest`) and error `fix` hints.
+- Added performance logs for CLI and MCP calls.
 
----
+## Requirements
 
-## How It Works
+- Python 3.12+
+- `pip`
+- Node.js (required by PMXT sidecar)
 
-```
-Agent receives goal
-       │
-       ▼
-agenttrader dataset download  ← one-time parquet history setup for backtesting
-       │
-       ▼
-agenttrader markets list      ← discover opportunities
-       │
-       ▼
-[agent writes strategy.py]
-       │
-       ▼
-agenttrader validate      ← catch errors before they waste time
-       │
-       ▼
-agenttrader backtest      ← test against real historical data
-       │
-       ├─── metrics look bad? agent edits strategy.py, loops back
-       │
-       ▼
-agenttrader paper start   ← deploy as background daemon
-       │
-       ▼
-[agent edits strategy.py] ← daemon hot-reloads, no restart needed
-```
-
-All state lives locally in `~/.agenttrader/`. No cloud backend. No app account required. PMXT market data does not require an API key.
-
----
-
-## Quickstart
-
-### Prerequisites
-
-```bash
-python --version    # 3.12+ required
-pip --version
-```
-
-Install PMXT dependencies (Python package + Node.js sidecar):
-
-```bash
-pip install pmxt
-npm install -g pmxtjs
-```
-
-### Install
+## Install
 
 ```bash
 pip install agenttrader
+```
+
+PMXT is installed as a Python dependency, but you still need the Node sidecar:
+
+```bash
+npm install -g pmxtjs
+```
+
+## Quickstart
+
+```bash
 agenttrader init
 ```
 
-### Verify it works
+`init` creates `~/.agenttrader`, runs DB migrations, and prompts for optional dataset download.
 
-```bash
-agenttrader sync --platform polymarket --days 2 --limit 5 --json
-agenttrader markets list --json
-```
-
-If you see markets in the output, you're ready.
-
-Optional but recommended for full-history backtests:
+### Verify local data setup
 
 ```bash
 agenttrader dataset verify
+```
+
+`dataset verify` prefers `./data` if present; otherwise it checks `~/.agenttrader/data`.
+
+### Download historical dataset (recommended for full backtests)
+
+```bash
 agenttrader dataset download
+agenttrader dataset build-index
 ```
 
----
+Use `--force` to rebuild the index:
 
-## Using agenttrader With Your Agent
-
-There are two ways to connect your agent to agenttrader. **MCP is recommended** — it's the most natural interface for agents. CLI mode works as a fallback if MCP isn't available.
-
----
-
-### Option A: MCP (Recommended)
-
-MCP lets your agent call agenttrader tools as native function calls — no shell commands, no output parsing. The agent calls `get_markets()`, `run_backtest()`, `start_paper_trade()` directly inside its reasoning loop.
-
-**Setup for Claude Code**
-
-Add this to `.claude/mcp.json` in your project directory:
-
-```json
-{
-  "mcpServers": {
-    "agenttrader": {
-      "command": "agenttrader",
-      "args": ["mcp"]
-    }
-  }
-}
+```bash
+agenttrader dataset build-index --force --json
 ```
 
-Restart Claude Code. The MCP server starts automatically — you never run `agenttrader mcp` manually.
-
-**Setup for Cursor**
-
-In Cursor settings → MCP → add server:
-
-```json
-{
-  "name": "agenttrader",
-  "command": "agenttrader",
-  "args": ["mcp"],
-  "transport": "stdio"
-}
-```
-
-**Setup for any other MCP-compatible agent**
-
-```json
-{
-  "mcpServers": {
-    "agenttrader": {
-      "command": "agenttrader",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-The transport is `stdio`. The agent spawns `agenttrader mcp` as a subprocess and communicates over stdin/stdout. No port, no server to keep running.
-
-**Available MCP tools**
-
-| Category | Tools |
-|----------|-------|
-| Markets | `get_markets`, `get_price`, `get_history`, `match_markets`, `research_markets` |
-| Strategy | `validate_strategy`, `run_backtest`, `validate_and_backtest`, `get_backtest`, `list_backtests` |
-| Paper trading | `start_paper_trade`, `get_portfolio`, `stop_paper_trade`, `list_paper_trades` |
-| Data | `sync_data` |
-
-**MCP response behavior**
-
-- Errors now include a machine-actionable `fix` field when possible.
-- `get_history` returns analytics by default (current price, 7d avg delta, 24h change, trend, volatility).
-- `get_history` raw points are optional via `include_raw=true` (default is `false` to reduce token usage).
-- `research_markets` composes `sync_data -> get_markets -> get_history` into one call.
-- `validate_and_backtest` composes `validate_strategy -> run_backtest` into one call.
-
-**Example agent prompts (MCP mode)**
-
-Once connected, give your agent natural language goals:
-
-```
-Use agenttrader to find the 10 most liquid Polymarket politics markets.
-Build a mean reversion strategy in ./strategy.py. Backtest it from
-2024-06-01 to 2024-12-31 with $10,000 starting cash. Iterate until
-Sharpe ratio > 1.0 and max drawdown better than -20%. Then start
-paper trading and report the portfolio_id.
-```
-
-```
-Check my current paper trading portfolio. If any position has been
-open for more than 7 days with negative PnL, update the strategy
-to add a stop-loss and let me know what changed.
-```
-
-```
-Find prediction markets on both Polymarket and Kalshi covering the
-same event. Write an arbitrage strategy that trades the price
-discrepancy when it exceeds 3 cents. Backtest it and paper trade it.
-```
-
-The agent will chain tool calls autonomously — setting up data, writing and editing `strategy.py`, running backtests, reading metrics, iterating, and deploying — without you touching a terminal.
-
----
-
-### Option B: CLI Mode
-
-If your agent can run shell commands (most can), it can use agenttrader without any MCP setup. Every command supports `--json` for clean, parseable output.
-
-**Setup**
-
-No configuration needed beyond the initial install. Your agent runs commands like:
+### Run a minimal workflow
 
 ```bash
 agenttrader sync --platform polymarket --days 7 --limit 20 --json
-agenttrader markets list --platform polymarket --json
+agenttrader markets list --platform polymarket --limit 10 --json
 agenttrader validate ./strategy.py --json
 agenttrader backtest ./strategy.py --from 2024-01-01 --to 2024-06-01 --json
-agenttrader paper start ./strategy.py --cash 5000 --json
-agenttrader paper status <portfolio_id> --json
+agenttrader paper start ./strategy.py --cash 10000 --json
 ```
 
-**Example agent prompts (CLI mode)**
+## Agent-First Usage
 
-For Claude Code without MCP configured:
+### MCP (recommended)
 
-```
-Use the agenttrader CLI to research Polymarket crypto markets.
-Run: agenttrader markets list --platform polymarket --category crypto --json
-Then build a strategy in ./strategy.py and iterate using:
-  agenttrader validate ./strategy.py --json
-  agenttrader backtest ./strategy.py --from 2024-01-01 --to 2024-06-01 --json
-Keep iterating until Sharpe > 1.0, then run:
-  agenttrader paper start ./strategy.py --json
-Report the portfolio_id when done.
-```
-
-**The JSON contract**
-
-Every `--json` response follows this shape:
-
-```json
-{ "ok": true, "...": "..." }
-```
-
-```json
-{ "ok": false, "error": "ErrorType", "message": "Human-readable details", "fix": "Next action for the agent" }
-```
-
-Strategy errors include line numbers and tracebacks so agents can self-heal:
+Run agenttrader as an MCP server via stdio:
 
 ```json
 {
-  "ok": false,
-  "error": "StrategyError",
-  "message": "name 'undefined_var' is not defined",
-  "file": "./strategy.py",
-  "line": 14,
-  "traceback": "Traceback (most recent call last):\n  ..."
+  "mcpServers": {
+    "agenttrader": {
+      "command": "agenttrader",
+      "args": ["mcp"]
+    }
+  }
 }
 ```
 
----
+### MCP tools (high-level)
 
-### The Agent Iteration Loop
+- Markets: `get_markets`, `get_price`, `get_history`, `match_markets`, `research_markets`
+- Strategy/backtests: `validate_strategy`, `run_backtest`, `validate_and_backtest`, `get_backtest`, `list_backtests`
+- Paper: `start_paper_trade`, `get_portfolio`, `stop_paper_trade`, `list_paper_trades`
+- Data: `sync_data`
 
-Whether using MCP or CLI, the core loop looks like this:
+### MCP behavior improvements
 
-```
-1. ensure backtest data is available (`agenttrader dataset verify`, then `agenttrader dataset download`)
-2. inspect markets + history
-3. write strategy.py
-4. validate --json          → fix any errors
-5. backtest --json          → read Sharpe, drawdown, win rate
-6. edit strategy.py         → improve based on metrics
-7. repeat 4–6 until satisfied
-8. paper start              → deploy daemon
-9. paper status --json      → monitor
-10. edit strategy.py live   → daemon hot-reloads automatically
-```
+- Structured errors include a `fix` field when possible.
+- `get_history` returns analytics by default; raw points are opt-in via `include_raw=true`.
+- `research_markets` combines sync + market listing + history fetch.
+- `validate_and_backtest` combines validate + backtest.
 
-Steps 3–7 are where agents spend most of their time. A well-prompted agent will iterate 5–10 times before deploying, each time reading the structured backtest metrics and making targeted improvements to the strategy logic.
+## CLI Commands
 
----
-
-## Strategy Authoring
-
-Strategies are plain Python files that subclass `BaseStrategy`. Write them in any editor — or let your agent write them.
-
-```python
-from agenttrader import BaseStrategy
-
-class MyStrategy(BaseStrategy):
-
-    def on_start(self):
-        # Subscribe to markets — called once at startup
-        self.subscribe(platform="polymarket", category="politics")
-
-    def on_market_data(self, market, price, orderbook):
-        # Called on every price update for subscribed markets
-        history = self.get_history(market.id, lookback_hours=48)
-        if len(history) < 2:
-            return
-
-        avg = sum(h.yes_price for h in history) / len(history)
-
-        if price < avg - 0.08 and self.get_position(market.id) is None:
-            self.buy(market.id, contracts=20)
-            self.log(f"BUY {market.title[:40]} @ {price:.3f}")
-
-        elif price > avg + 0.05 and self.get_position(market.id):
-            self.sell(market.id)
-            self.log(f"SELL {market.title[:40]} @ {price:.3f}")
-
-    def on_schedule(self, now, market):
-        # Called every 15 minutes — use for time-based logic
-        hours_left = (market.close_time - now.timestamp()) / 3600
-        if hours_left < 3 and self.get_position(market.id):
-            self.sell(market.id)
-            self.log(f"Pre-expiry close: {hours_left:.1f}h left")
-
-    def on_resolution(self, market, outcome, pnl):
-        # Called when a market resolves
-        self.log(f"Resolved: {outcome}, PnL: ${pnl:.2f}")
-```
-
-**Available methods inside a strategy:**
-
-```python
-# Subscribe + discover
-self.subscribe(platform, category, tags, market_ids)
-self.search_markets(query, platform)
-
-# Price + data (time-bounded in backtesting — no look-ahead bias)
-self.get_price(market_id)               # current YES price (0.0–1.0)
-self.get_orderbook(market_id)           # bids, asks, best_bid, best_ask, mid
-self.get_history(market_id, lookback_hours)  # list of PricePoint objects
-
-# Portfolio
-self.get_position(market_id)            # open Position or None
-self.get_cash()                         # available cash
-self.get_portfolio_value()              # cash + mark-to-market positions
-
-# Orders
-self.buy(market_id, contracts, side="yes", order_type="market")
-self.sell(market_id, contracts=None)    # None = sell entire position
-
-# Utilities
-self.log(message)                       # appears in dashboard + paper status
-self.set_state(key, value)              # persist state across calls
-self.get_state(key, default)
-```
-
-Do not call PMXT directly from a strategy. Do not import `requests`, `httpx`, `pmxt`, or any networking library. All data access goes through `self.*` methods.
-
----
-
-## All Commands
-
-### Setup
+### Setup and config
 
 ```bash
 agenttrader init
 agenttrader config show
-agenttrader dataset verify
-agenttrader dataset download
+agenttrader config set <key> <value>
+agenttrader config get <key>
 ```
 
-### Data Sync
+### Dataset
 
 ```bash
-agenttrader sync                                          # live sync for paper trading
-agenttrader sync --platform polymarket --days 7
-agenttrader sync --platform kalshi --days 7
-agenttrader sync --resolved --days 365 --platform polymarket --json   # resolved/expired markets
-agenttrader sync --markets <id1> --markets <id2>          # specific markets
-agenttrader sync --json
+agenttrader dataset verify
+agenttrader dataset download
+agenttrader dataset build-index [--force] [--json]
 ```
 
-`sync` is still used for paper trading and live cache updates. Backtesting automatically prefers the parquet dataset when available.
+### Sync (live/cache)
+
+```bash
+agenttrader sync --platform all --days 7 --limit 100
+agenttrader sync --resolved --platform polymarket --days 365 --json
+agenttrader sync --markets <id1> --markets <id2> --json
+```
 
 ### Markets
 
 ```bash
-agenttrader markets list
-agenttrader markets list --platform polymarket --limit 20 --json
-agenttrader markets list --category politics --min-volume 50000
+agenttrader markets list --platform all --limit 100 --json
 agenttrader markets price <market_id> --json
 agenttrader markets history <market_id> --days 30 --json
-agenttrader markets screen --condition "current_price < 0.30" --json
-agenttrader markets screen --condition "price_vs_7d_avg < -0.10" --platform polymarket --limit 20 --json
-agenttrader markets match --polymarket-slug "<slug>"
-agenttrader markets match --kalshi-ticker "<ticker>"
+agenttrader markets match --polymarket-slug "..." --json
+agenttrader markets match --kalshi-ticker "..." --json
 ```
 
-`markets screen` runs only on local cache data (SQLite) and supports fixed metric expressions:
+### Market screener
 
-`price_vs_7d_avg`, `current_price`, `volume`, `days_until_close`, `price_change_24h` with operators `<`, `>`, `<=`, `>=`, `==`.
+```bash
+agenttrader markets screen --condition "current_price < 0.30" --json
+agenttrader markets screen --condition "price_vs_7d_avg < -0.10" --platform polymarket --limit 20 --json
+```
+
+Supported condition metrics:
+
+- `price_vs_7d_avg`
+- `current_price`
+- `volume`
+- `days_until_close`
+- `price_change_24h`
+
+Supported operators: `<`, `>`, `<=`, `>=`, `==`.
 
 ### Validate
 
 ```bash
-agenttrader validate ./strategy.py
 agenttrader validate ./strategy.py --json
 ```
 
-### Backtest
+### Backtests
+
+Run:
 
 ```bash
-agenttrader backtest ./strategy.py --from 2024-01-01 --to 2024-06-01
-agenttrader backtest ./strategy.py --from 2024-01-01 --to 2024-06-01 --cash 10000
-agenttrader backtest ./strategy.py --from 2024-01-01 --to 2024-06-01 --json
+agenttrader backtest ./strategy.py --from 2024-01-01 --to 2024-06-01 --cash 10000 --json
+```
+
+Optional guardrails:
+
+```bash
+agenttrader backtest ./strategy.py --from 2024-01-01 --to 2024-06-01 --max-markets 100 --fidelity bar_1h --json
+```
+
+- `--max-markets`: optional cap (default: no cap)
+- `--fidelity`: `exact_trade` (default), `bar_1h`, or `bar_1d`
+
+List runs:
+
+```bash
 agenttrader backtest list --json
+```
+
+Show one run:
+
+```bash
 agenttrader backtest show <run_id> --json
 ```
 
-Backtest results include:
+`backtest` returns summary metrics. Full heavy arrays are stored in artifacts and returned by `backtest show`.
 
-```json
-{
-  "metrics": {
-    "total_return_pct": 32.4,
-    "sharpe_ratio": 1.84,
-    "sortino_ratio": 2.31,
-    "max_drawdown_pct": -12.3,
-    "win_rate": 0.61,
-    "profit_factor": 2.14,
-    "calmar_ratio": 2.63,
-    "avg_slippage": 0.008,
-    "total_trades": 47
-  },
-  "resolution_accuracy": {
-    "bought_yes_resolved_yes_pct": 0.64,
-    "bought_no_resolved_no_pct": 0.58,
-    "sample_size": 47
-  },
-  "by_category": {
-    "politics": { "trades": 23, "win_rate": 0.65, "return_pct": 18.2 },
-    "sports": { "trades": 14, "win_rate": 0.43, "return_pct": -4.1 }
-  },
-  "equity_curve": [...],
-  "trades": [...]
-}
-```
+Backtest output includes:
 
-### Paper Trading
+- `metrics`
+- `resolution_accuracy`
+- `by_category`
+- `data_source`, `fidelity`, `max_markets_applied`, `markets_tested`
+
+### Paper trading
 
 ```bash
-agenttrader paper start ./strategy.py --json
-agenttrader paper start ./strategy.py --cash 5000 --json
-agenttrader paper start ./strategy.py --no-daemon --json   # blocking, for testing
-agenttrader paper list --json
+agenttrader paper start ./strategy.py --cash 10000 --json
 agenttrader paper status <portfolio_id> --json
-agenttrader paper compare <portfolio_id_1> <portfolio_id_2> --json
-agenttrader paper compare --all --json
+agenttrader paper list --json
 agenttrader paper stop <portfolio_id> --json
 agenttrader paper stop --all --json
 ```
 
-**Hot-reload:** edit `strategy.py` while a paper trade is running — the daemon detects the change and reloads automatically. Portfolio state is preserved. No restart needed. `paper status` shows `reload_count` to confirm it happened.
+Compare parallel strategies:
 
-`paper compare` computes side-by-side stats per portfolio from existing SQLite tables (`paper_portfolios`, `positions`, `trades`): portfolio value, unrealized PnL, win rate, avg PnL per sell trade, open positions, and reload count.
+```bash
+agenttrader paper compare <portfolio_id_1> <portfolio_id_2> --json
+agenttrader paper compare --all --json
+```
+
+Strategies hot-reload on file changes; `reload_count` tracks reloads.
 
 ### Experiments
 
 ```bash
 agenttrader experiments log <backtest_run_id> --note "baseline" --tags "politics,mean-reversion" --json
-agenttrader experiments log --portfolio <portfolio_id> --note "live run snapshot" --json
+agenttrader experiments log --portfolio <portfolio_id> --note "live snapshot" --json
 agenttrader experiments list --json
-agenttrader experiments note <experiment_id> "updated note" --json
 agenttrader experiments show <experiment_id> --json
+agenttrader experiments note <experiment_id> "updated note" --json
 agenttrader experiments compare <exp_id_1> <exp_id_2> --json
 ```
-
-Experiments are persisted in `~/.agenttrader/experiments.json` and are sorted newest-first in `experiments list`.
 
 ### Dashboard
 
 ```bash
-agenttrader dashboard             # http://localhost:8080
+agenttrader dashboard
 agenttrader dashboard --port 9090
 ```
 
-Read-only local dashboard showing active paper trades, positions, trade history, strategy logs, and backtest results with equity curves.
+## Strategy Interface
 
-Dashboard routes include:
+Example:
 
-- `#/` overview
-- `#/paper` paper portfolios
-- `#/compare` side-by-side stats for all running paper portfolios
-- `#/backtests` backtest runs
-- `#/markets` cached markets
+```python
+from agenttrader import BaseStrategy
 
-### Maintenance
+class MyStrategy(BaseStrategy):
+    def on_start(self):
+        self.subscribe(platform="polymarket", category="politics")
 
-```bash
-agenttrader prune --older-than 90d --dry-run --json
-agenttrader prune --older-than 90d --json
+    def on_market_data(self, market, price, orderbook):
+        history = self.get_history(market.id, lookback_hours=48)
+        if len(history) < 2:
+            return
+        avg = sum(p.yes_price for p in history) / len(history)
+        if price < avg - 0.08 and self.get_position(market.id) is None:
+            self.buy(market.id, contracts=20)
+        elif price > avg + 0.05 and self.get_position(market.id):
+            self.sell(market.id)
+
+    def on_schedule(self, now, market):
+        pass
+
+    def on_resolution(self, market, outcome, pnl):
+        self.log(f"Resolved: {outcome}, pnl={pnl:.2f}")
 ```
 
----
+Available methods include:
 
-## Local Storage
+- `subscribe`, `search_markets`
+- `get_price`, `get_orderbook`, `get_history`
+- `get_position`, `get_cash`, `get_portfolio_value`
+- `buy`, `sell`
+- `log`, `set_state`, `get_state`
 
-```
+## Storage Layout
+
+```text
 ~/.agenttrader/
-├── config.yaml        # scheduler and sync preferences
-├── db.sqlite          # markets, backtests, positions, trade ledger
-├── data/              # parquet dataset (polymarket + kalshi history)
-├── experiments.json   # experiment memory/log for strategy iterations
+├── config.yaml
+├── db.sqlite
+├── data/                          # parquet dataset (if downloaded)
+├── backtest_index.duckdb          # normalized index (if built)
+├── backtest_artifacts/            # msgpack+gzip heavy run artifacts
+├── experiments.json               # experiment memory
 ├── logs/
-│   └── performance.jsonl  # call timing logs (CLI + MCP)
-└── orderbooks/        # compressed orderbook snapshots by market/day
+│   └── performance.jsonl          # CLI/MCP timing logs
+└── orderbooks/
 ```
 
-`db.sqlite` is a standard SQLite file. Agents can query it directly with SQL for custom analysis — for example, `SELECT * FROM markets WHERE volume > 10000 ORDER BY volume DESC`.
+## Data Source Selection for Backtests
 
-PMXT market-data calls are unauthenticated; no API key is required for sync and paper-trading workflows.
+Backtests auto-select the fastest available source:
 
-Performance logging is enabled by default. Every CLI command and MCP tool call appends a JSON line to `~/.agenttrader/logs/performance.jsonl` with `operation`, `status`, `duration_ms`, `session_id`, and timestamps.
-
----
+1. `normalized-index` (`backtest_index.duckdb`) if built
+2. parquet dataset fallback
+3. SQLite sync-cache fallback
 
 ## Troubleshooting
 
-| Problem | Fix |
-|---------|-----|
-| `agenttrader: command not found` | Activate your virtual environment: `source .venv/bin/activate` |
-| Not initialized | `agenttrader init` |
-| Market not in cache | `agenttrader sync ...` |
-| Strategy validation errors | `agenttrader validate ./strategy.py --json` — read `errors` array |
-| Backtest has no trades | Date range has no price movement — try wider range or sync more markets |
-| Dashboard shows blank | Ensure `agenttrader dashboard` is running and open `http://127.0.0.1:8080`; check command logs for startup errors |
-| MCP not connecting | Verify `agenttrader mcp` runs without error; check `.claude/mcp.json` path |
-
----
+- `agenttrader: command not found`
+  - Activate your environment or reinstall: `pip install agenttrader`
+- `NotInitialized`
+  - Run `agenttrader init`
+- `DatasetNotFound` on index build
+  - Run `agenttrader dataset download` first
+- PMXT import/sidecar issues
+  - Ensure `pip install pmxt` and `npm install -g pmxtjs`
+- Empty backtests
+  - Expand date range, sync more data, or build index from full dataset
 
 ## Development
 
 ```bash
-git clone https://github.com/yourname/agenttrader
+git clone https://github.com/finnfujimura/agenttrader
 cd agenttrader
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -e ".[dev]"
-
-ruff check agenttrader tests
-python -m compileall agenttrader tests
-
-# Integration tests
-python tests/integration/test_full_workflow.py
+pytest -q
 ```
-
----
 
 ## License
 

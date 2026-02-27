@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import heapq
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -9,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 import numpy as np
 
 from agenttrader.core.base_strategy import BaseStrategy
-from agenttrader.core.context import BacktestContext
+from agenttrader.core.context import BacktestContext, StreamingBacktestContext
 from agenttrader.core.fill_model import FillModel
 from agenttrader.data.models import Market, Platform
 
@@ -21,6 +22,9 @@ class BacktestConfig:
     end_date: str
     initial_cash: float = 10000.0
     schedule_interval_minutes: int = 15
+    history_buffer_hours: int = 168
+    max_markets: int | None = None
+    fidelity: str = "exact_trade"
 
 
 class SubscriptionCollector:
@@ -93,12 +97,40 @@ class SubscriptionCollector:
 
 
 class BacktestEngine:
-    def __init__(self, data_source, orderbook_store=None):
+    def __init__(self, data_source=None, orderbook_store=None):
         self._data = data_source
         self._ob_store = orderbook_store
         self._fill_model = FillModel()
 
     def run(self, strategy_class: type, config: BacktestConfig) -> dict:
+        from agenttrader.data.index_adapter import BacktestIndexAdapter
+
+        index = BacktestIndexAdapter()
+        if index.is_available():
+            try:
+                return self._run_streaming(strategy_class, config, index)
+            finally:
+                index.close()
+        return self._run_legacy(strategy_class, config)
+
+    def _ensure_legacy_data_source(self) -> None:
+        if self._data is not None:
+            return
+        from agenttrader.data.cache import DataCache
+        from agenttrader.data.orderbook_store import OrderBookStore
+        from agenttrader.data.parquet_adapter import ParquetDataAdapter
+        from agenttrader.db import get_engine
+
+        adapter = ParquetDataAdapter()
+        if adapter.is_available():
+            self._data = adapter
+            self._ob_store = None
+            return
+        self._data = DataCache(get_engine())
+        self._ob_store = OrderBookStore()
+
+    def _run_legacy(self, strategy_class: type, config: BacktestConfig) -> dict:
+        self._ensure_legacy_data_source()
         from agenttrader.data.parquet_adapter import ParquetDataAdapter
 
         start_dt = datetime.strptime(config.start_date, "%Y-%m-%d").replace(tzinfo=UTC)
@@ -222,12 +254,186 @@ class BacktestEngine:
             "end_date": config.end_date,
             "initial_cash": config.initial_cash,
             "data_source": "parquet" if using_parquet else "sqlite",
+            "fidelity": "exact_trade",
+            "max_markets_applied": None,
+            "markets_tested": len(price_data),
             "final_value": raw["final_value"],
             "metrics": metrics,
             "resolution_accuracy": resolution_accuracy,
             "by_category": by_category,
             "equity_curve": raw["equity_curve"],
             "trades": raw["trades"],
+        }
+
+    def _run_streaming(self, strategy_class: type, config: BacktestConfig, index) -> dict:
+        from agenttrader.data.parquet_adapter import ParquetDataAdapter
+
+        start_dt = datetime.strptime(config.start_date, "%Y-%m-%d").replace(tzinfo=UTC)
+        end_dt = datetime.strptime(config.end_date, "%Y-%m-%d").replace(tzinfo=UTC) + timedelta(days=1) - timedelta(seconds=1)
+        start_ts = int(start_dt.timestamp())
+        end_ts = int(end_dt.timestamp())
+
+        all_candidate_ids = index.get_market_ids(platform="all", start_ts=start_ts, end_ts=end_ts)
+        if not all_candidate_ids:
+            return {
+                "ok": False,
+                "error": "NoDataInRange",
+                "message": "No normalized data available for the requested date range. Run dataset build-index or adjust dates.",
+            }
+
+        parquet = self._data if isinstance(self._data, ParquetDataAdapter) else ParquetDataAdapter()
+        if not parquet.is_available():
+            return {
+                "ok": False,
+                "error": "DatasetNotFound",
+                "message": "Parquet metadata unavailable. Run: agenttrader dataset download",
+            }
+
+        all_markets = parquet.get_markets(platform="all", limit=50_000)
+        candidate_ids = {market_id for market_id, _platform in all_candidate_ids}
+        market_map: dict[str, Market] = {m.id: m for m in all_markets if m.id in candidate_ids}
+        if not market_map:
+            market_map = {m.id: m for m in all_markets}
+
+        collector = SubscriptionCollector(market_map)
+        probe = strategy_class(collector)
+        probe.on_start()
+        subscribed_ids = set(collector.get_subscribed_ids())
+
+        final_ids = subscribed_ids & candidate_ids
+        subscribed_markets = [market_map[mid] for mid in final_ids if mid in market_map]
+        if not subscribed_markets:
+            return {
+                "ok": False,
+                "error": "NoSubscriptions",
+                "message": (
+                    "Strategy subscribed to 0 markets with data in the requested date range. "
+                    "Check your subscribe() call and date range."
+                ),
+            }
+
+        max_markets_applied = None
+        if config.max_markets is not None and len(subscribed_markets) > config.max_markets:
+            counts = {mid: n for mid, _platform, n in index.get_market_ids_with_counts(platform="all", start_ts=start_ts, end_ts=end_ts)}
+            subscribed_markets.sort(key=lambda m: counts.get(m.id, 0), reverse=True)
+            subscribed_markets = subscribed_markets[: config.max_markets]
+            max_markets_applied = int(config.max_markets)
+
+        subscribed_map = {m.id: m for m in subscribed_markets}
+        context = StreamingBacktestContext(
+            initial_cash=config.initial_cash,
+            market_map=subscribed_map,
+            fill_model=self._fill_model,
+            history_buffer_hours=config.history_buffer_hours,
+        )
+        context._subscriptions = set(subscribed_map.keys())
+        context.advance_time(start_ts)
+        context.record_snapshot(start_ts)
+
+        strategy = strategy_class(context)
+        strategy.on_start()
+
+        fidelity = getattr(config, "fidelity", "exact_trade") or "exact_trade"
+        if fidelity not in {"exact_trade", "bar_1h", "bar_1d"}:
+            fidelity = "exact_trade"
+        bar_seconds = 3600 if fidelity == "bar_1h" else 86400 if fidelity == "bar_1d" else None
+
+        def _iter_for(market: Market):
+            if bar_seconds is not None:
+                return index.stream_market_history_resampled(
+                    market.id,
+                    market.platform.value,
+                    start_ts,
+                    end_ts,
+                    bar_seconds,
+                )
+            return index.stream_market_history(
+                market.id,
+                market.platform.value,
+                start_ts,
+                end_ts,
+            )
+
+        iterators = {m.id: _iter_for(m) for m in subscribed_markets}
+        for market in subscribed_markets:
+            previous = index.get_latest_price_before(market.id, market.platform.value, start_ts)
+            if previous is not None:
+                context.set_price_cursor(market.id, previous)
+
+        heap: list[tuple[int, str, object]] = []
+        for market in subscribed_markets:
+            first = next(iterators[market.id], None)
+            if first is not None:
+                heapq.heappush(heap, (int(first.timestamp), market.id, first))
+
+        schedule_interval = max(int(config.schedule_interval_minutes), 1) * 60
+        last_scheduled = {m.id: start_ts for m in subscribed_markets}
+        last_snapshot_ts = start_ts
+
+        while heap:
+            ts, market_id, point = heapq.heappop(heap)
+            if ts < start_ts or ts > end_ts:
+                continue
+            market = subscribed_map.get(market_id)
+            if market is None:
+                continue
+
+            context.advance_time(int(ts))
+            context.set_active_market(market_id)
+            context.set_price_cursor(market_id, float(point.yes_price))
+            context.push_history(market_id, point)
+            strategy.on_market_data(market, float(point.yes_price), context.get_orderbook(market_id))
+
+            if ts - last_scheduled[market_id] >= schedule_interval:
+                strategy.on_schedule(datetime.fromtimestamp(ts, tz=UTC), market)
+                last_scheduled[market_id] = ts
+
+            if context.portfolio_changed_since_last_check() or ts - last_snapshot_ts >= 3600:
+                context.record_snapshot(ts)
+                last_snapshot_ts = ts
+
+            nxt = next(iterators[market_id], None)
+            if nxt is not None:
+                heapq.heappush(heap, (int(nxt.timestamp), market_id, nxt))
+            context.set_active_market(None)
+
+        for market in subscribed_markets:
+            if not market.resolved or not market.resolution:
+                continue
+            if not (start_ts <= int(market.close_time or 0) <= end_ts):
+                continue
+            close_ts = int(market.close_time or end_ts)
+            context.advance_time(max(close_ts, context._current_ts))
+            context.set_active_market(market.id)
+            pnl = context.settle_positions(market.id, market.resolution)
+            strategy.on_resolution(market, market.resolution, pnl)
+            context.set_active_market(None)
+
+        strategy.on_stop()
+        context.record_snapshot(end_ts)
+
+        raw = context.compile_results()
+        metrics = self._compute_metrics(raw["equity_curve"], raw["trades"])
+        resolution_accuracy = self._compute_resolution_accuracy(raw["trades"])
+        by_category = self._compute_by_category(raw["trades"], subscribed_map, config.initial_cash)
+        return {
+            "ok": True,
+            "strategy_path": config.strategy_path,
+            "start_date": config.start_date,
+            "end_date": config.end_date,
+            "initial_cash": config.initial_cash,
+            "data_source": "normalized-index",
+            "fidelity": fidelity,
+            "max_markets_applied": max_markets_applied,
+            "markets_tested": len(subscribed_markets),
+            "final_value": raw["final_value"],
+            "metrics": metrics,
+            "resolution_accuracy": resolution_accuracy,
+            "by_category": by_category,
+            "_artifact_payload": {
+                "equity_curve": raw["equity_curve"],
+                "trades": raw["trades"],
+            },
         }
 
     def _compute_metrics(self, equity_curve: list[dict], trades: list[dict]) -> dict:

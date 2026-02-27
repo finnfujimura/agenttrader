@@ -57,7 +57,32 @@ def init_cmd() -> None:
         click.echo("Non-interactive shell detected. Skipping dataset prompt (default: 2).")
 
     if str(choice).strip() == "1":
-        download_dataset()
+        download_ok = download_dataset()
+        if download_ok:
+            click.echo()
+            if sys.stdin.isatty():
+                should_build = click.confirm(
+                    "Build backtest index now? (recommended, ~5-10 minutes)",
+                    default=True,
+                )
+            else:
+                should_build = False
+                click.echo("Non-interactive shell detected. Skipping index-build prompt.")
+            if should_build:
+                from agenttrader.data.index_builder import build_index
+
+                result = build_index()
+                if result.get("ok") and not result.get("skipped"):
+                    stats = result.get("stats", {})
+                    total = int(stats.get("polymarket_trades", 0)) + int(stats.get("kalshi_trades", 0))
+                    click.echo(
+                        f"Index built: {int(stats.get('markets_indexed', 0)):,} markets, {total:,} trades"
+                    )
+                elif result.get("skipped"):
+                    click.echo("Index already exists.")
+                else:
+                    click.echo(f"Index build failed: {result.get('message')}")
+                    click.echo("Run manually later: agenttrader dataset build-index")
     else:
         click.echo("Skipping dataset download.")
         click.echo("Run 'agenttrader dataset download' when ready.")
