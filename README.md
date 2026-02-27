@@ -27,20 +27,24 @@ That's it. `init` sets up your local database and walks you through the optional
 
 Backtesting works best with the full historical dataset — thousands of resolved Polymarket and Kalshi markets going back to 2021.
 
-```bash
-agenttrader dataset download      # ~36GB, one-time
-agenttrader dataset build-index   # ~5-10 min, also one-time
-```
-
 For the most reliable large dataset download, install `aria2` first. `agenttrader` will automatically use `aria2c` when it is available, and fall back to the built-in Python downloader otherwise.
 
 ```bash
 # macOS
 brew install aria2
 
+# Windows
+choco install aria2
+
 # WSL / Ubuntu / Debian
 sudo apt install aria2
 ```
+
+```bash
+agenttrader dataset download      # ~36GB, one-time
+agenttrader dataset build-index   # ~5-10 min, also one-time
+```
+
 
 Once built, backtests run against the full dataset automatically. No sync required.
 
