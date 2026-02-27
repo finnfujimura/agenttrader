@@ -32,6 +32,16 @@ agenttrader dataset download      # ~36GB, one-time
 agenttrader dataset build-index   # ~5-10 min, also one-time
 ```
 
+For the most reliable large dataset download, install `aria2` first. `agenttrader` will automatically use `aria2c` when it is available, and fall back to the built-in Python downloader otherwise.
+
+```bash
+# macOS
+brew install aria2
+
+# Ubuntu / Debian
+sudo apt install aria2
+```
+
 Once built, backtests run against the full dataset automatically. No sync required.
 
 > **Don't want to download 36GB?** Backtesting still works using live-synced data. Just run `agenttrader sync` before backtesting and it'll use whatever is cached locally.

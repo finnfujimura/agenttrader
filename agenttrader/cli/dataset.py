@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tarfile
 import urllib.request
+from urllib.error import HTTPError
 from pathlib import Path
 
 import click
@@ -16,6 +17,7 @@ from agenttrader.cli.utils import json_errors
 
 DATA_DIR = APP_DIR / "data"
 DOWNLOAD_URL = "https://s3.jbecker.dev/data.tar.zst"
+DOWNLOAD_USER_AGENT = "agenttrader/0.3.4 (+https://github.com/finnfujimura/agenttrader)"
 
 
 def _resolve_verify_data_dir() -> Path:
@@ -67,6 +69,99 @@ def _extract_with_python(archive_path: Path, dest: Path) -> None:
     click.echo("Extraction complete.")
 
 
+def _promote_partial_archive(dest: Path) -> None:
+    temp_path = dest.with_name(f"{dest.name}.part")
+    if temp_path.exists() and not dest.exists():
+        temp_path.replace(dest)
+
+
+def _download_with_aria2(url: str, dest: Path) -> bool:
+    aria2c = shutil.which("aria2c")
+    if not aria2c:
+        return False
+
+    _promote_partial_archive(dest)
+    click.echo(f"Using aria2c for download ({aria2c})...")
+    cmd = [
+        aria2c,
+        "--continue=true",
+        "--auto-file-renaming=false",
+        "--file-allocation=none",
+        "--max-tries=5",
+        "--retry-wait=5",
+        "--timeout=60",
+        "--connect-timeout=30",
+        "--summary-interval=1",
+        "--user-agent",
+        DOWNLOAD_USER_AGENT,
+        "-d",
+        str(dest.parent),
+        "-o",
+        dest.name,
+        url,
+    ]
+    result = subprocess.run(cmd, check=False)
+    if result.returncode == 0:
+        click.echo("Download complete.")
+        return True
+
+    click.echo(f"aria2c failed (exit {result.returncode}). Falling back to Python downloader...")
+    return False
+
+
+def _download_archive(url: str, dest: Path) -> None:
+    temp_path = dest.with_name(f"{dest.name}.part")
+    if not temp_path.exists() and dest.exists():
+        dest.replace(temp_path)
+    existing_bytes = temp_path.stat().st_size if temp_path.exists() else 0
+
+    headers = {"User-Agent": DOWNLOAD_USER_AGENT}
+    if existing_bytes:
+        headers["Range"] = f"bytes={existing_bytes}-"
+
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        response = urllib.request.urlopen(request)
+    except HTTPError as exc:
+        if exc.code == 416 and existing_bytes:
+            temp_path.replace(dest)
+            return
+        raise
+
+    with response:
+        status = getattr(response, "status", None)
+        append = existing_bytes > 0 and status == 206
+        if existing_bytes and not append:
+            temp_path.unlink(missing_ok=True)
+            existing_bytes = 0
+
+        content_length = response.headers.get("Content-Length")
+        total_size = existing_bytes + int(content_length) if content_length else None
+        downloaded = existing_bytes
+        chunk_size = 8 * 1024 * 1024
+        mode = "ab" if append else "wb"
+
+        with temp_path.open(mode) as fh:
+            while True:
+                chunk = response.read(chunk_size)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                downloaded += len(chunk)
+
+                if total_size:
+                    percent = min(int(downloaded * 100 / total_size), 100)
+                    mb_done = downloaded / 1024 / 1024
+                    mb_total = total_size / 1024 / 1024
+                    click.echo(f"\r  {percent}% ({mb_done:.0f} / {mb_total:.0f} MB)", nl=False)
+                else:
+                    mb_done = downloaded / 1024 / 1024
+                    click.echo(f"\r  Downloaded {mb_done:.0f} MB", nl=False)
+
+    temp_path.replace(dest)
+    click.echo("\n  Download complete.")
+
+
 def download_dataset() -> bool:
     """Download and extract the Jon Becker prediction market parquet dataset."""
     ensure_app_dir()
@@ -76,17 +171,9 @@ def download_dataset() -> bool:
     click.echo(f"\nDownloading to {DATA_DIR} ...")
     click.echo("This will take a while depending on your connection.\n")
 
-    def reporthook(count: int, block_size: int, total_size: int) -> None:
-        if total_size <= 0:
-            return
-        percent = min(int(count * block_size * 100 / total_size), 100)
-        mb_done = count * block_size / 1024 / 1024
-        mb_total = total_size / 1024 / 1024
-        click.echo(f"\r  {percent}% ({mb_done:.0f} / {mb_total:.0f} MB)", nl=False)
-
     try:
-        urllib.request.urlretrieve(DOWNLOAD_URL, archive_path, reporthook)
-        click.echo("\n  Download complete.")
+        if not _download_with_aria2(DOWNLOAD_URL, archive_path):
+            _download_archive(DOWNLOAD_URL, archive_path)
     except Exception as exc:
         click.echo(f"\nDownload failed: {exc}")
         click.echo("Try again with: agenttrader dataset download")
