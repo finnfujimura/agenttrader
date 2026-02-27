@@ -38,7 +38,7 @@ For the most reliable large dataset download, install `aria2` first. `agenttrade
 # macOS
 brew install aria2
 
-# Ubuntu / Debian
+# WSL / Ubuntu / Debian
 sudo apt install aria2
 ```
 
