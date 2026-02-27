@@ -21,6 +21,9 @@ venv/
 .agenttrader/
 docs/
 
+# Dataset (large parquet files)
+data/
+
 # Markdown files
 *.md
 !README.md
