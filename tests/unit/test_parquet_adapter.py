@@ -80,7 +80,7 @@ def _write_parquet_dataset(base):
         COPY (
             SELECT
                 1000::BIGINT AS block_number,
-                '1704067200'::VARCHAR AS timestamp
+                '2024-01-01T00:00:00Z'::VARCHAR AS timestamp
         ) TO '{base / "polymarket" / "blocks" / "part-000.parquet"}' (FORMAT PARQUET)
         """
     )
@@ -163,3 +163,14 @@ def test_parquet_adapter_market_and_history_translation(tmp_path):
     assert ob.best_bid is not None
     assert ob.best_ask is not None
     assert ob.best_ask > ob.best_bid
+
+
+def test_parquet_adapter_ignores_appledouble_files(tmp_path):
+    _write_parquet_dataset(tmp_path)
+    # Add invalid AppleDouble sidecar file that should be ignored.
+    bad = tmp_path / "polymarket" / "markets" / "._fake.parquet"
+    bad.write_bytes(b"not-a-parquet-file")
+
+    adapter = ParquetDataAdapter(data_dir=tmp_path)
+    markets = adapter.get_markets(platform="polymarket", limit=5)
+    assert len(markets) > 0

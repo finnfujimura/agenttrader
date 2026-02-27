@@ -23,6 +23,75 @@ class BacktestConfig:
     schedule_interval_minutes: int = 15
 
 
+class SubscriptionCollector:
+    """
+    Lightweight context for phase-1 subscription discovery.
+    Only subscribe() is functional.
+    """
+
+    def __init__(self, market_map: dict[str, Market]):
+        self._market_map = market_map
+        self._subscribed_ids: set[str] = set()
+
+    def subscribe(
+        self,
+        platform: str = "all",
+        category: str | None = None,
+        tags: list[str] | None = None,
+        market_ids: list[str] | None = None,
+    ) -> None:
+        if market_ids:
+            self._subscribed_ids.update(market_ids)
+            return
+        for market_id, market in self._market_map.items():
+            if platform != "all" and market.platform.value != platform:
+                continue
+            if category and market.category != category:
+                continue
+            if tags and not any(tag in market.tags for tag in tags):
+                continue
+            self._subscribed_ids.add(market_id)
+
+    def get_subscribed_ids(self) -> list[str]:
+        return list(self._subscribed_ids)
+
+    def search_markets(self, query, platform="all"):  # noqa: ANN001
+        return []
+
+    def get_price(self, market_id):  # noqa: ANN001
+        return 0.5
+
+    def get_orderbook(self, market_id):  # noqa: ANN001
+        return None
+
+    def get_history(self, market_id, lookback_hours=24):  # noqa: ANN001
+        return []
+
+    def get_position(self, market_id):  # noqa: ANN001
+        return None
+
+    def get_cash(self):
+        return 0.0
+
+    def get_portfolio_value(self):
+        return 0.0
+
+    def buy(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        return "noop"
+
+    def sell(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        return "noop"
+
+    def log(self, message):  # noqa: ANN001
+        return None
+
+    def set_state(self, key, value):  # noqa: ANN001
+        return None
+
+    def get_state(self, key, default=None):  # noqa: ANN001
+        return default
+
+
 class BacktestEngine:
     def __init__(self, data_source, orderbook_store=None):
         self._data = data_source
@@ -39,15 +108,29 @@ class BacktestEngine:
 
         using_parquet = isinstance(self._data, ParquetDataAdapter)
         if using_parquet:
-            markets = self._data.get_markets(platform="all", limit=10_000)
+            all_markets = self._data.get_markets(platform="all", limit=10_000)
         else:
-            markets = self._data.get_markets(limit=10_000)
-        markets_by_id: dict[str, Market] = {m.id: m for m in markets}
+            all_markets = self._data.get_markets(platform="all", limit=10_000)
+        market_map: dict[str, Market] = {m.id: m for m in all_markets}
+
+        subscription_collector = SubscriptionCollector(market_map)
+        strategy_probe: BaseStrategy = strategy_class(subscription_collector)
+        strategy_probe.on_start()
+
+        subscribed_ids = subscription_collector.get_subscribed_ids()
+        subscribed_markets = [market_map[mid] for mid in subscribed_ids if mid in market_map]
+        if not subscribed_markets:
+            raise ValueError(
+                "Strategy subscribed to 0 markets after on_start(). "
+                "Make sure your strategy calls self.subscribe() in on_start()."
+            )
+
+        markets_by_id: dict[str, Market] = {m.id: m for m in subscribed_markets}
 
         price_data: dict[str, list] = {}
         orderbook_data: dict[str, list] = {}
         platform_map: dict[str, Platform] = {}
-        for market in markets:
+        for market in subscribed_markets:
             if using_parquet:
                 history = self._data.get_price_history(market.id, market.platform, start_ts, end_ts)
             else:

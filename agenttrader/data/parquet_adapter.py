@@ -37,6 +37,15 @@ _POLY_SLUG_CATEGORY = {
 }
 
 
+def _safe_parquet_glob(directory: str) -> list[str]:
+    """Return sorted parquet files excluding AppleDouble metadata files."""
+    path = Path(directory)
+    if not path.exists():
+        return []
+    files = [str(f) for f in path.glob("*.parquet") if not f.name.startswith("._")]
+    return sorted(files)
+
+
 class ParquetDataAdapter:
     """
     Reads the Jon Becker prediction market parquet dataset via DuckDB.
@@ -48,26 +57,29 @@ class ParquetDataAdapter:
     def __init__(self, data_dir: Path | None = None):
         self._data_dir = data_dir or DATA_DIR
         self._conn = duckdb.connect() if duckdb is not None else None
-        self._polymarket_trades = str(self._data_dir / "polymarket" / "trades" / "*.parquet")
-        self._polymarket_markets = str(self._data_dir / "polymarket" / "markets" / "*.parquet")
-        self._polymarket_blocks = str(self._data_dir / "polymarket" / "blocks" / "*.parquet")
-        self._kalshi_trades = str(self._data_dir / "kalshi" / "trades" / "*.parquet")
-        self._kalshi_markets = str(self._data_dir / "kalshi" / "markets" / "*.parquet")
+        self._poly_trades_files = _safe_parquet_glob(str(self._data_dir / "polymarket" / "trades"))
+        self._poly_markets_files = _safe_parquet_glob(str(self._data_dir / "polymarket" / "markets"))
+        self._poly_blocks_files = _safe_parquet_glob(str(self._data_dir / "polymarket" / "blocks"))
+        self._kalshi_trades_files = _safe_parquet_glob(str(self._data_dir / "kalshi" / "trades"))
+        self._kalshi_markets_files = _safe_parquet_glob(str(self._data_dir / "kalshi" / "markets"))
+
+        self._poly_trades_view: str | None = None
+        self._poly_markets_view: str | None = None
+        self._poly_blocks_view: str | None = None
+        self._kalshi_trades_view: str | None = None
+        self._kalshi_markets_view: str | None = None
+
+        if self._conn is not None:
+            self._poly_trades_view = self._create_view("poly_trades", self._poly_trades_files)
+            self._poly_markets_view = self._create_view("poly_markets", self._poly_markets_files)
+            self._poly_blocks_view = self._create_view("poly_blocks", self._poly_blocks_files)
+            self._kalshi_trades_view = self._create_view("kalshi_trades", self._kalshi_trades_files)
+            self._kalshi_markets_view = self._create_view("kalshi_markets", self._kalshi_markets_files)
 
     def is_available(self) -> bool:
         if self._conn is None:
             return False
-        try:
-            expected = [
-                self._data_dir / "polymarket" / "markets",
-                self._data_dir / "polymarket" / "trades",
-                self._data_dir / "polymarket" / "blocks",
-                self._data_dir / "kalshi" / "markets",
-                self._data_dir / "kalshi" / "trades",
-            ]
-            return all(path.exists() and any(path.glob("*.parquet")) for path in expected)
-        except Exception:
-            return False
+        return len(self._poly_markets_files) > 0 or len(self._kalshi_markets_files) > 0
 
     def get_markets(
         self,
@@ -78,19 +90,19 @@ class ParquetDataAdapter:
         limit: int = 100,
     ) -> list[Market]:
         self._require_conn()
-        markets: list[Market] = []
         wanted = platform.lower()
-        if wanted in {"all", "polymarket"}:
-            markets.extend(self._get_polymarket_markets(resolved_only=resolved_only, min_volume=min_volume, limit=limit))
-        if wanted in {"all", "kalshi"}:
-            markets.extend(self._get_kalshi_markets(resolved_only=resolved_only, min_volume=min_volume, limit=limit))
-
-        if category:
-            category_l = category.lower()
-            markets = [m for m in markets if (m.category or "").lower() == category_l]
-
-        markets.sort(key=lambda m: float(m.volume or 0.0), reverse=True)
-        return markets[:limit]
+        if wanted == "polymarket":
+            return self._get_polymarket_markets(category, resolved_only, min_volume, limit)
+        if wanted == "kalshi":
+            return self._get_kalshi_markets(category, resolved_only, min_volume, limit)
+        if wanted == "all":
+            per_platform = max(limit // 2, 1)
+            poly = self._get_polymarket_markets(category, resolved_only, min_volume, per_platform)
+            kalshi = self._get_kalshi_markets(category, resolved_only, min_volume, per_platform)
+            combined = poly + kalshi
+            combined.sort(key=lambda m: float(m.volume or 0.0), reverse=True)
+            return combined[:limit]
+        raise ValueError(f"Unknown platform: {platform}. Use 'polymarket', 'kalshi', or 'all'.")
 
     def get_price_history(
         self,
@@ -130,10 +142,18 @@ class ParquetDataAdapter:
             total_volume = float(len(points))
         return self._synthesize_orderbook(vwap, total_volume, market_id, at_ts)
 
-    def _get_polymarket_markets(self, resolved_only: bool, min_volume: float | None, limit: int) -> list[Market]:
+    def _get_polymarket_markets(
+        self,
+        category: str | None,
+        resolved_only: bool,
+        min_volume: float | None,
+        limit: int,
+    ) -> list[Market]:
         self._require_conn()
+        if not self._poly_markets_view:
+            return []
         where = ["1=1"]
-        params: list[object] = [self._polymarket_markets]
+        params: list[object] = []
         if resolved_only:
             where.append("closed = TRUE")
         if min_volume is not None:
@@ -150,7 +170,7 @@ class ParquetDataAdapter:
                 closed,
                 end_date,
                 json_extract_string(outcome_prices, '$[0]') AS yes_price_str
-            FROM read_parquet(?)
+            FROM {self._poly_markets_view}
             WHERE {' AND '.join(where)}
             ORDER BY volume DESC
             LIMIT ?
@@ -168,13 +188,16 @@ class ParquetDataAdapter:
                     resolution = "yes"
                 elif yes_price <= 0.001:
                     resolution = "no"
+            inferred_category = self._infer_polymarket_category(str(slug or ""), str(title or ""))
+            if category and inferred_category.lower() != category.lower():
+                continue
             out.append(
                 Market(
                     id=str(market_id),
                     condition_id=str(condition_id or market_id),
                     platform=Platform.POLYMARKET,
                     title=str(title or ""),
-                    category=self._infer_polymarket_category(str(slug or ""), str(title or "")),
+                    category=inferred_category,
                     tags=[],
                     market_type=MarketType.BINARY,
                     volume=float(volume or 0.0),
@@ -187,10 +210,18 @@ class ParquetDataAdapter:
             )
         return out
 
-    def _get_kalshi_markets(self, resolved_only: bool, min_volume: float | None, limit: int) -> list[Market]:
+    def _get_kalshi_markets(
+        self,
+        category: str | None,
+        resolved_only: bool,
+        min_volume: float | None,
+        limit: int,
+    ) -> list[Market]:
         self._require_conn()
+        if not self._kalshi_markets_view:
+            return []
         where = ["1=1"]
-        params: list[object] = [self._kalshi_markets]
+        params: list[object] = []
         if resolved_only:
             where.append("status = 'finalized'")
         if min_volume is not None:
@@ -207,7 +238,7 @@ class ParquetDataAdapter:
                 volume / 100.0 AS volume_dollars,
                 close_time,
                 result
-            FROM read_parquet(?)
+            FROM {self._kalshi_markets_view}
             WHERE {' AND '.join(where)}
             ORDER BY volume DESC
             LIMIT ?
@@ -219,13 +250,16 @@ class ParquetDataAdapter:
             if not ticker:
                 continue
             norm_result = str(result or "").strip().lower() or None
+            inferred_category = self._infer_kalshi_category(str(event_ticker or ""))
+            if category and inferred_category.lower() != category.lower():
+                continue
             out.append(
                 Market(
                     id=str(ticker),
                     condition_id=str(event_ticker or ticker),
                     platform=Platform.KALSHI,
                     title=str(title or ticker),
-                    category=self._infer_kalshi_category(str(event_ticker or "")),
+                    category=inferred_category,
                     tags=[],
                     market_type=MarketType.BINARY if str(market_type or "").lower() == "binary" else MarketType.SCALAR,
                     volume=float(volume or 0.0),
@@ -240,13 +274,27 @@ class ParquetDataAdapter:
 
     def _get_polymarket_price_history(self, market_id: str, start_ts: int, end_ts: int) -> list[PricePoint]:
         self._require_conn()
+        if not self._poly_trades_view or not self._poly_blocks_view:
+            return []
         yes_token_id = self._get_polymarket_yes_token(market_id)
         if not yes_token_id:
             return []
-        query = """
+        query = f"""
             WITH block_times AS (
-                SELECT block_number, CAST(timestamp AS BIGINT) AS ts
-                FROM read_parquet(?)
+                SELECT block_number, ts
+                FROM (
+                    SELECT
+                        block_number,
+                        CASE
+                            WHEN TRY_CAST(timestamp AS BIGINT) IS NOT NULL
+                                THEN TRY_CAST(timestamp AS BIGINT)
+                            WHEN TRY_CAST(timestamp AS TIMESTAMP) IS NOT NULL
+                                THEN CAST(EPOCH(TRY_CAST(timestamp AS TIMESTAMP)) AS BIGINT)
+                            ELSE NULL
+                        END AS ts
+                    FROM {self._poly_blocks_view}
+                )
+                WHERE ts IS NOT NULL
             )
             SELECT
                 bt.ts AS timestamp,
@@ -256,7 +304,7 @@ class ParquetDataAdapter:
                     ELSE CAST(t.maker_amount AS DOUBLE) / NULLIF(CAST(t.maker_amount + t.taker_amount AS DOUBLE), 0)
                 END AS yes_price,
                 CAST(t.taker_amount + t.maker_amount AS DOUBLE) / 1000000.0 AS volume
-            FROM read_parquet(?) t
+            FROM {self._poly_trades_view} t
             JOIN block_times bt ON t.block_number = bt.block_number
             WHERE (
                 t.taker_asset_id = ? OR t.maker_asset_id = ?
@@ -268,9 +316,7 @@ class ParquetDataAdapter:
         rows = self._conn.execute(
             query,
             [
-                self._polymarket_blocks,
                 yes_token_id,
-                self._polymarket_trades,
                 yes_token_id,
                 yes_token_id,
                 int(start_ts),
@@ -295,13 +341,15 @@ class ParquetDataAdapter:
 
     def _get_kalshi_price_history(self, market_id: str, start_ts: int, end_ts: int) -> list[PricePoint]:
         self._require_conn()
-        query = """
+        if not self._kalshi_trades_view:
+            return []
+        query = f"""
             SELECT
                 CAST(EPOCH(created_time) AS BIGINT) AS timestamp,
                 yes_price / 100.0 AS yes_price,
                 no_price / 100.0 AS no_price,
                 count AS volume
-            FROM read_parquet(?)
+            FROM {self._kalshi_trades_view}
             WHERE ticker = ?
             AND EPOCH(created_time) >= ?
             AND EPOCH(created_time) <= ?
@@ -309,7 +357,7 @@ class ParquetDataAdapter:
         """
         rows = self._conn.execute(
             query,
-            [self._kalshi_trades, market_id, int(start_ts), int(end_ts)],
+            [market_id, int(start_ts), int(end_ts)],
         ).fetchall()
         return [
             PricePoint(
@@ -324,15 +372,25 @@ class ParquetDataAdapter:
 
     def _get_polymarket_yes_token(self, market_id: str) -> str | None:
         self._require_conn()
-        query = """
+        if not self._poly_markets_view:
+            return None
+        query = f"""
             SELECT json_extract_string(clob_token_ids, '$[0]') AS yes_token_id
-            FROM read_parquet(?)
+            FROM {self._poly_markets_view}
             WHERE json_extract_string(clob_token_ids, '$[0]') = ?
                OR condition_id = ?
             LIMIT 1
         """
-        row = self._conn.execute(query, [self._polymarket_markets, market_id, market_id]).fetchone()
+        row = self._conn.execute(query, [market_id, market_id]).fetchone()
         return str(row[0]) if row and row[0] else None
+
+    def _create_view(self, view_name: str, files: list[str]) -> str | None:
+        self._require_conn()
+        if not files:
+            return None
+        quoted_files = ", ".join("'" + str(path).replace("'", "''") + "'" for path in files)
+        self._conn.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM read_parquet([{quoted_files}])")
+        return view_name
 
     def _synthesize_orderbook(self, vwap: float, total_volume: float, market_id: str, at_ts: int) -> OrderBook:
         spread = max(0.005, min(0.03, 500.0 / (total_volume + 1.0)))

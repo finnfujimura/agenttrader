@@ -6,6 +6,7 @@ import importlib.util
 import inspect
 import json
 import statistics
+import sys
 import time
 import traceback
 import uuid
@@ -269,7 +270,12 @@ async def call_tool(name: str, arguments: dict):
                 if spec is None or spec.loader is None:
                     raise RuntimeError(f"Could not load strategy from {strategy_path}")
                 module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
+                sys.modules[spec.name] = module
+                try:
+                    spec.loader.exec_module(module)
+                except Exception:
+                    del sys.modules[spec.name]
+                    raise
                 strategy_class = None
                 for _, cls in inspect.getmembers(module, inspect.isclass):
                     if issubclass(cls, BaseStrategy) and cls is not BaseStrategy:
