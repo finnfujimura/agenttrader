@@ -19,3 +19,7 @@ venv/
 
 # Local app state
 .agenttrader/
+
+# Markdown files
+*.md
+!README.md
