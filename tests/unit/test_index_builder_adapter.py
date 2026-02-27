@@ -155,3 +155,35 @@ def test_build_index_missing_dataset_returns_error(tmp_path: Path):
     out = build_index(force=True, data_dir=data_dir, index_path=tmp_path / "index.duckdb")
     assert out["ok"] is False
     assert out["error"] == "DatasetNotFound"
+
+
+def test_build_index_prefers_local_data_dir(tmp_path: Path, monkeypatch):
+    local_data = tmp_path / "data"
+    _write_parquet_dataset(local_data)
+    monkeypatch.chdir(tmp_path)
+
+    out = build_index(force=True, index_path=tmp_path / "index.duckdb")
+    assert out["ok"] is True
+    assert out["data_dir"] == str(local_data)
+
+
+def test_build_index_discovers_recursive_parquet_and_ignores_appledouble(tmp_path: Path):
+    _write_parquet_dataset(tmp_path)
+
+    paths = [
+        tmp_path / "polymarket" / "markets" / "part-000.parquet",
+        tmp_path / "polymarket" / "trades" / "part-000.parquet",
+        tmp_path / "polymarket" / "blocks" / "part-000.parquet",
+        tmp_path / "kalshi" / "markets" / "part-000.parquet",
+        tmp_path / "kalshi" / "trades" / "part-000.parquet",
+    ]
+    for src in paths:
+        nested = src.parent / "partition=2024-01-01"
+        nested.mkdir(parents=True, exist_ok=True)
+        dst = nested / src.name
+        src.rename(dst)
+        (nested / f"._{src.name}").write_bytes(b"not-a-parquet")
+
+    out = build_index(force=True, data_dir=tmp_path, index_path=tmp_path / "index.duckdb")
+    assert out["ok"] is True
+    assert out["stats"]["markets_indexed"] > 0

@@ -12,10 +12,26 @@ DATA_DIR = Path.home() / ".agenttrader" / "data"
 
 
 def _safe_parquet_list(directory: Path) -> list[str]:
-    """Return sorted list of parquet paths, excluding AppleDouble (._*) files."""
+    """Return sorted parquet paths recursively, excluding AppleDouble (._*) files."""
     if not directory.exists():
         return []
-    return sorted(str(f) for f in directory.glob("*.parquet") if not f.name.startswith("._"))
+    return sorted(str(f) for f in directory.rglob("*.parquet") if not f.name.startswith("._"))
+
+
+def _resolve_data_dir(data_dir: Path | None) -> Path:
+    """
+    Resolve dataset location.
+    Preference order:
+      1) explicit data_dir argument (if provided)
+      2) local ./data (if exists)
+      3) ~/.agenttrader/data
+    """
+    if data_dir is not None:
+        return data_dir
+    local_data_dir = Path.cwd() / "data"
+    if local_data_dir.exists():
+        return local_data_dir
+    return DATA_DIR
 
 
 def _parquet_read_expr(files: list[str]) -> str:
@@ -149,7 +165,7 @@ def _build_metadata_table(conn: duckdb.DuckDBPyConnection, stats: dict) -> None:
 
 
 def build_index(force: bool = False, data_dir: Path | None = None, index_path: Path | None = None) -> dict:
-    data_dir = data_dir or DATA_DIR
+    data_dir = _resolve_data_dir(data_dir)
     index_path = index_path or INDEX_PATH
 
     if index_path.exists() and not force:
@@ -160,14 +176,18 @@ def build_index(force: bool = False, data_dir: Path | None = None, index_path: P
             "path": str(index_path),
         }
 
-    from agenttrader.data.parquet_adapter import ParquetDataAdapter
-
-    adapter = ParquetDataAdapter(data_dir=data_dir)
-    if not adapter.is_available():
+    file_count = len(_safe_parquet_list(data_dir))
+    if file_count == 0:
         return {
             "ok": False,
             "error": "DatasetNotFound",
-            "message": "Raw parquet files not found. Run: agenttrader dataset download",
+            "message": (
+                f"Raw parquet files not found in {data_dir} "
+                f"(found {file_count} .parquet files). "
+                "Run: agenttrader dataset download or place parquet files under ./data"
+            ),
+            "data_dir": str(data_dir),
+            "parquet_files_found": file_count,
         }
 
     index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,4 +221,5 @@ def build_index(force: bool = False, data_dir: Path | None = None, index_path: P
         "skipped": False,
         "stats": stats,
         "path": str(index_path),
+        "data_dir": str(data_dir),
     }
