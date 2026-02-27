@@ -17,6 +17,21 @@ DATA_DIR = APP_DIR / "data"
 DOWNLOAD_URL = "https://s3.jbecker.dev/data.tar.zst"
 
 
+def _resolve_verify_data_dir() -> Path:
+    local_data_dir = Path.cwd() / "data"
+    if local_data_dir.exists():
+        return local_data_dir
+    return DATA_DIR
+
+
+def _pretty_path(path: Path) -> str:
+    home = Path.home()
+    try:
+        return str(path.relative_to(home))
+    except ValueError:
+        return str(path)
+
+
 def _expected_dataset_dirs(base_dir: Path) -> list[Path]:
     return [
         base_dir / "polymarket" / "markets",
@@ -120,12 +135,15 @@ def dataset_download_cmd() -> None:
 @json_errors
 def dataset_verify_cmd() -> None:
     """Verify expected parquet dataset folders are present."""
-    expected = _expected_dataset_dirs(DATA_DIR)
+    data_dir = _resolve_verify_data_dir()
+    click.echo(f"Using dataset path: {_pretty_path(data_dir)}")
+
+    expected = _expected_dataset_dirs(data_dir)
     all_ok = True
     for path in expected:
-        files = list(path.glob("*.parquet")) if path.exists() else []
+        files = list(path.rglob("*.parquet")) if path.exists() else []
         status = "✓" if files else "✗ MISSING"
-        click.echo(f"  {status}  {path.relative_to(Path.home())} ({len(files)} parquet files)")
+        click.echo(f"  {status}  {_pretty_path(path)} ({len(files)} parquet files)")
         if not files:
             all_ok = False
     if all_ok:
