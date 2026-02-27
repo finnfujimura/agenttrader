@@ -21,6 +21,7 @@ from agenttrader.core.backtest_engine import BacktestConfig, BacktestEngine
 from agenttrader.core.base_strategy import BaseStrategy
 from agenttrader.data.cache import DataCache
 from agenttrader.data.orderbook_store import OrderBookStore
+from agenttrader.data.parquet_adapter import ParquetDataAdapter
 from agenttrader.db import get_engine, get_session
 from agenttrader.db.schema import BacktestRun
 from agenttrader.errors import AgentTraderError
@@ -42,6 +43,18 @@ def backtest_cmd(target: str, rest: tuple[str, ...]) -> None:
         return
 
     _backtest_run(target, list(rest))
+
+
+def get_backtest_engine() -> BacktestEngine:
+    """Return backtest engine with best available data source."""
+    adapter = ParquetDataAdapter()
+    if adapter.is_available():
+        return BacktestEngine(data_source=adapter)
+    db_engine = get_engine()
+    return BacktestEngine(
+        data_source=DataCache(db_engine),
+        orderbook_store=OrderBookStore(),
+    )
 
 
 def _backtest_run(strategy_path: str, args: list[str]) -> None:
@@ -129,7 +142,7 @@ def _backtest_run(strategy_path: str, args: list[str]) -> None:
     try:
         module = _import_strategy_module(path)
         strategy_class = _find_strategy_class(module)
-        engine = BacktestEngine(DataCache(db_engine), OrderBookStore())
+        engine = get_backtest_engine()
         results = engine.run(
             strategy_class,
             BacktestConfig(
@@ -155,6 +168,10 @@ def _backtest_run(strategy_path: str, args: list[str]) -> None:
             emit_json(results)
         else:
             click.echo(f"Backtest complete: {run_id}")
+            if results.get("data_source") == "parquet":
+                click.echo("Data source: Jon Becker dataset (parquet) — 2021-present")
+            else:
+                click.echo("Data source: local sync cache (SQLite) — run 'agenttrader dataset download' for full history")
             click.echo(f"Final value: {results['final_value']:.2f}")
             click.echo(f"Sharpe: {results['metrics']['sharpe_ratio']}")
     except Exception as exc:
@@ -278,8 +295,7 @@ def _import_strategy_module(path: Path):
 
 
 def _find_strategy_class(module):
-    return next(
-        cls
-        for _, cls in inspect.getmembers(module, inspect.isclass)
-        if issubclass(cls, BaseStrategy) and cls is not BaseStrategy
-    )
+    for _, cls in inspect.getmembers(module, inspect.isclass):
+        if issubclass(cls, BaseStrategy) and cls is not BaseStrategy:
+            return cls
+    raise RuntimeError("No BaseStrategy subclass found in strategy file")

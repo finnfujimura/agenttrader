@@ -60,7 +60,14 @@ def _get_candlesticks_with_chunking(
         return [by_ts[ts] for ts in sorted(by_ts.keys())]
 
 
-@click.command("sync")
+@click.command(
+    "sync",
+    help=(
+        "Sync live market data from PMXT for paper trading.\n\n"
+        "Note: backtesting prefers the Jon Becker parquet dataset, not sync data.\n"
+        "Run 'agenttrader dataset download' to set up the full backtest dataset."
+    ),
+)
 @click.option("--days", type=int, default=None)
 @click.option("--platform", default="all")
 @click.option("--category", default=None)
@@ -80,6 +87,11 @@ def sync_cmd(
     limit: int,
     json_output: bool,
 ) -> None:
+    """
+    Sync live market data from PMXT for paper trading.
+
+    Note: backtesting prefers the Jon Becker parquet dataset, not sync data.
+    """
     ensure_initialized()
     cfg = load_config()
 

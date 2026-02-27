@@ -17,10 +17,10 @@ All market data flows through [pmxt](https://github.com/Polymarket/pmxt), unifie
 Agent receives goal
        │
        ▼
-agenttrader sync          ← pull market data into local cache
+agenttrader dataset download  ← one-time parquet history setup for backtesting
        │
        ▼
-agenttrader markets list  ← discover opportunities
+agenttrader markets list      ← discover opportunities
        │
        ▼
 [agent writes strategy.py]
@@ -75,6 +75,13 @@ agenttrader markets list --json
 ```
 
 If you see markets in the output, you're ready.
+
+Optional but recommended for full-history backtests:
+
+```bash
+agenttrader dataset verify
+agenttrader dataset download
+```
 
 ---
 
@@ -137,10 +144,18 @@ The transport is `stdio`. The agent spawns `agenttrader mcp` as a subprocess and
 
 | Category | Tools |
 |----------|-------|
-| Markets | `get_markets`, `get_price`, `get_history`, `match_markets` |
-| Strategy | `validate_strategy`, `run_backtest`, `get_backtest`, `list_backtests` |
+| Markets | `get_markets`, `get_price`, `get_history`, `match_markets`, `research_markets` |
+| Strategy | `validate_strategy`, `run_backtest`, `validate_and_backtest`, `get_backtest`, `list_backtests` |
 | Paper trading | `start_paper_trade`, `get_portfolio`, `stop_paper_trade`, `list_paper_trades` |
 | Data | `sync_data` |
+
+**MCP response behavior**
+
+- Errors now include a machine-actionable `fix` field when possible.
+- `get_history` returns analytics by default (current price, 7d avg delta, 24h change, trend, volatility).
+- `get_history` raw points are optional via `include_raw=true` (default is `false` to reduce token usage).
+- `research_markets` composes `sync_data -> get_markets -> get_history` into one call.
+- `validate_and_backtest` composes `validate_strategy -> run_backtest` into one call.
 
 **Example agent prompts (MCP mode)**
 
@@ -166,7 +181,7 @@ same event. Write an arbitrage strategy that trades the price
 discrepancy when it exceeds 3 cents. Backtest it and paper trade it.
 ```
 
-The agent will chain tool calls autonomously — syncing data, writing and editing `strategy.py`, running backtests, reading metrics, iterating, and deploying — without you touching a terminal.
+The agent will chain tool calls autonomously — setting up data, writing and editing `strategy.py`, running backtests, reading metrics, iterating, and deploying — without you touching a terminal.
 
 ---
 
@@ -211,7 +226,7 @@ Every `--json` response follows this shape:
 ```
 
 ```json
-{ "ok": false, "error": "ErrorType", "message": "Human-readable details" }
+{ "ok": false, "error": "ErrorType", "message": "Human-readable details", "fix": "Next action for the agent" }
 ```
 
 Strategy errors include line numbers and tracebacks so agents can self-heal:
@@ -234,7 +249,7 @@ Strategy errors include line numbers and tracebacks so agents can self-heal:
 Whether using MCP or CLI, the core loop looks like this:
 
 ```
-1. sync market data
+1. ensure backtest data is available (`agenttrader dataset verify`, then `agenttrader dataset download`)
 2. inspect markets + history
 3. write strategy.py
 4. validate --json          → fix any errors
@@ -329,18 +344,22 @@ Do not call PMXT directly from a strategy. Do not import `requests`, `httpx`, `p
 ```bash
 agenttrader init
 agenttrader config show
+agenttrader dataset verify
+agenttrader dataset download
 ```
 
 ### Data Sync
 
 ```bash
-agenttrader sync                                          # top 100 markets, 90 days
+agenttrader sync                                          # live sync for paper trading
 agenttrader sync --platform polymarket --days 7
 agenttrader sync --platform kalshi --days 7
 agenttrader sync --resolved --days 365 --platform polymarket --json   # resolved/expired markets
 agenttrader sync --markets <id1> --markets <id2>          # specific markets
 agenttrader sync --json
 ```
+
+`sync` is still used for paper trading and live cache updates. Backtesting automatically prefers the parquet dataset when available.
 
 ### Markets
 
@@ -469,13 +488,18 @@ agenttrader prune --older-than 90d --json
 ~/.agenttrader/
 ├── config.yaml        # scheduler and sync preferences
 ├── db.sqlite          # markets, backtests, positions, trade ledger
+├── data/              # parquet dataset (polymarket + kalshi history)
 ├── experiments.json   # experiment memory/log for strategy iterations
+├── logs/
+│   └── performance.jsonl  # call timing logs (CLI + MCP)
 └── orderbooks/        # compressed orderbook snapshots by market/day
 ```
 
 `db.sqlite` is a standard SQLite file. Agents can query it directly with SQL for custom analysis — for example, `SELECT * FROM markets WHERE volume > 10000 ORDER BY volume DESC`.
 
-PMXT market-data calls are unauthenticated; no API key is required for sync, backtest, or paper trading workflows.
+PMXT market-data calls are unauthenticated; no API key is required for sync and paper-trading workflows.
+
+Performance logging is enabled by default. Every CLI command and MCP tool call appends a JSON line to `~/.agenttrader/logs/performance.jsonl` with `operation`, `status`, `duration_ms`, `session_id`, and timestamps.
 
 ---
 

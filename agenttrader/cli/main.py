@@ -7,6 +7,7 @@ import click
 
 from agenttrader.cli.backtest import backtest_cmd
 from agenttrader.cli.config import config_group, init_cmd
+from agenttrader.cli.dataset import dataset_group
 from agenttrader.cli.dashboard import dashboard_cmd
 from agenttrader.cli.experiments import experiments_group
 from agenttrader.cli.markets import markets_group
@@ -31,6 +32,7 @@ def mcp_cmd() -> None:
 
 cli.add_command(init_cmd)
 cli.add_command(config_group)
+cli.add_command(dataset_group)
 cli.add_command(sync_cmd)
 cli.add_command(markets_group)
 cli.add_command(validate_cmd)

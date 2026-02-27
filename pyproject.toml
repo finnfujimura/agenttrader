@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agenttrader"
-version = "0.2.3"
+version = "0.3.3"
 description = "Prediction market strategy research, backtesting, and paper trading toolkit"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = "MIT"
@@ -31,6 +31,7 @@ classifiers = [
 ]
 dependencies = [
   "pmxt>=2.17.9",
+  "duckdb>=0.10.0",
   "click>=8.1",
   "mcp>=1.0.0",
   "sqlalchemy>=2.0",
@@ -47,6 +48,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dataset = [
+  "zstandard>=0.22",
+]
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",

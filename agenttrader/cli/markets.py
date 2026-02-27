@@ -12,6 +12,8 @@ from rich.table import Table
 
 from agenttrader.cli.utils import emit_json, ensure_initialized, json_errors
 from agenttrader.data.cache import DataCache
+from agenttrader.data.models import Market
+from agenttrader.data.parquet_adapter import ParquetDataAdapter
 from agenttrader.db import get_engine
 from agenttrader.errors import AgentTraderError, MarketNotCachedError
 
@@ -46,13 +48,25 @@ def markets_group() -> None:
 @json_errors
 def markets_list(platform: str, category: str | None, tags: str | None, min_volume: float | None, limit: int, json_output: bool) -> None:
     ensure_initialized()
-    cache = DataCache(get_engine())
+    source_name, source = _get_market_source()
     tag_list = [t.strip() for t in tags.split(",")] if tags else None
-    markets = cache.get_markets(platform=platform, category=category, tags=tag_list, min_volume=min_volume, limit=limit)
+    if source_name == "parquet":
+        markets = source.get_markets(
+            platform=platform,
+            category=category,
+            min_volume=min_volume,
+            limit=limit,
+        )
+        if tag_list:
+            wanted = {t.lower() for t in tag_list}
+            markets = [m for m in markets if wanted.issubset({t.lower() for t in m.tags})]
+    else:
+        markets = source.get_markets(platform=platform, category=category, tags=tag_list, min_volume=min_volume, limit=limit)
 
     if json_output:
         payload = {
             "ok": True,
+            "data_source": source_name,
             "count": len(markets),
             "markets": [
                 {
@@ -84,8 +98,18 @@ def markets_list(platform: str, category: str | None, tags: str | None, min_volu
     table.add_column("Price")
     table.add_column("Volume")
 
+    if source_name == "parquet":
+        click.echo("Data source: Jon Becker dataset (parquet) — 2021-present")
+    else:
+        click.echo("Data source: local sync cache (SQLite) — run 'agenttrader dataset download' for full history")
+
+    now = int(time.time())
     for m in markets:
-        latest = cache.get_latest_price(m.id)
+        if source_name == "parquet":
+            points = source.get_price_history(m.id, m.platform, now - 7 * 86400, now)
+            latest = points[-1] if points else None
+        else:
+            latest = source.get_latest_price(m.id)
         price_text = f"{latest.yes_price:.3f}" if latest else "-"
         table.add_row(m.id[:14], m.platform.value, m.title[:60], m.category or "", price_text, f"{m.volume:,.2f}")
 
@@ -257,6 +281,30 @@ def _compute_market_metrics(market_id: str, cache: DataCache) -> dict:
     }
 
 
+def _compute_market_metrics_parquet(market: Market, adapter: ParquetDataAdapter) -> dict:
+    now = int(time.time())
+    history_7d = adapter.get_price_history(market.id, market.platform, now - 7 * 86400, now)
+    history_24h = adapter.get_price_history(market.id, market.platform, now - 86400, now)
+    current_price = float(history_7d[-1].yes_price) if history_7d else (float(history_24h[-1].yes_price) if history_24h else None)
+    avg_7d = (sum(float(p.yes_price) for p in history_7d) / len(history_7d)) if history_7d else None
+    oldest_24h = float(history_24h[0].yes_price) if history_24h else None
+
+    return {
+        "current_price": current_price,
+        "price_vs_7d_avg": (current_price - avg_7d) if (current_price is not None and avg_7d is not None) else None,
+        "price_change_24h": (current_price - oldest_24h) if (current_price is not None and oldest_24h is not None) else None,
+        "volume": float(market.volume or 0.0),
+        "days_until_close": ((int(market.close_time) - now) / 86400.0) if market.close_time else None,
+    }
+
+
+def _get_market_source() -> tuple[str, object]:
+    adapter = ParquetDataAdapter()
+    if adapter.is_available():
+        return "parquet", adapter
+    return "sqlite", DataCache(get_engine())
+
+
 @markets_group.command("screen")
 @click.option("--condition", required=True)
 @click.option("--platform", default="all")
@@ -277,18 +325,25 @@ def markets_screen(
 ) -> None:
     ensure_initialized()
     metric_name, op_fn, threshold = _parse_condition(condition)
-    cache = DataCache(get_engine())
+    source_name, source = _get_market_source()
     now = int(time.time())
 
-    markets = cache.get_markets(platform=platform, category=category, min_volume=min_volume, limit=5000)
+    if source_name == "parquet":
+        markets = source.get_markets(platform=platform, category=category, min_volume=min_volume, limit=5000)
+    else:
+        markets = source.get_markets(platform=platform, category=category, min_volume=min_volume, limit=5000)
     matches = []
 
     for market in markets:
-        history = cache.get_price_history(market.id, now - max(min_history_days, 1) * 86400, now)
+        if source_name == "parquet":
+            history = source.get_price_history(market.id, market.platform, now - max(min_history_days, 1) * 86400, now)
+            metrics = _compute_market_metrics_parquet(market, source)
+        else:
+            history = source.get_price_history(market.id, now - max(min_history_days, 1) * 86400, now)
+            metrics = _compute_market_metrics(market.id, source)
         if not history:
             continue
 
-        metrics = _compute_market_metrics(market.id, cache)
         metric_value = metrics.get(metric_name)
         if metric_value is None:
             continue
@@ -311,7 +366,7 @@ def markets_screen(
         if len(matches) >= limit:
             break
 
-    payload = {"ok": True, "condition": condition, "count": len(matches), "markets": matches}
+    payload = {"ok": True, "data_source": source_name, "condition": condition, "count": len(matches), "markets": matches}
     if json_output:
         emit_json(payload)
         return

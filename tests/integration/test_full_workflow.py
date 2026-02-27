@@ -1,13 +1,17 @@
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 
 
+AGENTTRADER_CLI = f"{sys.executable} -m agenttrader.cli.main"
+
+
 def run(cmd: str) -> dict:
     result = subprocess.run(
-        f"agenttrader {cmd} --json",
+        f"{AGENTTRADER_CLI} {cmd} --json",
         shell=True,
         capture_output=True,
         text=True,
@@ -18,7 +22,7 @@ def run(cmd: str) -> dict:
 
 
 def test_full_agent_workflow():
-    subprocess.run("agenttrader init", shell=True, check=True)
+    subprocess.run(f"{AGENTTRADER_CLI} init", shell=True, check=True)
 
     r = run("sync --days 7 --platform polymarket --limit 10")
     assert r["ok"]

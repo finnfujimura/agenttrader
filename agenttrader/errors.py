@@ -9,6 +9,7 @@ from typing import Any
 class AgentTraderError(Exception):
     error: str
     message: str
+    fix: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -17,6 +18,7 @@ class NotInitializedError(AgentTraderError):
         super().__init__(
             error="NotInitialized",
             message="agenttrader not initialized. Run: agenttrader init",
+            fix="Run: agenttrader init",
         )
 
 
@@ -25,6 +27,7 @@ class MarketNotCachedError(AgentTraderError):
         super().__init__(
             error="MarketNotCached",
             message=f"Market {market_id} not in cache. Run: agenttrader sync",
+            fix=f"Call sync_data(market_ids=['{market_id}']) or run: agenttrader sync --market-id {market_id}",
         )
 
 

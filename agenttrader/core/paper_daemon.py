@@ -8,8 +8,9 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
@@ -32,6 +33,7 @@ class DaemonRuntime:
     context: LiveContext | None = None
     observer: Observer | None = None
     shutdown: bool = False
+    reload_requested: threading.Event = field(default_factory=threading.Event)
 
 
 class StrategyFileHandler(FileSystemEventHandler):
@@ -40,7 +42,8 @@ class StrategyFileHandler(FileSystemEventHandler):
 
     def on_modified(self, event: FileSystemEvent) -> None:
         if Path(event.src_path).resolve() == self._daemon.strategy_path:
-            self._daemon._reload_strategy()
+            # Signal the main loop to reload — don't mutate state from watchdog thread
+            self._daemon._runtime.reload_requested.set()
 
 
 class PaperDaemon:
@@ -102,6 +105,15 @@ class PaperDaemon:
         if not self._runtime.context:
             raise RuntimeError("LiveContext not initialized")
 
+        # Validate strategy file before executing it
+        from agenttrader.cli.validate import validate_strategy_file
+
+        validation = validate_strategy_file(str(self.strategy_path))
+        if not validation.get("valid", False):
+            errors = validation.get("errors", [])
+            msg = "; ".join(e.get("message", str(e)) for e in errors) if errors else "Validation failed"
+            raise RuntimeError(f"Strategy validation failed: {msg}")
+
         module = self._import_module(self.strategy_path)
         strategy_class = self._find_strategy_class(module)
         strategy = strategy_class(self._runtime.context)
@@ -143,6 +155,11 @@ class PaperDaemon:
         next_schedule = time.time() + interval_seconds
 
         while not self._runtime.shutdown:
+            # Check for reload request from watchdog thread (thread-safe)
+            if self._runtime.reload_requested.is_set():
+                self._runtime.reload_requested.clear()
+                self._reload_strategy()
+
             subscriptions = self._runtime.context.subscriptions
             for market_id, market in subscriptions.items():
                 latest = self._runtime.context._cache.get_latest_price(market_id)

@@ -1,6 +1,7 @@
 # DO NOT import pmxt here. Use agenttrader.data.pmxt_client only.
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from alembic import command as alembic_command
@@ -8,6 +9,7 @@ from alembic.config import Config
 import click
 import yaml
 
+from agenttrader.cli.dataset import download_dataset
 from agenttrader.config import APP_DIR, CONFIG_PATH, DB_PATH, ensure_app_dir, load_config, save_config, write_default_config
 from agenttrader.cli.utils import ensure_initialized, json_errors
 
@@ -37,7 +39,29 @@ def init_cmd() -> None:
     DB_PATH.touch(exist_ok=True)
     click.echo(f"Initialized {APP_DIR}/")
     click.echo(f"Database: {db_path}")
-    click.echo("Next step: agenttrader sync --platform polymarket --days 7")
+
+    click.echo("\nHistorical dataset for backtesting")
+    click.echo("─" * 40)
+    click.echo("The Jon Becker dataset contains trade history for")
+    click.echo("thousands of Polymarket and Kalshi markets (2021-present).")
+    click.echo()
+    click.echo("Download options:")
+    click.echo("  [1] Full dataset (~36GB) — complete history, all markets")
+    click.echo("  [2] Skip — download later with: agenttrader dataset download")
+    click.echo()
+
+    choice = "2"
+    if sys.stdin.isatty():
+        choice = click.prompt("Choice [1/2]", default="2")
+    else:
+        click.echo("Non-interactive shell detected. Skipping dataset prompt (default: 2).")
+
+    if str(choice).strip() == "1":
+        download_dataset()
+    else:
+        click.echo("Skipping dataset download.")
+        click.echo("Run 'agenttrader dataset download' when ready.")
+        click.echo("Until then, backtesting uses local sync cache data (SQLite fallback).")
 
 
 @click.group("config")
@@ -67,7 +91,11 @@ def config_set(key: str, value: str) -> None:
 
     cfg[key] = parsed
     save_config(cfg)
-    click.echo(str(parsed))
+    _SENSITIVE_KEYS = {"pmxt_api_key", "api_key", "dome_api_key", "secret", "password", "token"}
+    if key.lower() in _SENSITIVE_KEYS:
+        click.echo(f"Set {key} = [redacted]")
+    else:
+        click.echo(str(parsed))
 
 
 @config_group.command("get")

@@ -102,16 +102,31 @@ class OrderBookStore:
         return count
 
     def _file_path(self, platform: str, market_id: str, day: str) -> Path:
-        return self.base_path / platform / market_id / f"{day}.msgpack.gz"
+        # Sanitize path components to prevent directory traversal
+        safe_platform = Path(platform).name
+        safe_market_id = Path(market_id).name
+        path = self.base_path / safe_platform / safe_market_id / f"{day}.msgpack.gz"
+        if not path.resolve().is_relative_to(self.base_path.resolve()):
+            raise ValueError(f"Path traversal detected: {platform}/{market_id}")
+        return path
 
     def _read_raw(self, path: Path) -> list[dict]:
         if not path.exists():
             return []
-        with gzip.open(path, "rb") as fh:
-            payload = fh.read()
-            if not payload:
-                return []
-            return msgpack.unpackb(payload, raw=False)
+        try:
+            with gzip.open(path, "rb") as fh:
+                payload = fh.read()
+                if not payload:
+                    return []
+                if len(payload) > 100 * 1024 * 1024:  # 100MB limit
+                    return []
+                try:
+                    return msgpack.unpackb(payload, raw=False, max_buffer_size=100 * 1024 * 1024)
+                except TypeError:
+                    # Older msgpack versions don't support max_buffer_size.
+                    return msgpack.unpackb(payload, raw=False)
+        except (msgpack.UnpackValueError, msgpack.ExtraData, ValueError, EOFError):
+            return []  # skip corrupted files
 
     @staticmethod
     def _to_orderbook(market_id: str, raw: dict) -> OrderBook:

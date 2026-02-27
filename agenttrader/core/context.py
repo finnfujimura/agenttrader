@@ -64,8 +64,10 @@ class BacktestContext(ExecutionContext):
         self,
         initial_cash: float,
         price_data: dict[str, list[dict[str, Any] | PricePoint]],
-        orderbook_data: dict[str, list[OrderBook]],
+        orderbook_data: dict[str, list[OrderBook]] | None,
         markets: dict[str, Market],
+        parquet_adapter=None,
+        platform_map: dict[str, Platform] | None = None,
     ):
         self._cash = float(initial_cash)
         self._initial_cash = float(initial_cash)
@@ -77,13 +79,16 @@ class BacktestContext(ExecutionContext):
             points.sort(key=lambda p: p.timestamp)
         self._orderbook_data = {
             market_id: sorted(list(orderbooks), key=lambda o: o.timestamp)
-            for market_id, orderbooks in orderbook_data.items()
+            for market_id, orderbooks in (orderbook_data or {}).items()
         }
         self._markets = dict(markets)
+        self._parquet_adapter = parquet_adapter
+        self._platform_map = dict(platform_map or {})
         self._state: dict[str, Any] = {}
         self._logs: list[dict[str, Any]] = []
         self._subscriptions: set[str] = set()
         self._current_ts = 0
+        self._active_market_id: str | None = None  # prevents cross-market look-ahead
         self._fill_model = FillModel()
         self._positions: dict[str, PositionModel] = {}
         self._trades: list[dict[str, Any]] = []
@@ -115,12 +120,21 @@ class BacktestContext(ExecutionContext):
 
     def get_price(self, market_id: str) -> float:
         points = self._price_data.get(market_id, [])
-        historical = [p for p in points if p.timestamp <= self._current_ts]
+        # Prevent cross-market look-ahead bias: for the active market use <=,
+        # for other markets use < so they only see already-announced prices.
+        if self._active_market_id is not None and market_id != self._active_market_id:
+            historical = [p for p in points if p.timestamp < self._current_ts]
+        else:
+            historical = [p for p in points if p.timestamp <= self._current_ts]
         if not historical:
             raise MarketNotCachedError(market_id)
         return historical[-1].yes_price
 
     def get_orderbook(self, market_id: str) -> OrderBook:
+        if self._parquet_adapter is not None:
+            platform = self._platform_map.get(market_id, Platform.POLYMARKET)
+            return self._parquet_adapter.get_orderbook_snapshot(market_id, platform, self._current_ts)
+
         books = self._orderbook_data.get(market_id, [])
         before = [o for o in books if o.timestamp <= self._current_ts]
         if before:
@@ -262,8 +276,13 @@ class BacktestContext(ExecutionContext):
         return self._state.get(key, default)
 
     def advance_time(self, ts: int) -> None:
-        assert ts >= self._current_ts, f"Time must advance: {ts} < {self._current_ts}"
+        if ts < self._current_ts:
+            raise AgentTraderError("TimeOrderViolation", f"Time must advance: {ts} < {self._current_ts}")
         self._current_ts = ts
+
+    def set_active_market(self, market_id: str | None) -> None:
+        """Set the currently processing market to prevent cross-market look-ahead bias."""
+        self._active_market_id = market_id
 
     def record_snapshot(self) -> None:
         self._equity_curve.append({"timestamp": self._current_ts, "value": self.get_portfolio_value()})
@@ -397,7 +416,11 @@ class LiveContext(ExecutionContext):
     def get_portfolio_value(self) -> float:
         value = self._cash
         for pos in self._positions.values():
-            value += pos.contracts * self.get_price(pos.market_id)
+            try:
+                mark = self.get_price(pos.market_id)
+            except AgentTraderError:
+                mark = pos.avg_cost
+            value += pos.contracts * mark
         return value
 
     def buy(self, market_id, contracts, side="yes", order_type="market", limit_price=None) -> str:

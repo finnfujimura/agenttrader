@@ -10,7 +10,8 @@ import numpy as np
 
 from agenttrader.core.base_strategy import BaseStrategy
 from agenttrader.core.context import BacktestContext
-from agenttrader.data.models import Market
+from agenttrader.core.fill_model import FillModel
+from agenttrader.data.models import Market, Platform
 
 
 @dataclass
@@ -23,33 +24,48 @@ class BacktestConfig:
 
 
 class BacktestEngine:
-    def __init__(self, cache, orderbook_store):
-        self._cache = cache
+    def __init__(self, data_source, orderbook_store=None):
+        self._data = data_source
         self._ob_store = orderbook_store
+        self._fill_model = FillModel()
 
     def run(self, strategy_class: type, config: BacktestConfig) -> dict:
+        from agenttrader.data.parquet_adapter import ParquetDataAdapter
+
         start_dt = datetime.strptime(config.start_date, "%Y-%m-%d").replace(tzinfo=UTC)
         end_dt = datetime.strptime(config.end_date, "%Y-%m-%d").replace(tzinfo=UTC) + timedelta(days=1) - timedelta(seconds=1)
         start_ts = int(start_dt.timestamp())
         end_ts = int(end_dt.timestamp())
 
-        markets = self._cache.get_markets(limit=10_000)
+        using_parquet = isinstance(self._data, ParquetDataAdapter)
+        if using_parquet:
+            markets = self._data.get_markets(platform="all", limit=10_000)
+        else:
+            markets = self._data.get_markets(limit=10_000)
         markets_by_id: dict[str, Market] = {m.id: m for m in markets}
 
         price_data: dict[str, list] = {}
         orderbook_data: dict[str, list] = {}
+        platform_map: dict[str, Platform] = {}
         for market in markets:
-            history = self._cache.get_price_history(market.id, start_ts, end_ts)
+            if using_parquet:
+                history = self._data.get_price_history(market.id, market.platform, start_ts, end_ts)
+            else:
+                history = self._data.get_price_history(market.id, start_ts, end_ts)
             if not history:
                 continue
             price_data[market.id] = history
-            orderbook_data[market.id] = self._ob_store.read(market.platform.value, market.id, start_ts, end_ts)
+            platform_map[market.id] = market.platform
+            if not using_parquet and self._ob_store is not None:
+                orderbook_data[market.id] = self._ob_store.read(market.platform.value, market.id, start_ts, end_ts)
 
         context = BacktestContext(
             initial_cash=config.initial_cash,
             price_data=price_data,
             orderbook_data=orderbook_data,
             markets={mid: markets_by_id[mid] for mid in price_data.keys() if mid in markets_by_id},
+            parquet_adapter=self._data if using_parquet else None,
+            platform_map=platform_map,
         )
         context.advance_time(start_ts)
 
@@ -95,6 +111,8 @@ class BacktestEngine:
         for event in events:
             context.advance_time(event["timestamp"])
             market = markets_by_id.get(event["market_id"])
+            # Set active market to prevent cross-market look-ahead bias
+            context.set_active_market(event["market_id"])
             if event["type"] == "price_update":
                 if market:
                     strategy.on_market_data(market, float(event["price"]), context.get_orderbook(event["market_id"]))
@@ -105,6 +123,7 @@ class BacktestEngine:
                 if market:
                     pnl = context.settle_positions(event["market_id"], event["outcome"])
                     strategy.on_resolution(market, event["outcome"], pnl)
+            context.set_active_market(None)
             context.record_snapshot()
 
         strategy.on_stop()
@@ -119,6 +138,7 @@ class BacktestEngine:
             "start_date": config.start_date,
             "end_date": config.end_date,
             "initial_cash": config.initial_cash,
+            "data_source": "parquet" if using_parquet else "sqlite",
             "final_value": raw["final_value"],
             "metrics": metrics,
             "resolution_accuracy": resolution_accuracy,
@@ -144,7 +164,7 @@ class BacktestEngine:
 
         values = np.array([float(p["value"]) for p in equity_curve], dtype=float)
         timestamps = np.array([int(p["timestamp"]) for p in equity_curve], dtype=float)
-        initial = values[0] if values[0] else 1.0
+        initial = values[0] if values[0] != 0.0 else 1.0
         final = values[-1]
         total_return = (final / initial - 1.0) * 100.0
 
