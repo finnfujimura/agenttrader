@@ -29,7 +29,6 @@ from agenttrader.data.models import ExecutionMode
 from agenttrader.errors import AgentTraderError
 from agenttrader.data.pmxt_client import PmxtClient
 from agenttrader.data.orderbook_store import OrderBookStore
-from agenttrader.data.parquet_adapter import ParquetDataAdapter
 from agenttrader.db import get_engine, get_session
 from agenttrader.db.schema import BacktestRun, PaperPortfolio
 from agenttrader.perf_logging import log_performance_event
@@ -358,11 +357,7 @@ async def call_tool(name: str, arguments: dict):
                 if strategy_class is None:
                     raise RuntimeError("No BaseStrategy subclass found in strategy file")
 
-                parquet_adapter = ParquetDataAdapter()
-                if parquet_adapter.is_available():
-                    bt = BacktestEngine(data_source=parquet_adapter)
-                else:
-                    bt = BacktestEngine(data_source=cache, orderbook_store=OrderBookStore())
+                bt = BacktestEngine()
                 execution_mode = ExecutionMode(args.get("execution_mode", "strict_price_only"))
                 result = bt.run(
                     strategy_class,

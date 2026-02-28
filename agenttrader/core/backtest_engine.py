@@ -132,18 +132,13 @@ class BacktestEngine:
 
     def _run_legacy(self, strategy_class: type, config: BacktestConfig) -> dict:
         self._ensure_legacy_data_source()
-        from agenttrader.data.parquet_adapter import ParquetDataAdapter
 
         start_dt = datetime.strptime(config.start_date, "%Y-%m-%d").replace(tzinfo=UTC)
         end_dt = datetime.strptime(config.end_date, "%Y-%m-%d").replace(tzinfo=UTC) + timedelta(days=1) - timedelta(seconds=1)
         start_ts = int(start_dt.timestamp())
         end_ts = int(end_dt.timestamp())
 
-        using_parquet = isinstance(self._data, ParquetDataAdapter)
-        if using_parquet:
-            all_markets = self._data.get_markets(platform="all", limit=10_000)
-        else:
-            all_markets = self._data.get_markets(platform="all", limit=10_000)
+        all_markets = self._data.get_markets(platform="all", limit=10_000)
         market_map: dict[str, Market] = {m.id: m for m in all_markets}
 
         subscription_collector = SubscriptionCollector(market_map)
@@ -160,6 +155,9 @@ class BacktestEngine:
 
         markets_by_id: dict[str, Market] = {m.id: m for m in subscribed_markets}
 
+        from agenttrader.data.parquet_adapter import ParquetDataAdapter
+
+        using_parquet = isinstance(self._data, ParquetDataAdapter)
         price_data: dict[str, list] = {}
         orderbook_data: dict[str, list] = {}
         platform_map: dict[str, Platform] = {}
@@ -254,7 +252,7 @@ class BacktestEngine:
             "start_date": config.start_date,
             "end_date": config.end_date,
             "initial_cash": config.initial_cash,
-            "data_source": "parquet" if using_parquet else "sqlite",
+            "data_source": "parquet" if isinstance(self._data, ParquetDataAdapter) else "sqlite",
             "fidelity": "exact_trade",
             "max_markets_applied": None,
             "markets_tested": len(price_data),
@@ -283,7 +281,7 @@ class BacktestEngine:
                 "message": "No normalized data available for the requested date range. Run dataset build-index or adjust dates.",
             }
 
-        parquet = self._data if isinstance(self._data, ParquetDataAdapter) else ParquetDataAdapter()
+        parquet = ParquetDataAdapter()
         if not parquet.is_available():
             return {
                 "ok": False,
