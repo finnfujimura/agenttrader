@@ -691,7 +691,7 @@ async def call_tool(name: str, arguments: dict):
                 try:
                     cache.upsert_market(m)
                     candles = client.get_candlesticks(m.condition_id, m.platform, start_ts, end_ts, 60)
-                    cache.upsert_price_points_batch(m.id, m.platform.value, candles)
+                    cache.upsert_price_points_batch(m.id, m.platform.value, candles, source="pmxt", granularity="1h")
                     pp += len(candles)
                     ob = client.get_orderbook_snapshots(m.id, m.platform, start_ts, end_ts, 100)
                     ob_files += ob_store.write(m.platform.value, m.id, ob)

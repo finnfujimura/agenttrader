@@ -152,7 +152,7 @@ def sync_cmd(
                     limit=100,
                 )
 
-            cache.upsert_price_points_batch(market.id, market.platform.value, candles)
+            cache.upsert_price_points_batch(market.id, market.platform.value, candles, source="pmxt", granularity=granularity)
             price_points_fetched += len(candles)
             orderbook_files_written += ob_store.write(market.platform.value, market.id, orderbooks)
 

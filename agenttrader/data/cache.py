@@ -46,7 +46,7 @@ class DataCache:
     def upsert_price_point(self, market_id: str, platform: str, point: PricePoint) -> None:
         self.upsert_price_points_batch(market_id, platform, [point])
 
-    def upsert_price_points_batch(self, market_id: str, platform: str, points: list[PricePoint]) -> None:
+    def upsert_price_points_batch(self, market_id: str, platform: str, points: list[PricePoint], source: str = "pmxt", granularity: str = "1h") -> None:
         if not points:
             return
         rows = [
@@ -57,6 +57,8 @@ class DataCache:
                 "yes_price": p.yes_price,
                 "no_price": p.no_price,
                 "volume": p.volume,
+                "source": source,
+                "granularity": granularity,
             }
             for p in points
         ]
