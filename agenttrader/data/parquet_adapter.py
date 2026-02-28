@@ -11,7 +11,7 @@ try:  # pragma: no cover - import availability depends on runtime environment
 except ImportError:  # pragma: no cover
     duckdb = None
 
-from agenttrader.data.models import Market, MarketType, OrderBook, OrderLevel, Platform, PricePoint
+from agenttrader.data.models import Market, MarketType, Platform, PricePoint
 
 
 LOGGER = logging.getLogger(__name__)
@@ -115,32 +115,6 @@ class ParquetDataAdapter:
         if platform == Platform.POLYMARKET:
             return self._get_polymarket_price_history(market_id, start_ts, end_ts)
         return self._get_kalshi_price_history(market_id, start_ts, end_ts)
-
-    def get_orderbook_snapshot(
-        self,
-        market_id: str,
-        platform: Platform,
-        at_ts: int,
-        lookback_seconds: int = 300,
-    ) -> OrderBook:
-        self._require_conn()
-        points = self.get_price_history(market_id, platform, at_ts - lookback_seconds, at_ts)
-        if not points:
-            LOGGER.warning("No trades in lookback window for %s at %s, using neutral orderbook.", market_id, at_ts)
-            return OrderBook(
-                market_id=market_id,
-                timestamp=at_ts,
-                bids=[OrderLevel(price=0.49, size=1.0)],
-                asks=[OrderLevel(price=0.51, size=1.0)],
-            )
-
-        total_volume = sum(max(float(p.volume or 0.0), 0.0) for p in points)
-        if total_volume > 0:
-            vwap = sum(float(p.yes_price) * max(float(p.volume or 0.0), 0.0) for p in points) / total_volume
-        else:
-            vwap = sum(float(p.yes_price) for p in points) / max(len(points), 1)
-            total_volume = float(len(points))
-        return self._synthesize_orderbook(vwap, total_volume, market_id, at_ts)
 
     def _get_polymarket_markets(
         self,
@@ -391,24 +365,6 @@ class ParquetDataAdapter:
         quoted_files = ", ".join("'" + str(path).replace("'", "''") + "'" for path in files)
         self._conn.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT * FROM read_parquet([{quoted_files}])")
         return view_name
-
-    def _synthesize_orderbook(self, vwap: float, total_volume: float, market_id: str, at_ts: int) -> OrderBook:
-        spread = max(0.005, min(0.03, 500.0 / (total_volume + 1.0)))
-        half = spread / 2.0
-        base_size = max(total_volume, 1.0)
-        bids = [
-            OrderLevel(price=self._clamp_price(vwap - half), size=base_size * 0.4),
-            OrderLevel(price=self._clamp_price(vwap - half * 2), size=base_size * 0.3),
-            OrderLevel(price=self._clamp_price(vwap - half * 3), size=base_size * 0.2),
-        ]
-        asks = [
-            OrderLevel(price=self._clamp_price(vwap + half), size=base_size * 0.4),
-            OrderLevel(price=self._clamp_price(vwap + half * 2), size=base_size * 0.3),
-            OrderLevel(price=self._clamp_price(vwap + half * 3), size=base_size * 0.2),
-        ]
-        bids.sort(key=lambda x: x.price, reverse=True)
-        asks.sort(key=lambda x: x.price)
-        return OrderBook(market_id=market_id, timestamp=at_ts, bids=bids, asks=asks)
 
     @staticmethod
     def _clamp_price(value: float) -> float:

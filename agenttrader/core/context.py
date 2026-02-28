@@ -156,9 +156,6 @@ class BacktestContext(ExecutionContext):
                 f"No observed orderbook history for {market_id}.",
             )
         # SYNTHETIC_EXECUTION_MODEL
-        if self._parquet_adapter is not None:
-            platform = self._platform_map.get(market_id, Platform.POLYMARKET)
-            return self._parquet_adapter.get_orderbook_snapshot(market_id, platform, self._current_ts)
         books = self._orderbook_data.get(market_id, [])
         before = [o for o in books if o.timestamp <= self._current_ts]
         if before:
