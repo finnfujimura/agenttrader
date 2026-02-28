@@ -3,6 +3,19 @@ from enum import Enum
 from typing import Optional
 
 
+class ExecutionMode(str, Enum):
+    STRICT_PRICE_ONLY = "strict_price_only"
+    OBSERVED_ORDERBOOK = "observed_orderbook"
+    SYNTHETIC_EXECUTION_MODEL = "synthetic_execution_model"
+
+
+@dataclass
+class DataProvenance:
+    source: str          # "parquet", "pmxt", "index"
+    observed: bool       # True = real observed data, False = synthetic/modeled
+    granularity: str     # "trade", "1m", "1h", "1d"
+
+
 class Platform(str, Enum):
     POLYMARKET = "polymarket"
     KALSHI = "kalshi"
