@@ -57,6 +57,7 @@ class BacktestRun(Base):
     results_json = Column(Text)
     created_at = Column(Integer, nullable=False)
     completed_at = Column(Integer)
+    execution_mode = Column(Text, default="strict_price_only")
 
 
 class PaperPortfolio(Base):
