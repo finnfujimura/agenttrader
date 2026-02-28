@@ -25,6 +25,7 @@ from agenttrader.core.base_strategy import BaseStrategy
 from agenttrader.core.paper_daemon import PaperDaemon
 from agenttrader.data.backtest_artifacts import read_backtest_artifact, write_backtest_artifact
 from agenttrader.data.cache import DataCache
+from agenttrader.data.models import ExecutionMode
 from agenttrader.errors import AgentTraderError
 from agenttrader.data.pmxt_client import PmxtClient
 from agenttrader.data.orderbook_store import OrderBookStore
@@ -154,6 +155,16 @@ async def list_tools() -> list[types.Tool]:
                             "bar_1d: daily bars (fastest, least accurate)."
                         ),
                     },
+                    "execution_mode": {
+                        "type": "string",
+                        "enum": ["strict_price_only", "observed_orderbook", "synthetic_execution_model"],
+                        "default": "strict_price_only",
+                        "description": (
+                            "strict_price_only (default): fills at observed prices, no orderbook synthesis. "
+                            "observed_orderbook: uses real stored orderbooks, errors if none. "
+                            "synthetic_execution_model: synthesizes orderbooks for approximate fills (opt-in)."
+                        ),
+                    },
                     "include_curve": {
                         "type": "boolean",
                         "default": False,
@@ -176,6 +187,16 @@ async def list_tools() -> list[types.Tool]:
                     "initial_cash": {"type": "number", "default": 10000},
                     "max_markets": {"type": "integer"},
                     "fidelity": {"type": "string", "enum": ["exact_trade", "bar_1h", "bar_1d"], "default": "exact_trade"},
+                    "execution_mode": {
+                        "type": "string",
+                        "enum": ["strict_price_only", "observed_orderbook", "synthetic_execution_model"],
+                        "default": "strict_price_only",
+                        "description": (
+                            "strict_price_only (default): fills at observed prices, no orderbook synthesis. "
+                            "observed_orderbook: uses real stored orderbooks, errors if none. "
+                            "synthetic_execution_model: synthesizes orderbooks for approximate fills (opt-in)."
+                        ),
+                    },
                     "include_curve": {"type": "boolean", "default": False},
                 },
                 "required": ["strategy_path", "start_date", "end_date"],
@@ -342,6 +363,7 @@ async def call_tool(name: str, arguments: dict):
                     bt = BacktestEngine(data_source=parquet_adapter)
                 else:
                     bt = BacktestEngine(data_source=cache, orderbook_store=OrderBookStore())
+                execution_mode = ExecutionMode(args.get("execution_mode", "strict_price_only"))
                 result = bt.run(
                     strategy_class,
                     BacktestConfig(
@@ -352,6 +374,7 @@ async def call_tool(name: str, arguments: dict):
                         schedule_interval_minutes=int(load_config().get("schedule_interval_minutes", 15)),
                         max_markets=int(args["max_markets"]) if args.get("max_markets") is not None else None,
                         fidelity=str(args.get("fidelity", "exact_trade")),
+                        execution_mode=execution_mode,
                     ),
                 )
                 if result.get("ok") is False:
