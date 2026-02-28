@@ -57,8 +57,10 @@ def _extract_with_python(archive_path: Path, dest: Path) -> None:
     """Fallback extraction using Python zstandard."""
     try:
         import zstandard
-    except ImportError as exc:  # pragma: no cover - optional path
-        raise RuntimeError("Install zstandard to extract .zst archives: pip install 'agenttrader[dataset]'") from exc
+    except ImportError as exc:  # pragma: no cover - should not happen when package is installed correctly
+        raise RuntimeError(
+            "Missing required dependency 'zstandard'. Reinstall agenttrader to restore dataset extraction support."
+        ) from exc
 
     click.echo("Using Python zstandard for extraction...")
     with archive_path.open("rb") as fh:
