@@ -11,7 +11,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.dialects.sqlite import insert
 
 from agenttrader.data.cache import DataCache
-from agenttrader.data.models import Market, OrderBook, Platform, Position as PositionModel, PricePoint
+from agenttrader.data.models import ExecutionMode, Market, OrderBook, Platform, Position as PositionModel, PricePoint
 from agenttrader.data.orderbook_store import OrderBookStore
 from agenttrader.db import get_session
 from agenttrader.db.schema import PaperPortfolio, Position, Trade
@@ -364,6 +364,7 @@ class StreamingBacktestContext(ExecutionContext):
         market_map: dict[str, Market],
         fill_model: FillModel,
         history_buffer_hours: int = 168,
+        execution_mode: ExecutionMode = ExecutionMode.STRICT_PRICE_ONLY,
     ):
         self._cash = float(initial_cash)
         self._initial_cash = float(initial_cash)
@@ -373,6 +374,12 @@ class StreamingBacktestContext(ExecutionContext):
         self._history_buffer_hours = int(history_buffer_hours)
         self._active_market_id: str | None = None
         self._portfolio_changed = False
+        self._execution_mode = execution_mode
+        if execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
+            from agenttrader.core.price_fill_model import PriceOnlyFillModel
+            self._price_fill_model = PriceOnlyFillModel()
+        else:
+            self._price_fill_model = None
 
         # O(1) price lookup
         self._price_cursors: dict[str, float] = {}
@@ -454,6 +461,20 @@ class StreamingBacktestContext(ExecutionContext):
         return [p for p in self._history[market_id] if cutoff <= p.timestamp <= self._current_ts]
 
     def get_orderbook(self, market_id: str) -> OrderBook:
+        if self._execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
+            raise AgentTraderError(
+                "NoObservedOrderbook",
+                f"No observed orderbook data for {market_id}. "
+                "In strict_price_only mode, orderbook access is not available. "
+                "Use execution_mode='synthetic_execution_model' to enable synthetic orderbooks.",
+            )
+        if self._execution_mode == ExecutionMode.OBSERVED_ORDERBOOK:
+            raise AgentTraderError(
+                "NoObservedOrderbook",
+                f"No observed orderbook history for {market_id}. "
+                "Historical orderbook data must be collected via PMXT sync before use.",
+            )
+        # SYNTHETIC_EXECUTION_MODEL: existing behavior
         price = self._price_cursors.get(market_id, 0.5)
         return self._synthesize_orderbook(price, market_id)
 
@@ -477,8 +498,19 @@ class StreamingBacktestContext(ExecutionContext):
         contracts = float(contracts)
         if contracts <= 0:
             raise AgentTraderError("InvalidOrder", "contracts must be > 0")
-        ob = self.get_orderbook(market_id)
-        fill = self._fill_model.simulate_buy(contracts, ob, order_type=order_type, limit_price=limit_price)
+
+        if self._execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
+            observed_price = self._price_cursors.get(market_id)
+            if observed_price is None:
+                raise MarketNotCachedError(market_id)
+            fill = self._price_fill_model.fill_buy(
+                contracts, observed_price,
+                limit_price=limit_price if order_type == "limit" else None,
+            )
+        else:
+            ob = self.get_orderbook(market_id)
+            fill = self._fill_model.simulate_buy(contracts, ob, order_type=order_type, limit_price=limit_price)
+
         if not fill.filled or fill.contracts <= 0:
             raise AgentTraderError("OrderNotFilled", f"Buy not filled for market {market_id}")
 
@@ -537,8 +569,15 @@ class StreamingBacktestContext(ExecutionContext):
         if contracts_to_sell <= 0:
             raise AgentTraderError("InvalidOrder", "contracts must be > 0")
 
-        ob = self.get_orderbook(market_id)
-        fill = self._fill_model.simulate_sell(contracts_to_sell, ob)
+        if self._execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
+            observed_price = self._price_cursors.get(market_id)
+            if observed_price is None:
+                raise MarketNotCachedError(market_id)
+            fill = self._price_fill_model.fill_sell(contracts_to_sell, observed_price)
+        else:
+            ob = self.get_orderbook(market_id)
+            fill = self._fill_model.simulate_sell(contracts_to_sell, ob)
+
         if not fill.filled:
             raise AgentTraderError("OrderNotFilled", f"Sell not filled for market {market_id}")
 
@@ -628,6 +667,7 @@ class StreamingBacktestContext(ExecutionContext):
             "trades": self._trades,
             "logs": self._logs,
             "avg_slippage": (sum(self._slippage_samples) / len(self._slippage_samples)) if self._slippage_samples else 0.0,
+            "execution_mode": self._execution_mode.value,
         }
 
     def _synthesize_orderbook(self, price: float, market_id: str) -> OrderBook:
