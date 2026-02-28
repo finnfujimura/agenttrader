@@ -12,7 +12,7 @@ import numpy as np
 from agenttrader.core.base_strategy import BaseStrategy
 from agenttrader.core.context import BacktestContext, StreamingBacktestContext
 from agenttrader.core.fill_model import FillModel
-from agenttrader.data.models import Market, Platform
+from agenttrader.data.models import ExecutionMode, Market, Platform
 
 
 @dataclass
@@ -25,6 +25,7 @@ class BacktestConfig:
     history_buffer_hours: int = 168
     max_markets: int | None = None
     fidelity: str = "exact_trade"
+    execution_mode: ExecutionMode = ExecutionMode.STRICT_PRICE_ONLY
 
 
 class SubscriptionCollector:
