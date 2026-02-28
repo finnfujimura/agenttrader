@@ -4,7 +4,7 @@ from pathlib import Path
 from agenttrader.core.backtest_engine import BacktestConfig, BacktestEngine
 from agenttrader.core.base_strategy import BaseStrategy
 from agenttrader.data.backtest_artifacts import read_backtest_artifact, write_backtest_artifact
-from agenttrader.data.models import Market, MarketType, Platform, PricePoint
+from agenttrader.data.models import ExecutionMode, Market, MarketType, Platform, PricePoint
 
 
 def test_backtest_artifact_roundtrip(tmp_path: Path, monkeypatch):
@@ -83,6 +83,7 @@ def test_streaming_backtest_returns_summary_and_artifact_payload(monkeypatch):
             start_date="2024-01-01",
             end_date="2024-01-02",
             initial_cash=1000.0,
+            execution_mode=ExecutionMode.SYNTHETIC_EXECUTION_MODEL,
         ),
         FakeIndex(),
     )
@@ -182,6 +183,7 @@ def test_streaming_backtest_applies_guardrails(monkeypatch):
             initial_cash=1000.0,
             max_markets=1,
             fidelity="bar_1h",
+            execution_mode=ExecutionMode.SYNTHETIC_EXECUTION_MODEL,
         ),
         index,
     )

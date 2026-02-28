@@ -262,6 +262,7 @@ class BacktestEngine:
             "metrics": metrics,
             "resolution_accuracy": resolution_accuracy,
             "by_category": by_category,
+            "execution_mode": config.execution_mode.value,
             "equity_curve": raw["equity_curve"],
             "trades": raw["trades"],
         }
@@ -326,6 +327,7 @@ class BacktestEngine:
             market_map=subscribed_map,
             fill_model=self._fill_model,
             history_buffer_hours=config.history_buffer_hours,
+            execution_mode=config.execution_mode,
         )
         context._subscriptions = set(subscribed_map.keys())
         context.advance_time(start_ts)
@@ -383,7 +385,11 @@ class BacktestEngine:
             context.set_active_market(market_id)
             context.set_price_cursor(market_id, float(point.yes_price))
             context.push_history(market_id, point)
-            strategy.on_market_data(market, float(point.yes_price), context.get_orderbook(market_id))
+            if config.execution_mode == ExecutionMode.SYNTHETIC_EXECUTION_MODEL:
+                ob = context.get_orderbook(market_id)
+            else:
+                ob = None
+            strategy.on_market_data(market, float(point.yes_price), ob)
 
             if ts - last_scheduled[market_id] >= schedule_interval:
                 strategy.on_schedule(datetime.fromtimestamp(ts, tz=UTC), market)
@@ -431,6 +437,7 @@ class BacktestEngine:
             "metrics": metrics,
             "resolution_accuracy": resolution_accuracy,
             "by_category": by_category,
+            "execution_mode": config.execution_mode.value,
             "_artifact_payload": {
                 "equity_curve": raw["equity_curve"],
                 "trades": raw["trades"],
