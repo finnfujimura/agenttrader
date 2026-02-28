@@ -15,7 +15,9 @@
       "Bash(py:*)",
       "Bash(pytest:*)",
       "Bash(python:*)",
-      "Bash(git:*)"
+      "Bash(git:*)",
+      "Bash(rtk python:*)",
+      "Bash(pip install:*)"
     ]
   }
 }

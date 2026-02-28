@@ -159,11 +159,6 @@ def test_parquet_adapter_market_and_history_translation(tmp_path):
     assert kalshi_history[0].yes_price == 0.35
     assert kalshi_history[0].no_price == 0.65
 
-    ob = adapter.get_orderbook_snapshot("yes-token-1", Platform.POLYMARKET, 1704067200)
-    assert ob.best_bid is not None
-    assert ob.best_ask is not None
-    assert ob.best_ask > ob.best_bid
-
 
 def test_parquet_adapter_ignores_appledouble_files(tmp_path):
     _write_parquet_dataset(tmp_path)

@@ -2,6 +2,8 @@ import importlib
 import json
 import time
 
+import asyncio
+
 import pytest
 
 from agenttrader.cli.utils import json_errors
@@ -55,13 +57,12 @@ def test_json_errors_wrapper_logs_cli_call(tmp_path, monkeypatch):
     assert lines[0]["operation"] == "_sample_cmd"
 
 
-@pytest.mark.asyncio
-async def test_mcp_call_logs_tool_timing(tmp_path, monkeypatch):
+def test_mcp_call_logs_tool_timing(tmp_path, monkeypatch):
     log_path = tmp_path / "performance.jsonl"
     monkeypatch.setenv("AGENTTRADER_PERF_LOG_PATH", str(log_path))
     monkeypatch.setattr(mcp_server, "is_initialized", lambda: False)
 
-    await mcp_server.call_tool("get_markets", {})
+    asyncio.run(mcp_server.call_tool("get_markets", {}))
     lines = _read_lines(log_path)
     assert len(lines) >= 1
     last = lines[-1]

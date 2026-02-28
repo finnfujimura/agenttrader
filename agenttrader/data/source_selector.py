@@ -10,15 +10,15 @@ from __future__ import annotations
 
 def get_best_data_source():
     """Return (source_object, source_name_string) for the best available data source."""
-    from agenttrader.data.index_adapter import BacktestIndexAdapter
+    from agenttrader.data.index_provider import IndexProvider
     from agenttrader.data.parquet_adapter import ParquetDataAdapter
     from agenttrader.data.cache import DataCache
     from agenttrader.db import get_engine
 
     try:
-        index = BacktestIndexAdapter()
-        if index.is_available():
-            return index, "normalized-index"
+        provider = IndexProvider()
+        if provider.is_available():
+            return provider, "normalized-index"
     except Exception:
         pass
 

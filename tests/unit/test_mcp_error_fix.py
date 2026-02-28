@@ -1,3 +1,4 @@
+import asyncio
 import json
 import importlib
 import time
@@ -9,6 +10,10 @@ mcp_server = importlib.import_module("agenttrader.mcp.server")
 models = importlib.import_module("agenttrader.data.models")
 
 
+def _run(coro):
+    return asyncio.run(coro)
+
+
 def _payload(result):
     return json.loads(result[0].text)
 
@@ -18,20 +23,18 @@ def _set_perf_log_path(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTTRADER_PERF_LOG_PATH", str(tmp_path / "performance.jsonl"))
 
 
-@pytest.mark.asyncio
-async def test_call_tool_not_initialized_includes_fix(monkeypatch):
+def test_call_tool_not_initialized_includes_fix(monkeypatch):
     monkeypatch.setattr(mcp_server, "is_initialized", lambda: False)
-    result = await mcp_server.call_tool("get_markets", {})
+    result = _run(mcp_server.call_tool("get_markets", {}))
     payload = _payload(result)
     assert payload["ok"] is False
     assert payload["error"] == "NotInitialized"
     assert payload["fix"] == "Run: agenttrader init"
 
 
-@pytest.mark.asyncio
-async def test_call_tool_missing_argument_returns_fix(monkeypatch):
+def test_call_tool_missing_argument_returns_fix(monkeypatch):
     monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
-    result = await mcp_server.call_tool("get_price", {})
+    result = _run(mcp_server.call_tool("get_price", {}))
     payload = _payload(result)
     assert payload["ok"] is False
     assert payload["error"] == "BadRequest"
@@ -39,8 +42,7 @@ async def test_call_tool_missing_argument_returns_fix(monkeypatch):
     assert "market_id" in payload["fix"]
 
 
-@pytest.mark.asyncio
-async def test_call_tool_market_not_cached_returns_fix(monkeypatch):
+def test_call_tool_market_not_cached_returns_fix(monkeypatch):
     class FakeCache:
         def get_market(self, _market_id):
             return None
@@ -49,25 +51,23 @@ async def test_call_tool_market_not_cached_returns_fix(monkeypatch):
     monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: FakeCache())
     monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
 
-    result = await mcp_server.call_tool("get_price", {"market_id": "0xabc"})
+    result = _run(mcp_server.call_tool("get_price", {"market_id": "0xabc"}))
     payload = _payload(result)
     assert payload["ok"] is False
     assert payload["error"] == "MarketNotCached"
     assert "sync_data" in payload["fix"]
 
 
-@pytest.mark.asyncio
-async def test_unknown_tool_returns_fix(monkeypatch):
+def test_unknown_tool_returns_fix(monkeypatch):
     monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
-    result = await mcp_server.call_tool("unknown_tool", {})
+    result = _run(mcp_server.call_tool("unknown_tool", {}))
     payload = _payload(result)
     assert payload["ok"] is False
     assert payload["error"] == "UnknownTool"
     assert "list_tools" in payload["fix"]
 
 
-@pytest.mark.asyncio
-async def test_get_history_returns_analytics_by_default(monkeypatch):
+def test_get_history_returns_analytics_by_default(monkeypatch):
     now = int(time.time())
     history = [
         SimpleNamespace(timestamp=now - (2 * 86400), yes_price=0.40, no_price=0.60, volume=1000),
@@ -82,11 +82,13 @@ async def test_get_history_returns_analytics_by_default(monkeypatch):
         def get_price_history(self, _market_id, _start_ts, _end_ts):
             return history
 
+    fake_cache = FakeCache()
     monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
-    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: FakeCache())
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: fake_cache)
     monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
+    monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (fake_cache, "sqlite-cache"))
 
-    result = await mcp_server.call_tool("get_history", {"market_id": "0xabc", "days": 7})
+    result = _run(mcp_server.call_tool("get_history", {"market_id": "0xabc", "days": 7}))
     payload = _payload(result)
     assert payload["ok"] is True
     assert "history" not in payload
@@ -96,8 +98,7 @@ async def test_get_history_returns_analytics_by_default(monkeypatch):
     assert payload["analytics"]["points"] == 3
 
 
-@pytest.mark.asyncio
-async def test_get_history_include_raw_true_returns_history(monkeypatch):
+def test_get_history_include_raw_true_returns_history(monkeypatch):
     now = int(time.time())
     history = [SimpleNamespace(timestamp=now, yes_price=0.55, no_price=0.45, volume=2000)]
 
@@ -108,30 +109,30 @@ async def test_get_history_include_raw_true_returns_history(monkeypatch):
         def get_price_history(self, _market_id, _start_ts, _end_ts):
             return history
 
+    fake_cache = FakeCache()
     monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
-    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: FakeCache())
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: fake_cache)
     monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
+    monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (fake_cache, "sqlite-cache"))
 
-    result = await mcp_server.call_tool(
+    result = _run(mcp_server.call_tool(
         "get_history",
         {"market_id": "0xdef", "days": 7, "include_raw": True},
-    )
+    ))
     payload = _payload(result)
     assert payload["ok"] is True
     assert "history" in payload
     assert len(payload["history"]) == 1
 
 
-@pytest.mark.asyncio
-async def test_list_tools_includes_compound_tools():
-    tools = await mcp_server.list_tools()
+def test_list_tools_includes_compound_tools():
+    tools = _run(mcp_server.list_tools())
     names = {t.name for t in tools}
     assert "research_markets" in names
     assert "validate_and_backtest" in names
 
 
-@pytest.mark.asyncio
-async def test_validate_and_backtest_returns_validation_error_with_fix(monkeypatch):
+def test_validate_and_backtest_returns_validation_error_with_fix(monkeypatch):
     monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
     monkeypatch.setattr(
         mcp_server,
@@ -139,10 +140,10 @@ async def test_validate_and_backtest_returns_validation_error_with_fix(monkeypat
         lambda _path: {"ok": True, "valid": False, "errors": [{"line": 1, "message": "bad"}], "warnings": []},
     )
 
-    result = await mcp_server.call_tool(
+    result = _run(mcp_server.call_tool(
         "validate_and_backtest",
         {"strategy_path": "./bad.py", "start_date": "2024-01-01", "end_date": "2024-01-02"},
-    )
+    ))
     payload = _payload(result)
     assert payload["ok"] is False
     assert payload["error"] == "StrategyValidationError"
@@ -150,8 +151,7 @@ async def test_validate_and_backtest_returns_validation_error_with_fix(monkeypat
     assert "validation" in payload
 
 
-@pytest.mark.asyncio
-async def test_research_markets_runs_compound_flow(monkeypatch):
+def test_research_markets_runs_compound_flow(monkeypatch):
     now = int(time.time())
     market = models.Market(
         id="0xabc",
@@ -181,7 +181,7 @@ async def test_research_markets_runs_compound_flow(monkeypatch):
         def upsert_market(self, m):
             self.markets[m.id] = m
 
-        def upsert_price_points_batch(self, market_id, _platform, batch):
+        def upsert_price_points_batch(self, market_id, _platform, batch, **_kwargs):
             self.history.setdefault(market_id, [])
             self.history[market_id].extend(batch)
             self.history[market_id].sort(key=lambda p: p.timestamp)
@@ -230,11 +230,12 @@ async def test_research_markets_runs_compound_flow(monkeypatch):
     monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
     monkeypatch.setattr(mcp_server, "PmxtClient", lambda: FakeClient())
     monkeypatch.setattr(mcp_server, "OrderBookStore", lambda: FakeOrderBookStore())
+    monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (shared_cache, "sqlite-cache"))
 
-    result = await mcp_server.call_tool(
+    result = _run(mcp_server.call_tool(
         "research_markets",
-        {"platform": "polymarket", "days": 7, "limit": 5},
-    )
+        {"platform": "polymarket", "days": 7, "limit": 5, "sync_first": True},
+    ))
     payload = _payload(result)
     assert payload["ok"] is True
     assert payload["count"] == 1
