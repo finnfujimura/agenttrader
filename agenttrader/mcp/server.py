@@ -26,6 +26,8 @@ from agenttrader.core.paper_daemon import PaperDaemon
 from agenttrader.data.backtest_artifacts import read_backtest_artifact, write_backtest_artifact
 from agenttrader.data.cache import DataCache
 from agenttrader.data.models import ExecutionMode
+from agenttrader.data.source_selector import get_best_data_source
+from agenttrader.db.health import check_schema
 from agenttrader.errors import AgentTraderError
 from agenttrader.data.pmxt_client import PmxtClient
 from agenttrader.data.orderbook_store import OrderBookStore
@@ -112,7 +114,7 @@ async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="get_markets",
-            description="List prediction markets from local cache. Filter by platform, category, tags.",
+            description="List prediction markets. Uses best available data source (index > parquet > cache). Filter by platform, category, tags.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -124,7 +126,25 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(name="get_price", description="Get latest cached price", inputSchema={"type": "object", "properties": {"market_id": {"type": "string"}}, "required": ["market_id"]}),
-        types.Tool(name="get_history", description="Get cached market history analytics. Raw history is omitted by default; set include_raw=true to include points.", inputSchema={"type": "object", "properties": {"market_id": {"type": "string"}, "days": {"type": "integer", "default": 7}, "include_raw": {"type": "boolean", "default": False}}, "required": ["market_id"]}),
+        types.Tool(
+            name="get_history",
+            description="Get market history analytics. Uses best available data source (index > parquet > cache). Raw history is omitted by default; set include_raw=true to include points.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "market_id": {"type": "string"},
+                    "days": {"type": "integer", "default": 7},
+                    "platform": {
+                        "type": "string",
+                        "enum": ["polymarket", "kalshi"],
+                        "default": "polymarket",
+                        "description": "Platform hint. Required when using indexed/parquet data source.",
+                    },
+                    "include_raw": {"type": "boolean", "default": False},
+                },
+                "required": ["market_id"],
+            },
+        ),
         types.Tool(name="match_markets", description="Match markets across platforms", inputSchema={"type": "object", "properties": {"polymarket_slug": {"type": "string"}, "kalshi_ticker": {"type": "string"}}}),
         types.Tool(
             name="run_backtest",
@@ -173,7 +193,35 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["strategy_path", "start_date", "end_date"],
             },
         ),
-        types.Tool(name="research_markets", description="Compound research workflow: sync cache, list filtered markets, and return history analytics for each market.", inputSchema={"type": "object", "properties": {"days": {"type": "integer", "default": 7}, "platform": {"type": "string", "enum": ["polymarket", "kalshi", "all"], "default": "all"}, "category": {"type": "string"}, "tags": {"type": "array", "items": {"type": "string"}}, "market_ids": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "default": 20}, "sync_limit": {"type": "integer", "default": 100}, "include_raw": {"type": "boolean", "default": False}}}),
+        types.Tool(
+            name="research_markets",
+            description=(
+                "Compound research workflow: list filtered markets and return history analytics for each. "
+                "Uses best available data source (index > parquet > cache). "
+                "Set sync_first=true to sync live data before researching (only relevant for sqlite-cache)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "default": 7},
+                    "platform": {"type": "string", "enum": ["polymarket", "kalshi", "all"], "default": "all"},
+                    "category": {"type": "string"},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "market_ids": {"type": "array", "items": {"type": "string"}},
+                    "limit": {"type": "integer", "default": 20},
+                    "sync_first": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "If true, sync fresh data from PMXT before researching. "
+                            "Only relevant when using sqlite-cache. Default: false."
+                        ),
+                    },
+                    "sync_limit": {"type": "integer", "default": 100},
+                    "include_raw": {"type": "boolean", "default": False},
+                },
+            },
+        ),
         types.Tool(
             name="validate_and_backtest",
             description="Compound workflow: validate a strategy file then run backtest when valid.",
@@ -208,7 +256,24 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(name="get_portfolio", description="Get paper portfolio status", inputSchema={"type": "object", "properties": {"portfolio_id": {"type": "string"}}, "required": ["portfolio_id"]}),
         types.Tool(name="stop_paper_trade", description="Stop paper trading daemon", inputSchema={"type": "object", "properties": {"portfolio_id": {"type": "string"}}, "required": ["portfolio_id"]}),
         types.Tool(name="list_paper_trades", description="List paper portfolios", inputSchema={"type": "object", "properties": {}}),
-        types.Tool(name="sync_data", description="Sync data from PMXT", inputSchema={"type": "object", "properties": {"days": {"type": "integer", "default": 7}, "platform": {"type": "string", "default": "all"}, "market_ids": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "default": 100}}}),
+        types.Tool(
+            name="sync_data",
+            description=(
+                "Sync live market data from PMXT into local SQLite cache. "
+                "Use for paper trading or when you need real-time prices. "
+                "Not needed for backtesting if the indexed dataset is available."
+            ),
+            inputSchema={"type": "object", "properties": {"days": {"type": "integer", "default": 7}, "platform": {"type": "string", "default": "all"}, "market_ids": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "default": 100}}},
+        ),
+        types.Tool(
+            name="debug_data_sources",
+            description=(
+                "Diagnose data source availability. Returns status of all data backends: "
+                "DuckDB index, parquet files, SQLite cache, and schema health. "
+                "Use this first when data lookups fail or return unexpected results."
+            ),
+            inputSchema={"type": "object", "properties": {}, "required": []},
+        ),
     ]
 
 
@@ -244,13 +309,24 @@ async def call_tool(name: str, arguments: dict):
     cache = DataCache(get_engine())
     try:
         if name == "get_markets":
-            markets = cache.get_markets(
-                platform=args.get("platform", "all"),
-                category=args.get("category"),
-                tags=args.get("tags"),
-                limit=int(args.get("limit", 20)),
-            )
-            return _respond({"ok": True, "count": len(markets), "markets": [m.__dict__ | {"platform": m.platform.value, "market_type": m.market_type.value} for m in markets]})
+            source, source_name = get_best_data_source()
+            kwargs = {
+                "platform": args.get("platform", "all"),
+                "category": args.get("category"),
+                "limit": int(args.get("limit", 20)),
+            }
+            if source_name == "sqlite-cache" and args.get("tags"):
+                kwargs["tags"] = args.get("tags")
+            markets = source.get_markets(**kwargs)
+            return _respond({
+                "ok": True,
+                "data_source": source_name,
+                "count": len(markets),
+                "markets": [
+                    m.__dict__ | {"platform": m.platform.value, "market_type": m.market_type.value}
+                    for m in markets
+                ],
+            })
 
         if name == "get_price":
             market_id = args["market_id"]
@@ -268,22 +344,33 @@ async def call_tool(name: str, arguments: dict):
 
         if name == "get_history":
             market_id = args["market_id"]
-            market = cache.get_market(market_id)
-            if not market:
-                return _respond(
-                    _error_payload(
-                        "MarketNotCached",
-                        f"Market {market_id} not found in local cache",
-                        fix=f"Call sync_data(market_ids=['{market_id}']) and retry.",
+            source, source_name = get_best_data_source()
+
+            if source_name == "sqlite-cache":
+                market = cache.get_market(market_id)
+                if not market:
+                    return _respond(
+                        _error_payload(
+                            "MarketNotCached",
+                            f"Market {market_id} not found in local cache",
+                            fix=f"Call sync_data(market_ids=['{market_id}']) and retry.",
+                        )
                     )
-                )
+
             days = int(args.get("days", 7))
             end_ts = int(time.time())
             start_ts = end_ts - days * 24 * 3600
-            history = cache.get_price_history(market_id, start_ts, end_ts)
+
+            if source_name == "sqlite-cache":
+                history = source.get_price_history(market_id, start_ts, end_ts)
+            else:
+                platform = args.get("platform", "polymarket")
+                history = source.get_price_history(market_id, platform, start_ts, end_ts)
+
             include_raw = bool(args.get("include_raw", False))
             payload = {
                 "ok": True,
+                "data_source": source_name,
                 "market_id": market_id,
                 "days": days,
                 "analytics": _compute_history_analytics(history, end_ts),
@@ -417,81 +504,71 @@ async def call_tool(name: str, arguments: dict):
             sync_limit = int(args.get("sync_limit", 100))
             include_raw = bool(args.get("include_raw", False))
 
-            sync_response = await call_tool(
-                "sync_data",
-                {
-                    "days": days,
-                    "platform": platform,
-                    "market_ids": market_ids,
-                    "limit": sync_limit,
-                },
-            )
-            sync_payload = json.loads(sync_response[0].text)
-            if not sync_payload.get("ok"):
-                return _respond(
-                    _error_payload(
-                        "ResearchFailed",
-                        "research_markets failed during sync_data",
-                        fix=sync_payload.get("fix", "Retry sync_data first, then rerun research_markets."),
-                        step="sync_data",
-                        sync=sync_payload,
-                    )
-                )
+            source, source_name = get_best_data_source()
+            sync_payload = None
 
-            markets_response = await call_tool(
-                "get_markets",
-                {
-                    "platform": platform,
-                    "category": category,
-                    "tags": tags,
-                    "limit": limit,
-                },
-            )
-            markets_payload = json.loads(markets_response[0].text)
-            if not markets_payload.get("ok"):
-                return _respond(
-                    _error_payload(
-                        "ResearchFailed",
-                        "research_markets failed during get_markets",
-                        fix=markets_payload.get("fix", "Retry get_markets with broader filters."),
-                        step="get_markets",
-                        sync=sync_payload,
-                        markets=markets_payload,
-                    )
+            # Only sync if explicitly requested AND using sqlite-cache
+            if source_name == "sqlite-cache" and args.get("sync_first", False):
+                sync_response = await call_tool(
+                    "sync_data",
+                    {"days": days, "platform": platform, "market_ids": market_ids, "limit": sync_limit},
                 )
+                sync_payload = json.loads(sync_response[0].text)
+                if not sync_payload.get("ok"):
+                    return _respond(
+                        _error_payload(
+                            "ResearchFailed",
+                            "research_markets failed during sync_data",
+                            fix=sync_payload.get("fix", "Retry sync_data first, then rerun research_markets."),
+                            step="sync_data",
+                            sync=sync_payload,
+                        )
+                    )
 
+            # Get markets from best source
+            mkwargs = {"platform": platform, "category": category, "limit": limit}
+            if source_name == "sqlite-cache" and tags:
+                mkwargs["tags"] = tags
+            markets = source.get_markets(**mkwargs)
+
+            # Get history for each market
+            end_ts = int(time.time())
+            start_ts = end_ts - days * 24 * 3600
             history = []
             history_errors = []
-            for market in markets_payload.get("markets", []):
-                history_response = await call_tool(
-                    "get_history",
-                    {
-                        "market_id": market["id"],
-                        "days": days,
-                        "include_raw": include_raw,
-                    },
-                )
-                history_payload = json.loads(history_response[0].text)
-                if history_payload.get("ok"):
-                    history.append(history_payload)
-                else:
-                    history_errors.append({"market_id": market["id"], **history_payload})
+            for market in markets:
+                try:
+                    mid = market.id if hasattr(market, "id") else market["id"]
+                    plat = market.platform.value if hasattr(market.platform, "value") else str(market.platform)
+                    if source_name == "sqlite-cache":
+                        pts = source.get_price_history(mid, start_ts, end_ts)
+                    else:
+                        pts = source.get_price_history(mid, plat, start_ts, end_ts)
+                    analytics = _compute_history_analytics(pts, end_ts)
+                    entry = {"ok": True, "market_id": mid, "days": days, "analytics": analytics}
+                    if include_raw:
+                        entry["history"] = [h.__dict__ for h in pts]
+                    history.append(entry)
+                except Exception as exc:
+                    history_errors.append({"market_id": getattr(market, "id", "?"), "error": str(exc)})
 
             payload = {
                 "ok": len(history_errors) == 0,
-                "sync": sync_payload,
-                "markets": markets_payload.get("markets", []),
+                "data_source": source_name,
+                "markets": [
+                    m.__dict__ | {"platform": m.platform.value, "market_type": m.market_type.value}
+                    for m in markets
+                ],
                 "history": history,
                 "history_errors": history_errors,
-                "count": len(markets_payload.get("markets", [])),
+                "count": len(markets),
             }
+            if sync_payload is not None:
+                payload["sync"] = sync_payload
             if history_errors:
                 payload["error"] = "PartialHistoryFailure"
                 payload["message"] = "History fetch failed for one or more markets."
-                payload["fix"] = history_errors[0].get(
-                    "fix",
-                    "Retry with a smaller limit or sync_data for failed market_ids.",
-                )
+                payload["fix"] = "Retry with a smaller limit or sync_data for failed market_ids."
             return _respond(payload)
 
         if name == "validate_and_backtest":
@@ -705,6 +782,95 @@ async def call_tool(name: str, arguments: dict):
                 }
             )
 
+        if name == "debug_data_sources":
+            base = Path.home() / ".agenttrader"
+            diag = {"ok": True, "sources": {}}
+
+            # 1. DuckDB normalized index
+            index_path = base / "backtest_index.duckdb"
+            if index_path.exists():
+                try:
+                    from agenttrader.data.index_adapter import BacktestIndexAdapter
+                    adapter = BacktestIndexAdapter()
+                    if adapter.is_available():
+                        diag["sources"]["normalized_index"] = {
+                            "available": True,
+                            "path": str(index_path),
+                            "size_mb": round(index_path.stat().st_size / 1e6, 1),
+                        }
+                    else:
+                        diag["sources"]["normalized_index"] = {
+                            "available": False, "path": str(index_path),
+                            "reason": "File exists but tables not readable",
+                            "fix": "Run: agenttrader dataset build-index --force",
+                        }
+                except Exception as e:
+                    diag["sources"]["normalized_index"] = {
+                        "available": False, "error": str(e),
+                        "fix": "Run: agenttrader dataset build-index --force",
+                    }
+            else:
+                diag["sources"]["normalized_index"] = {
+                    "available": False, "reason": "File not found",
+                    "fix": "Run: agenttrader dataset download && agenttrader dataset build-index",
+                }
+
+            # 2. Raw parquet files
+            data_dir = base / "data"
+            parquet_status = {}
+            for plat in ["polymarket", "kalshi"]:
+                for subdir in ["markets", "trades"]:
+                    p = data_dir / plat / subdir
+                    if p.exists():
+                        parquet_status[f"{plat}/{subdir}"] = len(list(p.glob("*.parquet")))
+                    else:
+                        parquet_status[f"{plat}/{subdir}"] = 0
+            total_parquet = sum(parquet_status.values())
+            diag["sources"]["raw_parquet"] = {
+                "available": total_parquet > 0,
+                "data_dir": str(data_dir),
+                "file_counts": parquet_status,
+            }
+            if total_parquet == 0:
+                diag["sources"]["raw_parquet"]["fix"] = "Run: agenttrader dataset download"
+
+            # 3. SQLite cache
+            db_path = base / "db.sqlite"
+            schema_health = check_schema(db_path)
+            if db_path.exists():
+                try:
+                    import sqlite3
+                    conn = sqlite3.connect(str(db_path))
+                    market_count = conn.execute("SELECT COUNT(*) FROM markets").fetchone()[0]
+                    price_count = conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
+                    conn.close()
+                    diag["sources"]["sqlite_cache"] = {
+                        "available": True,
+                        "path": str(db_path),
+                        "schema_ok": schema_health["ok"],
+                        "schema_issues": schema_health.get("missing_columns", []),
+                        "markets_cached": market_count,
+                        "price_points": price_count,
+                    }
+                    if not schema_health["ok"]:
+                        diag["sources"]["sqlite_cache"]["fix"] = schema_health.get("fix")
+                except Exception as e:
+                    diag["sources"]["sqlite_cache"] = {
+                        "available": False, "error": str(e),
+                        "fix": "Run: agenttrader init",
+                    }
+            else:
+                diag["sources"]["sqlite_cache"] = {
+                    "available": False, "reason": "Database not found",
+                    "fix": "Run: agenttrader init",
+                }
+
+            # 4. Active data source
+            _, active_name = get_best_data_source()
+            diag["active_data_source"] = active_name
+
+            return _respond(diag)
+
         return _respond(_error_payload("UnknownTool", f"Unknown tool: {name}"))
     except AgentTraderError as exc:
         return _respond(_error_payload(exc.error, exc.message, fix=exc.fix, **exc.extra))
@@ -739,6 +905,17 @@ async def call_tool(name: str, arguments: dict):
 
 
 async def main():
+    from agenttrader.config import DB_PATH
+
+    if DB_PATH.exists():
+        health = check_schema(DB_PATH)
+        if not health["ok"]:
+            print(f"ERROR: {health['error']}", file=sys.stderr)
+            if "missing_columns" in health:
+                print(f"Missing: {', '.join(health['missing_columns'])}", file=sys.stderr)
+            print(f"Fix: {health['fix']}", file=sys.stderr)
+            sys.exit(1)
+
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
