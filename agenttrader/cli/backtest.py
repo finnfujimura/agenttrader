@@ -197,9 +197,9 @@ def _backtest_run(strategy_path: str, args: list[str]) -> None:
             if results.get("data_source") == "normalized-index":
                 click.echo("Data source: normalized backtest index (DuckDB)")
             elif results.get("data_source") == "parquet":
-                click.echo("Data source: Jon Becker dataset (parquet) — 2021-present")
+                click.echo("Data source: Jon Becker dataset (parquet) -- 2021-present")
             else:
-                click.echo("Data source: local sync cache (SQLite) — run 'agenttrader dataset download' for full history")
+                click.echo("Data source: local sync cache (SQLite) -- run 'agenttrader dataset download' for full history")
             click.echo(f"Final value: {results['final_value']:.2f}")
             click.echo(f"Sharpe: {results['metrics']['sharpe_ratio']}")
     except Exception as exc:

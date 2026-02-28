@@ -233,7 +233,7 @@ def dataset_verify_cmd() -> None:
     all_ok = True
     for path in expected:
         files = list(path.rglob("*.parquet")) if path.exists() else []
-        status = "✓" if files else "✗ MISSING"
+        status = "OK" if files else "MISSING"
         click.echo(f"  {status}  {_pretty_path(path)} ({len(files)} parquet files)")
         if not files:
             all_ok = False

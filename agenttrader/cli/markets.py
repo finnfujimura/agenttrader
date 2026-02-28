@@ -99,9 +99,9 @@ def markets_list(platform: str, category: str | None, tags: str | None, min_volu
     table.add_column("Volume")
 
     if source_name == "parquet":
-        click.echo("Data source: Jon Becker dataset (parquet) — 2021-present")
+        click.echo("Data source: Jon Becker dataset (parquet) -- 2021-present")
     else:
-        click.echo("Data source: local sync cache (SQLite) — run 'agenttrader dataset download' for full history")
+        click.echo("Data source: local sync cache (SQLite) -- run 'agenttrader dataset download' for full history")
 
     now = int(time.time())
     for m in markets:

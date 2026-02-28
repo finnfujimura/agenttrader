@@ -41,13 +41,13 @@ def init_cmd() -> None:
     click.echo(f"Database: {db_path}")
 
     click.echo("\nHistorical dataset for backtesting")
-    click.echo("─" * 40)
+    click.echo("-" * 40)
     click.echo("The Jon Becker dataset contains trade history for")
     click.echo("thousands of Polymarket and Kalshi markets (2021-present).")
     click.echo()
     click.echo("Download options:")
-    click.echo("  [1] Full dataset (~36GB) — complete history, all markets")
-    click.echo("  [2] Skip — download later with: agenttrader dataset download")
+    click.echo("  [1] Full dataset (~36GB) -- complete history, all markets")
+    click.echo("  [2] Skip -- download later with: agenttrader dataset download")
     click.echo()
 
     choice = "2"

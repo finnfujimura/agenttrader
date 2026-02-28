@@ -19,7 +19,7 @@ from agenttrader.cli.validate import validate_cmd
 
 @click.group()
 def cli():
-    """agenttrader — prediction market strategy platform"""
+    """agenttrader -- prediction market strategy platform"""
 
 
 @cli.command("mcp")
