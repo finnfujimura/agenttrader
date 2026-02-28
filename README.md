@@ -187,6 +187,47 @@ agenttrader backtest ./strategy.py --from 2024-01-01 --to 2024-12-31 --fidelity 
 
 By default, backtests run on all subscribed markets with full trade fidelity. These flags are opt-in.
 
+### Execution Modes
+
+Backtests support three execution modes that control how trades are filled and whether orderbook data is used:
+
+| Mode | Default? | Fill behavior | Orderbook access |
+|------|----------|---------------|------------------|
+| `strict_price_only` | **Yes** | Fills at observed price, zero slippage | `get_orderbook()` returns `None` |
+| `observed_orderbook` | No | Uses real stored orderbook snapshots | Raises if no observed OB exists |
+| `synthetic_execution_model` | No | Synthesizes orderbooks for approximate fill modeling | Always available (modeled) |
+
+**Why strict is the default:** Historical orderbook data is not available in the parquet dataset. Synthetic orderbooks can produce misleadingly optimistic backtest results. `strict_price_only` forces strategies to trade on price signals alone, producing conservative and reproducible results.
+
+```bash
+# Default: strict price-only fills
+agenttrader backtest ./strategy.py --from 2024-01-01 --to 2024-12-31
+
+# Opt-in to synthetic execution modeling (use with caution)
+agenttrader backtest ./strategy.py --from 2024-01-01 --to 2024-12-31 --execution-mode synthetic_execution_model
+```
+
+Strategies that call `get_orderbook()` should handle `None` gracefully:
+
+```python
+def on_market_data(self, market, price, orderbook):
+    if orderbook is not None:
+        # Use orderbook-aware logic
+        best_bid = orderbook.bids[0].price if orderbook.bids else price
+    else:
+        # Fall back to price-only logic
+        best_bid = price
+```
+
+### Data Sources
+
+Two upstream sources normalize into one canonical interface:
+
+- **Historical parquet dataset** — Thousands of resolved markets (2021–present). Best for backtesting. No orderbook data.
+- **Live PMXT API** — Real-time prices and orderbook snapshots. Used by `agenttrader sync` for paper trading.
+
+Provenance metadata (`source`, `granularity`) is recorded for all stored price points, so you can distinguish parquet-sourced data from live-synced data.
+
 ---
 
 ## Paper Trading
