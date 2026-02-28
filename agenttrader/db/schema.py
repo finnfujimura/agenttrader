@@ -27,7 +27,10 @@ class Market(Base):
 
 class PriceHistory(Base):
     __tablename__ = "price_history"
-    __table_args__ = (UniqueConstraint("market_id", "timestamp", name="uq_price_market_ts"),)
+    __table_args__ = (
+        UniqueConstraint("market_id", "timestamp", name="uq_price_market_ts"),
+        UniqueConstraint("market_id", "platform", "timestamp", name="uq_price_market_platform_ts"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     market_id = Column(Text, nullable=False)
@@ -36,6 +39,8 @@ class PriceHistory(Base):
     yes_price = Column(Float, nullable=False)
     no_price = Column(Float)
     volume = Column(Float)
+    source = Column(Text, default="pmxt")
+    granularity = Column(Text, default="1h")
 
 
 class BacktestRun(Base):
