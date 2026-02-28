@@ -10,7 +10,12 @@
       "Bash(cd /c/Users/finnf/Desktop/agenttrader && python -m pytest tests/unit/test_backtest_streaming.py -v 2>&1)",
       "Bash(cd /c/Users/finnf/Desktop/agenttrader && python -m pytest tests/unit/test_strict_backtest.py -v 2>&1)",
       "Bash(cd /c/Users/finnf/Desktop/agenttrader && python -m pytest tests/ -v --ignore=tests/unit/test_index_builder_adapter.py --ignore=tests/unit/test_parquet_adapter.py 2>&1)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(python3:*)",
+      "Bash(py:*)",
+      "Bash(pytest:*)",
+      "Bash(python:*)",
+      "Bash(git:*)"
     ]
   }
 }
