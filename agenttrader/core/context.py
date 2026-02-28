@@ -69,6 +69,7 @@ class BacktestContext(ExecutionContext):
         markets: dict[str, Market],
         parquet_adapter=None,
         platform_map: dict[str, Platform] | None = None,
+        execution_mode: ExecutionMode = ExecutionMode.STRICT_PRICE_ONLY,
     ):
         self._cash = float(initial_cash)
         self._initial_cash = float(initial_cash)
@@ -91,6 +92,12 @@ class BacktestContext(ExecutionContext):
         self._current_ts = 0
         self._active_market_id: str | None = None  # prevents cross-market look-ahead
         self._fill_model = FillModel()
+        self._execution_mode = execution_mode
+        if execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
+            from agenttrader.core.price_fill_model import PriceOnlyFillModel
+            self._price_fill_model = PriceOnlyFillModel()
+        else:
+            self._price_fill_model = None
         self._positions: dict[str, PositionModel] = {}
         self._trades: list[dict[str, Any]] = []
         self._equity_curve: list[dict[str, float | int]] = []
@@ -132,20 +139,33 @@ class BacktestContext(ExecutionContext):
         return historical[-1].yes_price
 
     def get_orderbook(self, market_id: str) -> OrderBook:
+        if self._execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
+            raise AgentTraderError(
+                "NoObservedOrderbook",
+                f"No observed orderbook data for {market_id}. "
+                "In strict_price_only mode, orderbook access is not available. "
+                "Use execution_mode='synthetic_execution_model' to enable synthetic orderbooks.",
+            )
+        if self._execution_mode == ExecutionMode.OBSERVED_ORDERBOOK:
+            books = self._orderbook_data.get(market_id, [])
+            before = [o for o in books if o.timestamp <= self._current_ts]
+            if before:
+                return before[-1]
+            raise AgentTraderError(
+                "NoObservedOrderbook",
+                f"No observed orderbook history for {market_id}.",
+            )
+        # SYNTHETIC_EXECUTION_MODEL
         if self._parquet_adapter is not None:
             platform = self._platform_map.get(market_id, Platform.POLYMARKET)
             return self._parquet_adapter.get_orderbook_snapshot(market_id, platform, self._current_ts)
-
         books = self._orderbook_data.get(market_id, [])
         before = [o for o in books if o.timestamp <= self._current_ts]
         if before:
             return before[-1]
-
-        # Fallback synthetic book from latest known price.
         price = self.get_price(market_id)
         spread = 0.01
         from agenttrader.data.models import OrderLevel
-
         return OrderBook(
             market_id=market_id,
             timestamp=self._current_ts,
@@ -178,8 +198,17 @@ class BacktestContext(ExecutionContext):
         contracts = float(contracts)
         if contracts <= 0:
             raise AgentTraderError("InvalidOrder", "contracts must be > 0")
-        ob = self.get_orderbook(market_id)
-        fill = self._fill_model.simulate_buy(contracts, ob, order_type=order_type, limit_price=limit_price)
+
+        if self._execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
+            observed_price = self.get_price(market_id)
+            fill = self._price_fill_model.fill_buy(
+                contracts, observed_price,
+                limit_price=limit_price if order_type == "limit" else None,
+            )
+        else:
+            ob = self.get_orderbook(market_id)
+            fill = self._fill_model.simulate_buy(contracts, ob, order_type=order_type, limit_price=limit_price)
+
         if not fill.filled or fill.contracts <= 0:
             raise AgentTraderError("OrderNotFilled", f"Buy not filled for market {market_id}")
 
@@ -233,8 +262,13 @@ class BacktestContext(ExecutionContext):
         if contracts_to_sell <= 0:
             raise AgentTraderError("InvalidOrder", "contracts must be > 0")
 
-        ob = self.get_orderbook(market_id)
-        fill = self._fill_model.simulate_sell(contracts_to_sell, ob)
+        if self._execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
+            observed_price = self.get_price(market_id)
+            fill = self._price_fill_model.fill_sell(contracts_to_sell, observed_price)
+        else:
+            ob = self.get_orderbook(market_id)
+            fill = self._fill_model.simulate_sell(contracts_to_sell, ob)
+
         if not fill.filled:
             raise AgentTraderError("OrderNotFilled", f"Sell not filled for market {market_id}")
 
@@ -332,6 +366,7 @@ class BacktestContext(ExecutionContext):
             "trades": self._trades,
             "logs": self._logs,
             "avg_slippage": (sum(self._slippage_samples) / len(self._slippage_samples)) if self._slippage_samples else 0.0,
+            "execution_mode": self._execution_mode.value,
         }
 
     @staticmethod
@@ -722,14 +757,10 @@ class LiveContext(ExecutionContext):
             raise MarketNotCachedError(market_id)
         ob = self._ob_store.get_nearest(market.platform.value, market_id, int(datetime.now(tz=UTC).timestamp()))
         if not ob:
-            from agenttrader.data.models import OrderLevel
-
-            price = self.get_price(market_id)
-            return OrderBook(
-                market_id=market_id,
-                timestamp=int(datetime.now(tz=UTC).timestamp()),
-                bids=[OrderLevel(price=max(0.0, price - 0.01), size=1_000_000.0)],
-                asks=[OrderLevel(price=min(1.0, price + 0.01), size=1_000_000.0)],
+            raise AgentTraderError(
+                "NoObservedOrderbook",
+                f"No observed orderbook snapshot for {market_id}. "
+                "Run 'agenttrader sync' to fetch live orderbook data from PMXT.",
             )
         return ob
 
