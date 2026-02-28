@@ -42,20 +42,40 @@ def test_call_tool_missing_argument_returns_fix(monkeypatch):
     assert "market_id" in payload["fix"]
 
 
-def test_call_tool_market_not_cached_returns_fix(monkeypatch):
-    class FakeCache:
-        def get_market(self, _market_id):
+def test_call_tool_market_not_found_returns_fix(monkeypatch):
+    class FakeSource:
+        def get_latest_price(self, _market_id, _platform):
             return None
 
     monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
-    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: FakeCache())
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: object())
     monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
+    monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (FakeSource(), "sqlite-cache"))
 
     result = _run(mcp_server.call_tool("get_price", {"market_id": "0xabc"}))
     payload = _payload(result)
     assert payload["ok"] is False
-    assert payload["error"] == "MarketNotCached"
+    assert payload["error"] == "MarketNotFound"
     assert "sync_data" in payload["fix"]
+
+
+def test_get_price_routes_through_source_selector(monkeypatch):
+    price_point = SimpleNamespace(timestamp=1000, yes_price=0.65, no_price=0.35, volume=500)
+
+    class FakeSource:
+        def get_latest_price(self, _market_id, _platform):
+            return price_point
+
+    monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: object())
+    monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
+    monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (FakeSource(), "normalized-index"))
+
+    result = _run(mcp_server.call_tool("get_price", {"market_id": "0xabc"}))
+    payload = _payload(result)
+    assert payload["ok"] is True
+    assert payload["data_source"] == "normalized-index"
+    assert payload["price"]["yes_price"] == 0.65
 
 
 def test_unknown_tool_returns_fix(monkeypatch):

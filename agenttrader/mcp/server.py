@@ -125,7 +125,7 @@ async def list_tools() -> list[types.Tool]:
                 },
             },
         ),
-        types.Tool(name="get_price", description="Get latest cached price", inputSchema={"type": "object", "properties": {"market_id": {"type": "string"}}, "required": ["market_id"]}),
+        types.Tool(name="get_price", description="Get latest price for a market. Uses best available data source (index > cache).", inputSchema={"type": "object", "properties": {"market_id": {"type": "string"}, "platform": {"type": "string", "enum": ["polymarket", "kalshi"], "default": "polymarket"}}, "required": ["market_id"]}),
         types.Tool(
             name="get_history",
             description="Get market history analytics. Uses best available data source (index > parquet > cache). Raw history is omitted by default; set include_raw=true to include points.",
@@ -330,17 +330,18 @@ async def call_tool(name: str, arguments: dict):
 
         if name == "get_price":
             market_id = args["market_id"]
-            market = cache.get_market(market_id)
-            if not market:
+            platform = args.get("platform", "polymarket")
+            source, source_name = get_best_data_source()
+            latest = source.get_latest_price(market_id, platform)
+            if not latest:
                 return _respond(
                     _error_payload(
-                        "MarketNotCached",
-                        f"Market {market_id} not found in local cache",
-                        fix=f"Call sync_data(market_ids=['{market_id}']) and retry.",
+                        "MarketNotFound",
+                        f"No price data found for {market_id}",
+                        fix=f"Call sync_data(market_ids=['{market_id}']) or check market_id is correct.",
                     )
                 )
-            latest = cache.get_latest_price(market_id)
-            return _respond({"ok": bool(latest), "market_id": market_id, "price": latest.__dict__ if latest else None})
+            return _respond({"ok": True, "data_source": source_name, "market_id": market_id, "price": latest.__dict__})
 
         if name == "get_history":
             market_id = args["market_id"]

@@ -49,7 +49,12 @@ class PmxtClient:
         results_by_id: dict[str, Market] = {}
         wanted_tags = {t.lower() for t in tags} if tags else None
         wanted_category = category.strip().lower() if category else None
-        status = "closed" if resolved else "active"
+        if market_ids:
+            status = "all"
+        elif resolved:
+            status = "closed"
+        else:
+            status = "active"
 
         if platform in ("all", "polymarket"):
             for item in self._poly.fetch_markets(status=status, limit=limit):
