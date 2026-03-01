@@ -120,6 +120,9 @@ class PmxtClient:
     ) -> list[PricePoint]:
         return self.get_candlesticks_with_status(condition_id, platform, start_time, end_time, interval)["points"]
 
+    # Maximum seconds per OHLCV chunk — 7 days keeps requests small enough for PMXT.
+    _OHLCV_CHUNK_SECONDS = 7 * 24 * 3600
+
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def get_candlesticks_with_status(
         self,
@@ -132,6 +135,42 @@ class PmxtClient:
         if end_time <= start_time:
             return {"points": [], "status": "empty", "error": None}
 
+        span = end_time - start_time
+        if span <= self._OHLCV_CHUNK_SECONDS:
+            return self._fetch_ohlcv_chunk(condition_id, platform, start_time, end_time, interval)
+
+        # Split into chunks, merge, deduplicate
+        all_points: list[PricePoint] = []
+        chunk_errors: list[str] = []
+        chunk_start = start_time
+        while chunk_start < end_time:
+            chunk_end = min(chunk_start + self._OHLCV_CHUNK_SECONDS, end_time)
+            result = self._fetch_ohlcv_chunk(condition_id, platform, chunk_start, chunk_end, interval)
+            all_points.extend(result["points"])
+            if result["status"] == "error" and result["error"]:
+                chunk_errors.append(result["error"])
+            chunk_start = chunk_end
+
+        # Deduplicate by timestamp (keep last seen for each ts)
+        seen: dict[int, PricePoint] = {}
+        for p in all_points:
+            seen[p.timestamp] = p
+        points = sorted(seen.values(), key=lambda p: p.timestamp)
+
+        if not points and chunk_errors:
+            return {"points": [], "status": "error", "error": "; ".join(chunk_errors)}
+        status = "ok" if points else "empty"
+        return {"points": points, "status": status, "error": None}
+
+    def _fetch_ohlcv_chunk(
+        self,
+        condition_id: str,
+        platform: Platform,
+        start_time: int,
+        end_time: int,
+        interval: int = 60,
+    ) -> dict[str, Any]:
+        """Fetch a single OHLCV chunk (no further splitting)."""
         client = self._poly if platform == Platform.POLYMARKET else self._kalshi
         resolution = self._resolution_from_interval(interval)
         start_dt = datetime.fromtimestamp(int(start_time), tz=UTC)

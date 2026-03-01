@@ -19,7 +19,9 @@
       "Bash(rtk python:*)",
       "Bash(pip install:*)",
       "Bash(rtk ls:*)",
-      "Bash(du:*)"
+      "Bash(du:*)",
+      "Bash(rtk grep:*)",
+      "Bash(rtk test:*)"
     ]
   }
 }

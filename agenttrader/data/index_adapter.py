@@ -71,6 +71,21 @@ class BacktestIndexAdapter:
         ).fetchall()
         return [(str(r[0]), str(r[1]), int(r[2])) for r in rows]
 
+    def get_market_date_ranges(self, market_ids: list[str]) -> dict[str, tuple[int, int]]:
+        """Batch query min_ts/max_ts for a list of market IDs from market_metadata."""
+        if self._conn is None or not market_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in market_ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT market_id, min_ts, max_ts
+            FROM market_metadata
+            WHERE market_id IN ({placeholders})
+            """,
+            market_ids,
+        ).fetchall()
+        return {str(r[0]): (int(r[1]), int(r[2])) for r in rows}
+
     def stream_market_history(
         self,
         market_id: str,

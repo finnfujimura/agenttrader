@@ -26,6 +26,7 @@ from agenttrader.core.paper_daemon import PaperDaemon
 from agenttrader.data.backtest_artifacts import read_backtest_artifact, write_backtest_artifact
 from agenttrader.data.cache import DataCache
 from agenttrader.data.models import ExecutionMode
+from agenttrader.data.index_adapter import BacktestIndexAdapter
 from agenttrader.data.source_selector import get_best_data_source, get_all_sources
 from agenttrader.db.health import check_schema
 from agenttrader.errors import AgentTraderError
@@ -125,6 +126,72 @@ def _compute_history_analytics(history: list, end_ts: int) -> dict:
         "hours_since_last_point": max(0.0, (end_ts - last_point_ts) / 3600.0),
         "has_24h_reference": has_24h_reference,
     }
+
+
+def _compute_capabilities(markets: list, cache) -> dict[str, dict]:
+    """Build per-market capability annotations from local sources only."""
+    if not markets:
+        return {}
+
+    ids = [getattr(m, "id", None) or m.get("id") for m in markets]
+    ids = [mid for mid in ids if mid]
+
+    # Backtest index ranges (single DuckDB query)
+    index_ranges: dict[str, tuple[int, int]] = {}
+    try:
+        adapter = BacktestIndexAdapter()
+        if adapter.is_available():
+            index_ranges = adapter.get_market_date_ranges(ids)
+        adapter.close()
+    except Exception:
+        pass
+
+    # Cache availability (per-market SQLite lookups)
+    cache_info: dict[str, object] = {}
+    for mid in ids:
+        try:
+            latest = cache.get_latest_price(mid)
+            if latest is not None:
+                cache_info[mid] = latest
+        except Exception:
+            pass
+
+    caps: dict[str, dict] = {}
+    for m in markets:
+        mid = getattr(m, "id", None) or m.get("id")
+        if not mid:
+            continue
+
+        # Backtest
+        if mid in index_ranges:
+            min_ts, max_ts = index_ranges[mid]
+            backtest = {
+                "index_available": True,
+                "index_start": datetime.fromtimestamp(min_ts, tz=UTC).strftime("%Y-%m-%d"),
+                "index_end": datetime.fromtimestamp(max_ts, tz=UTC).strftime("%Y-%m-%d"),
+            }
+        else:
+            backtest = {"index_available": False, "index_start": None, "index_end": None}
+
+        # History cache
+        if mid in cache_info:
+            lp = cache_info[mid]
+            history = {
+                "cache_available": True,
+                "last_point_timestamp": datetime.fromtimestamp(
+                    int(lp.timestamp), tz=UTC
+                ).isoformat(),
+            }
+        else:
+            history = {"cache_available": False, "last_point_timestamp": None}
+
+        # Sync
+        resolved = bool(getattr(m, "resolved", False))
+        sync = {"can_attempt_live_sync": not resolved}
+
+        caps[mid] = {"backtest": backtest, "history": history, "sync": sync}
+
+    return caps
 
 
 def _is_market_resolved(market) -> bool:
@@ -362,6 +429,7 @@ async def list_tools() -> list[types.Tool]:
                     "category": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "market_ids": {"type": "array", "items": {"type": "string"}, "description": "Look up specific markets by ID. Bypasses volume/limit ordering."},
+                    "include_capabilities": {"type": "boolean", "default": False, "description": "Include backtest/history/sync capability annotations per market."},
                     "limit": {"type": "integer", "default": 20},
                 },
             },
@@ -578,14 +646,23 @@ async def call_tool(name: str, arguments: dict):
                 if source_name == "sqlite-cache" and args.get("tags"):
                     kwargs["tags"] = args.get("tags")
                 markets = source.get_markets(**kwargs)
+            include_caps = bool(args.get("include_capabilities", False))
+            if include_caps:
+                caps = _compute_capabilities(markets, cache)
+                market_dicts = [
+                    m.__dict__ | {"platform": m.platform.value, "market_type": m.market_type.value, "capabilities": caps.get(m.id, {})}
+                    for m in markets
+                ]
+            else:
+                market_dicts = [
+                    m.__dict__ | {"platform": m.platform.value, "market_type": m.market_type.value}
+                    for m in markets
+                ]
             return _respond({
                 "ok": True,
                 "data_source": source_name,
                 "count": len(markets),
-                "markets": [
-                    m.__dict__ | {"platform": m.platform.value, "market_type": m.market_type.value}
-                    for m in markets
-                ],
+                "markets": market_dicts,
             })
 
         if name == "get_price":
@@ -834,11 +911,12 @@ async def call_tool(name: str, arguments: dict):
                 except Exception as exc:
                     history_errors.append({"market_id": getattr(market, "id", "?"), "error": str(exc)})
 
+            caps = _compute_capabilities(markets, cache)
             payload = {
                 "ok": len(history_errors) == 0,
                 "data_source": source_name,
                 "markets": [
-                    m.__dict__ | {"platform": m.platform.value, "market_type": m.market_type.value}
+                    m.__dict__ | {"platform": m.platform.value, "market_type": m.market_type.value, "capabilities": caps.get(m.id, {})}
                     for m in markets
                 ],
                 "history": history,

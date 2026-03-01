@@ -109,9 +109,20 @@ class BacktestEngine:
         index = BacktestIndexAdapter()
         if index.is_available():
             try:
-                return self._run_streaming(strategy_class, config, index)
+                result = self._run_streaming(strategy_class, config, index)
             finally:
                 index.close()
+
+            # If the index had no data for this range, fall back to legacy
+            if isinstance(result, dict) and not result.get("ok", True):
+                error = result.get("error", "")
+                if error in ("NoDataInRange", "NoSubscriptions", "DatasetNotFound"):
+                    legacy = self._run_legacy(strategy_class, config)
+                    if isinstance(legacy, dict) and legacy.get("ok"):
+                        legacy["fallback_from"] = "normalized-index"
+                        legacy["fallback_reason"] = result.get("message", error)
+                    return legacy
+            return result
         return self._run_legacy(strategy_class, config)
 
     def _ensure_legacy_data_source(self) -> None:
