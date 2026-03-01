@@ -36,6 +36,11 @@ _POLY_SLUG_CATEGORY = {
     "soccer": "sports",
 }
 
+# Reverse map: category -> list of keywords that map to it
+_POLY_CATEGORY_KEYWORDS: dict[str, list[str]] = {}
+for _kw, _cat in _POLY_SLUG_CATEGORY.items():
+    _POLY_CATEGORY_KEYWORDS.setdefault(_cat, []).append(_kw)
+
 
 def _safe_parquet_glob(directory: str) -> list[str]:
     """Return sorted parquet files excluding AppleDouble metadata files."""
@@ -244,8 +249,19 @@ class ParquetDataAdapter:
         if min_volume is not None:
             where.append("volume >= ?")
             params.append(float(min_volume))
-        # When category is active, skip SQL LIMIT — category is inferred in Python
-        # so we must scan all rows to find matches, then trim to `limit` afterward.
+        # When category is active, add SQL pre-filter using ILIKE on slug/question
+        # to narrow rows before Python-level exact category inference.
+        # The Python filter remains authoritative; this just avoids a full table scan.
+        if category:
+            keywords = _POLY_CATEGORY_KEYWORDS.get(category.lower(), [])
+            if keywords:
+                ilike_clauses = []
+                for kw in keywords:
+                    ilike_clauses.append("slug ILIKE ?")
+                    params.append(f"%{kw}%")
+                    ilike_clauses.append("question ILIKE ?")
+                    params.append(f"%{kw}%")
+                where.append(f"({' OR '.join(ilike_clauses)})")
         limit_clause = ""
         if not category:
             params.append(int(limit))
@@ -317,11 +333,12 @@ class ParquetDataAdapter:
         if min_volume is not None:
             where.append("volume / 100.0 >= ?")
             params.append(float(min_volume))
-        # When category is active, skip SQL LIMIT — category is inferred in Python
-        limit_clause = ""
-        if not category:
-            params.append(int(limit))
-            limit_clause = "LIMIT ?"
+        # Kalshi category = uppercase prefix of event_ticker (e.g. KXFEDDECISION -> kxfeddecision).
+        # This is exact, so we can push it into SQL and keep LIMIT.
+        if category:
+            where.append("LOWER(REGEXP_EXTRACT(event_ticker, '^([A-Z]+)', 1)) = ?")
+            params.append(category.lower())
+        params.append(int(limit))
         query = f"""
             SELECT
                 ticker,
@@ -335,7 +352,7 @@ class ParquetDataAdapter:
             FROM {self._kalshi_markets_view}
             WHERE {' AND '.join(where)}
             ORDER BY volume DESC
-            {limit_clause}
+            LIMIT ?
         """
         rows = self._conn.execute(query, params).fetchall()
         out: list[Market] = []

@@ -140,8 +140,8 @@ def test_research_markets_without_ids_uses_get_markets(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_parquet_polymarket_no_sql_limit_with_category():
-    """When category is provided, SQL should have no LIMIT clause (scan all rows)."""
+def test_parquet_polymarket_category_adds_ilike_prefilter():
+    """When category is provided, SQL should have ILIKE pre-filter and no LIMIT."""
     from agenttrader.data.parquet_adapter import ParquetDataAdapter
 
     adapter = ParquetDataAdapter.__new__(ParquetDataAdapter)
@@ -154,9 +154,30 @@ def test_parquet_polymarket_no_sql_limit_with_category():
     call_args = adapter._conn.execute.call_args
     sql = call_args[0][0]
     params = call_args[0][1]
-    assert "LIMIT" not in sql, f"SQL should not have LIMIT when category is set, got: {sql}"
-    # No limit param should be in params
-    assert len(params) == 0, f"Expected no params, got {params}"
+    # Should have ILIKE pre-filter for crypto keywords (bitcoin, btc, ethereum, etc.)
+    assert "ILIKE" in sql, f"SQL should have ILIKE pre-filter, got: {sql}"
+    # Should NOT have LIMIT (Python trims after exact category check)
+    assert "LIMIT" not in sql, f"SQL should not have LIMIT when polymarket category is set"
+    # Params should contain the ILIKE patterns
+    assert any("%bitcoin%" in str(p) for p in params), f"Expected bitcoin keyword in params, got {params}"
+
+
+def test_parquet_polymarket_unknown_category_no_ilike():
+    """Unknown polymarket categories (e.g. 'kxfeddecision') get no ILIKE pre-filter but still no LIMIT."""
+    from agenttrader.data.parquet_adapter import ParquetDataAdapter
+
+    adapter = ParquetDataAdapter.__new__(ParquetDataAdapter)
+    adapter._conn = MagicMock()
+    adapter._poly_markets_view = "poly_markets"
+    adapter._conn.execute.return_value.fetchall.return_value = []
+
+    adapter._get_polymarket_markets(category="randomcategory", resolved_only=False, min_volume=None, limit=10)
+
+    call_args = adapter._conn.execute.call_args
+    sql = call_args[0][0]
+    # No known keywords -> no ILIKE, but still no LIMIT
+    assert "ILIKE" not in sql
+    assert "LIMIT" not in sql
 
 
 def test_parquet_polymarket_has_sql_limit_without_category():
@@ -177,8 +198,8 @@ def test_parquet_polymarket_has_sql_limit_without_category():
     assert params[-1] == 10, f"Expected SQL limit of 10, got {params[-1]}"
 
 
-def test_parquet_kalshi_no_sql_limit_with_category():
-    """Kalshi should also drop SQL LIMIT when category is set."""
+def test_parquet_kalshi_category_uses_sql_filter():
+    """Kalshi category should push exact REGEXP filter into SQL and keep LIMIT."""
     from agenttrader.data.parquet_adapter import ParquetDataAdapter
 
     adapter = ParquetDataAdapter.__new__(ParquetDataAdapter)
@@ -186,11 +207,19 @@ def test_parquet_kalshi_no_sql_limit_with_category():
     adapter._kalshi_markets_view = "kalshi_markets"
     adapter._conn.execute.return_value.fetchall.return_value = []
 
-    adapter._get_kalshi_markets(category="politics", resolved_only=False, min_volume=None, limit=5)
+    adapter._get_kalshi_markets(category="kxfeddecision", resolved_only=False, min_volume=None, limit=5)
 
     call_args = adapter._conn.execute.call_args
     sql = call_args[0][0]
-    assert "LIMIT" not in sql, f"SQL should not have LIMIT when category is set"
+    params = call_args[0][1]
+    # Should have REGEXP_EXTRACT filter in SQL
+    assert "REGEXP_EXTRACT" in sql, f"SQL should have REGEXP_EXTRACT filter, got: {sql}"
+    # Should still have LIMIT (Kalshi filter is exact)
+    assert "LIMIT" in sql
+    # Category param should be in params
+    assert "kxfeddecision" in params
+    # LIMIT should be 5
+    assert params[-1] == 5
 
 
 # ---------------------------------------------------------------------------
