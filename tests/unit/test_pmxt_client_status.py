@@ -6,8 +6,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-models = importlib.import_module("agenttrader.data.models")
-
 
 @pytest.fixture
 def _make_client(monkeypatch):
@@ -24,71 +22,75 @@ def _make_client(monkeypatch):
         return client, poly, kalshi
 
     return factory
-
-
-def _fake_market_item(market_id, status="closed"):
-    """Minimal dict that _to_market can convert."""
-    return {
-        "id": market_id,
-        "conditionId": market_id,
-        "question": "Resolved?",
-        "category": "politics",
-        "tags": [],
-        "outcomes": ["Yes", "No"],
-        "volume": "5000",
-        "endDate": "2025-01-01T00:00:00Z",
-        "active": status != "closed",
-        "closed": status == "closed",
-        "resolvedBy": "yes" if status == "closed" else None,
-    }
-
-
-def test_market_ids_uses_status_all(_make_client):
-    client, poly, kalshi = _make_client()
-
-    resolved_market = SimpleNamespace(
-        id="0xresolved",
-        condition_id="0xresolved",
-        platform=models.Platform.POLYMARKET,
-        title="Resolved market",
-        category="politics",
+def _fake_market_object(
+    *,
+    market_id,
+    ticker=None,
+    title="Resolved market",
+    category="politics",
+    volume="5000",
+    status="closed",
+):
+    return SimpleNamespace(
+        market_id=market_id,
+        ticker=ticker,
+        title=title,
+        category=category,
         tags=[],
-        market_type=models.MarketType.BINARY,
-        volume=5000.0,
-        close_time=0,
-        resolved=True,
-        resolution="yes",
-        scalar_low=None,
-        scalar_high=None,
+        volume=volume,
+        resolution_date="2025-01-01T00:00:00Z",
+        yes=SimpleNamespace(outcome_id=market_id, price="1", label="yes"),
+        no=SimpleNamespace(outcome_id=f"{market_id}-no", price="0", label="no"),
+        outcomes=[],
+        active=status != "closed",
+        closed=status == "closed",
     )
 
-    # When status="all", the API returns the resolved market.
-    # When status="active", it wouldn't.
-    def fake_fetch(status="active", limit=100):
-        if status == "all":
-            return [_fake_market_item("0xresolved", status="closed")]
-        return []  # active filter excludes resolved markets
 
-    poly.fetch_markets.side_effect = fake_fetch
+def test_market_ids_query_each_requested_id(_make_client):
+    client, poly, kalshi = _make_client()
+    poly.fetch_markets.return_value = [_fake_market_object(market_id="0xresolved")]
 
-    # Patch _to_market to return our resolved market directly
-    original_to_market = type(client)._to_market
-    def patched_to_market(self, item, platform, status_hint="active"):
-        return resolved_market
-    type(client)._to_market = patched_to_market
+    results = client.get_markets(
+        platform="polymarket",
+        market_ids=["0xresolved"],
+        limit=1,
+    )
 
-    try:
-        results = client.get_markets(
-            platform="polymarket",
-            market_ids=["0xresolved"],
-        )
+    poly.fetch_markets.assert_called_once_with(query="0xresolved", status="all", limit=20)
+    assert len(results) == 1
+    assert results[0].id == "0xresolved"
 
-        # Verify status="all" was passed to the API
-        poly.fetch_markets.assert_called_once_with(status="all", limit=100)
-        assert len(results) == 1
-        assert results[0].id == "0xresolved"
-    finally:
-        type(client)._to_market = original_to_market
+
+def test_market_ids_match_kalshi_ticker_alias(_make_client):
+    client, poly, kalshi = _make_client()
+    kalshi.fetch_markets.return_value = [
+        _fake_market_object(market_id="internal-id", ticker="PRES-2024-DJT", title="Kalshi market")
+    ]
+
+    results = client.get_markets(
+        platform="kalshi",
+        market_ids=["PRES-2024-DJT"],
+        limit=1,
+    )
+
+    kalshi.fetch_markets.assert_called_once_with(query="PRES-2024-DJT", status="all", limit=20)
+    assert len(results) == 1
+    assert results[0].id == "internal-id"
+
+
+def test_market_ids_require_exact_alias_match(_make_client):
+    client, poly, kalshi = _make_client()
+    poly.fetch_markets.return_value = [_fake_market_object(market_id="0xother")]
+
+    results = client.get_markets(
+        platform="polymarket",
+        market_ids=["0xresolved"],
+        limit=1,
+    )
+
+    poly.fetch_markets.assert_called_once_with(query="0xresolved", status="all", limit=20)
+    assert results == []
 
 
 def test_no_market_ids_active_uses_status_active(_make_client):

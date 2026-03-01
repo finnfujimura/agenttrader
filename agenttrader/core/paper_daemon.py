@@ -55,6 +55,28 @@ class PaperDaemon:
         self._emit_stdout = True
 
     def start_as_daemon(self) -> int:
+        log_dir = Path.home() / ".agenttrader" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stderr_path = log_dir / f"daemon-{self.portfolio_id}.log"
+
+        stderr_file = open(stderr_path, "w", encoding="utf-8")  # noqa: SIM115
+
+        kwargs: dict = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": stderr_file,
+            "stdin": subprocess.DEVNULL,
+        }
+        if sys.platform == "win32":
+            # On Windows, start_new_session uses CREATE_NEW_PROCESS_GROUP which
+            # can cause handle inheritance issues leading to readonly SQLite.
+            # Use DETACHED_PROCESS + CREATE_NO_WINDOW for clean detachment.
+            kwargs["creationflags"] = (
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
+            )
+        else:
+            kwargs["start_new_session"] = True
+            kwargs["close_fds"] = True
+
         proc = subprocess.Popen(
             [
                 sys.executable,
@@ -64,13 +86,11 @@ class PaperDaemon:
                 str(self.strategy_path),
                 str(self.initial_cash),
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
+            **kwargs,
         )
-        return int(proc.pid)
+        self._stderr_file = stderr_file
+        self._stderr_path = stderr_path
+        return proc
 
     def _run_detached(self):
         self._emit_stdout = False

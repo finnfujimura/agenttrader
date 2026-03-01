@@ -46,12 +46,19 @@ class PmxtClient:
         min_volume: float | None = None,
         limit: int = 100,
     ) -> list[Market]:
-        results_by_id: dict[str, Market] = {}
+        if market_ids:
+            return self._get_markets_by_ids(
+                platform=platform,
+                category=category,
+                tags=tags,
+                market_ids=market_ids,
+                min_volume=min_volume,
+            )
+
+        results_by_id: dict[tuple[str, str], Market] = {}
         wanted_tags = {t.lower() for t in tags} if tags else None
         wanted_category = category.strip().lower() if category else None
-        if market_ids:
-            status = "all"
-        elif resolved:
+        if resolved:
             status = "closed"
         else:
             status = "active"
@@ -59,29 +66,18 @@ class PmxtClient:
         if platform in ("all", "polymarket"):
             for item in self._poly.fetch_markets(status=status, limit=limit):
                 market = self._to_market(item, Platform.POLYMARKET, status_hint=status)
-                if wanted_category and not self._matches_category(market, wanted_category):
+                if not self._matches_market_filters(market, wanted_category, wanted_tags, min_volume):
                     continue
-                if wanted_tags and not wanted_tags.issubset({t.lower() for t in market.tags}):
-                    continue
-                if min_volume is not None and market.volume < float(min_volume):
-                    continue
-                results_by_id[market.id] = market
+                results_by_id[(market.platform.value, market.id)] = market
 
         if platform in ("all", "kalshi"):
             for item in self._kalshi.fetch_markets(status=status, limit=limit):
                 market = self._to_market(item, Platform.KALSHI, status_hint=status)
-                if wanted_category and not self._matches_category(market, wanted_category):
+                if not self._matches_market_filters(market, wanted_category, wanted_tags, min_volume):
                     continue
-                if wanted_tags and not wanted_tags.issubset({t.lower() for t in market.tags}):
-                    continue
-                if min_volume is not None and market.volume < float(min_volume):
-                    continue
-                results_by_id[market.id] = market
+                results_by_id[(market.platform.value, market.id)] = market
 
         results = sorted(results_by_id.values(), key=lambda m: m.volume, reverse=True)
-        if market_ids:
-            wanted_ids = set(market_ids)
-            results = [m for m in results if m.id in wanted_ids]
         return results[:limit]
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
@@ -257,6 +253,79 @@ class PmxtClient:
         # pmxt doesn't expose Dome-style sports matching endpoint.
         return []
 
+    def _get_markets_by_ids(
+        self,
+        platform: str,
+        category: str | None,
+        tags: list[str] | None,
+        market_ids: list[str],
+        min_volume: float | None,
+    ) -> list[Market]:
+        wanted_ids = [str(market_id).strip() for market_id in market_ids if str(market_id).strip()]
+        if not wanted_ids:
+            return []
+
+        wanted_category = category.strip().lower() if category else None
+        wanted_tags = {t.lower() for t in tags} if tags else None
+        query_limit = max(len(wanted_ids), 20)
+        results: list[Market] = []
+        seen: set[tuple[str, str]] = set()
+
+        if platform in ("all", "polymarket"):
+            self._append_markets_by_ids(
+                backend=self._poly,
+                platform=Platform.POLYMARKET,
+                wanted_ids=wanted_ids,
+                wanted_category=wanted_category,
+                wanted_tags=wanted_tags,
+                min_volume=min_volume,
+                query_limit=query_limit,
+                results=results,
+                seen=seen,
+            )
+
+        if platform in ("all", "kalshi"):
+            self._append_markets_by_ids(
+                backend=self._kalshi,
+                platform=Platform.KALSHI,
+                wanted_ids=wanted_ids,
+                wanted_category=wanted_category,
+                wanted_tags=wanted_tags,
+                min_volume=min_volume,
+                query_limit=query_limit,
+                results=results,
+                seen=seen,
+            )
+
+        return results
+
+    def _append_markets_by_ids(
+        self,
+        backend: Any,
+        platform: Platform,
+        wanted_ids: list[str],
+        wanted_category: str | None,
+        wanted_tags: set[str] | None,
+        min_volume: float | None,
+        query_limit: int,
+        results: list[Market],
+        seen: set[tuple[str, str]],
+    ) -> None:
+        for wanted_id in wanted_ids:
+            normalized_wanted_id = wanted_id.lower()
+            for item in backend.fetch_markets(query=wanted_id, status="all", limit=query_limit):
+                market = self._to_market(item, platform, status_hint="all")
+                if not self._matches_market_filters(market, wanted_category, wanted_tags, min_volume):
+                    continue
+                aliases = self._market_identifier_aliases(item, market)
+                if normalized_wanted_id not in aliases:
+                    continue
+                key = (market.platform.value, market.id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append(market)
+
     def _to_market(self, item: Any, platform: Platform, status_hint: str) -> Market:
         primary_outcome = self._primary_outcome(item)
         market_id = str(getattr(primary_outcome, "outcome_id", None) or getattr(item, "market_id", ""))
@@ -338,6 +407,59 @@ class PmxtClient:
         if str(market.category or "").lower() == wanted:
             return True
         return wanted in {str(tag).lower() for tag in market.tags}
+
+    @staticmethod
+    def _matches_market_filters(
+        market: Market,
+        wanted_category: str | None,
+        wanted_tags: set[str] | None,
+        min_volume: float | None,
+    ) -> bool:
+        if wanted_category and not PmxtClient._matches_category(market, wanted_category):
+            return False
+        if wanted_tags and not wanted_tags.issubset({t.lower() for t in market.tags}):
+            return False
+        if min_volume is not None and market.volume < float(min_volume):
+            return False
+        return True
+
+    @staticmethod
+    def _market_identifier_aliases(item: Any, market: Market) -> set[str]:
+        aliases = {
+            str(value).strip().lower()
+            for value in (
+                market.id,
+                market.condition_id,
+                PmxtClient._field(item, "ticker"),
+                PmxtClient._field(item, "market_id", "marketId", "id"),
+                PmxtClient._field(item, "condition_id", "conditionId"),
+            )
+            if value is not None and str(value).strip()
+        }
+
+        primary_outcome = PmxtClient._primary_outcome(item)
+        for value in (
+            PmxtClient._field(primary_outcome, "outcome_id", "outcomeId", "id"),
+        ):
+            if value is not None and str(value).strip():
+                aliases.add(str(value).strip().lower())
+
+        return aliases
+
+    @staticmethod
+    def _field(item: Any, *names: str) -> Any:
+        if item is None:
+            return None
+        if isinstance(item, dict):
+            for name in names:
+                if name in item:
+                    return item[name]
+            return None
+        for name in names:
+            value = getattr(item, name, None)
+            if value is not None:
+                return value
+        return None
 
     @staticmethod
     def _to_unix_seconds(value: Any) -> int:

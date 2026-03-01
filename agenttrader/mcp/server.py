@@ -66,6 +66,16 @@ def _error_payload(error: str, message: str, fix: str | None = None, **extra):
     return payload
 
 
+def _pid_alive(pid: int) -> bool:
+    """Check whether a process with the given PID is still running."""
+    import os
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
 def _compute_history_analytics(history: list, end_ts: int) -> dict:
     if not history:
         return {
@@ -660,7 +670,38 @@ async def call_tool(name: str, arguments: dict):
                 )
                 session.commit()
             daemon = PaperDaemon(portfolio_id, str(strategy_path), initial_cash)
-            pid = daemon.start_as_daemon()
+            proc = daemon.start_as_daemon()
+            pid = proc.pid
+
+            # Health check: wait briefly and verify daemon is still alive
+            import time as _time
+            _time.sleep(1.0)
+            exit_code = proc.poll()
+            if exit_code is not None:
+                # Daemon died immediately — read stderr log for details
+                error_detail = ""
+                if hasattr(daemon, "_stderr_path") and daemon._stderr_path.exists():
+                    error_detail = daemon._stderr_path.read_text(encoding="utf-8").strip()[-500:]
+                if hasattr(daemon, "_stderr_file"):
+                    daemon._stderr_file.close()
+                with get_session(get_engine()) as session:
+                    row = session.get(PaperPortfolio, portfolio_id)
+                    if row:
+                        row.status = "failed"
+                        row.pid = pid
+                        row.stopped_at = int(datetime.now(tz=UTC).timestamp())
+                        session.commit()
+                return _respond(
+                    _error_payload(
+                        "DaemonCrashed",
+                        f"Paper trading daemon exited immediately (exit code {exit_code})",
+                        fix="Check daemon log for details. Common cause: SQLite write permissions.",
+                        stderr=error_detail or "(no output captured)",
+                    )
+                )
+
+            if hasattr(daemon, "_stderr_file"):
+                daemon._stderr_file.close()
             with get_session(get_engine()) as session:
                 row = session.get(PaperPortfolio, portfolio_id)
                 if row:
@@ -679,6 +720,14 @@ async def call_tool(name: str, arguments: dict):
                         fix=f"Call list_paper_trades then retry with a valid portfolio_id (missing: {portfolio_id}).",
                     )
                 )
+            # Auto-correct stale "running" status when daemon PID is dead
+            if p.status == "running" and p.pid and not _pid_alive(int(p.pid)):
+                with get_session(get_engine()) as session:
+                    row = session.get(PaperPortfolio, p.id)
+                    if row:
+                        row.status = "dead"
+                        session.commit()
+                p = cache.get_portfolio(portfolio_id)
             positions = cache.get_open_positions(p.id)
             out = []
             unrealized = 0.0
@@ -731,8 +780,8 @@ async def call_tool(name: str, arguments: dict):
             if p.pid:
                 try:
                     os.kill(int(p.pid), signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                except (ProcessLookupError, OSError):
+                    pass  # Process already dead or Windows WinError 87
             with get_session(get_engine()) as session:
                 row = session.get(PaperPortfolio, p.id)
                 if row:
