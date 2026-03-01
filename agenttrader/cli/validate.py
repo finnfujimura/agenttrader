@@ -4,26 +4,21 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import inspect
+
 import click
 
 from agenttrader.cli.utils import emit_json, json_errors
+from agenttrader.core.base_strategy import BaseStrategy
 
 
-ALLOWED_SELF_METHODS = {
-    "subscribe",
-    "search_markets",
-    "get_price",
-    "get_orderbook",
-    "get_history",
-    "get_position",
-    "get_cash",
-    "get_portfolio_value",
-    "buy",
-    "sell",
-    "log",
-    "set_state",
-    "get_state",
-}
+def _base_strategy_methods() -> set[str]:
+    """Derive allowed self.* methods from the actual BaseStrategy class."""
+    return {
+        name
+        for name, _ in inspect.getmembers(BaseStrategy, predicate=inspect.isfunction)
+        if not name.startswith("_")
+    }
 
 FORBIDDEN_IMPORTS = {"requests", "httpx", "aiohttp", "urllib", "dome_api_sdk", "pmxt"}
 
@@ -99,27 +94,44 @@ class StrategyValidator(ast.NodeVisitor):
             )
             return
 
-        arg_names = [a.arg for a in method.args.args]
-        if arg_names != ["self", "market", "price", "orderbook"]:
+        # Check arity (4 args including self), not exact parameter names
+        arg_count = len(method.args.args)
+        if arg_count != 4:
             self.errors.append(
                 {
                     "type": "InvalidSignature",
-                    "message": "on_market_data must accept exactly (self, market, price, orderbook).",
+                    "message": f"on_market_data must accept exactly 4 arguments (self, market, price, orderbook), got {arg_count}.",
                     "file": self.file_path,
                     "line": method.lineno,
                 }
             )
+
+        # Collect methods defined in this class (helpers are allowed)
+        class_defined_methods = {
+            item.name
+            for item in cls.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+        # Allowed self.* calls = BaseStrategy public API + class-defined methods
+        allowed = _base_strategy_methods() | class_defined_methods
 
         for node in ast.walk(cls):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 owner = node.func.value
                 if isinstance(owner, ast.Name) and owner.id == "self":
                     method_name = node.func.attr
-                    if method_name not in ALLOWED_SELF_METHODS:
+                    if method_name.startswith("_"):
+                        # Allow private/internal attribute access (e.g. self._ctx)
+                        continue
+                    if method_name not in allowed:
                         self.errors.append(
                             {
                                 "type": "InvalidMethodCall",
-                                "message": f"Call to undefined method 'self.{method_name}()'. Not in BaseStrategy interface.",
+                                "message": (
+                                    f"Call to 'self.{method_name}()' is not part of the BaseStrategy API "
+                                    f"and is not defined in this class."
+                                ),
                                 "file": self.file_path,
                                 "line": node.lineno,
                             }
