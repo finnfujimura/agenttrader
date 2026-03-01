@@ -23,7 +23,9 @@
       "Bash(rtk grep:*)",
       "Bash(rtk test:*)",
       "Bash(source:*)",
-      "Bash(rtk git:*)"
+      "Bash(rtk git:*)",
+      "Bash(wc:*)",
+      "Bash(find .:*)"
     ]
   }
 }

@@ -96,8 +96,8 @@ def sync_cmd(
     cfg = load_config()
 
     if days is None:
-        days = int(cfg.get("max_sync_days", 90))
-    granularity = granularity or str(cfg.get("sync_granularity", "hourly"))
+        days = cfg["max_sync_days"]
+    granularity = granularity or cfg["sync_granularity"]
 
     interval_map = {
         "hourly": 60,

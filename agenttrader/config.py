@@ -38,13 +38,61 @@ def write_default_config() -> None:
     CONFIG_PATH.write_text(yaml.safe_dump(DEFAULT_CONFIG, sort_keys=False), encoding="utf-8")
 
 
+_VALID_GRANULARITIES = {"minute", "hourly", "daily"}
+
+
+def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Validate and coerce config values. Raises ConfigError on invalid input."""
+    errors = []
+
+    # schedule_interval_minutes: int >= 1
+    val = cfg.get("schedule_interval_minutes", 15)
+    try:
+        val = int(val)
+        if val < 1:
+            errors.append(f"schedule_interval_minutes must be >= 1, got {val}")
+    except (TypeError, ValueError):
+        errors.append(f"schedule_interval_minutes must be an integer, got {val!r}")
+    cfg["schedule_interval_minutes"] = val
+
+    # default_initial_cash: float, 1.0 – 1e9
+    val = cfg.get("default_initial_cash", 10000.0)
+    try:
+        val = float(val)
+        if not (1.0 <= val <= 1e9):
+            errors.append(f"default_initial_cash must be between 1.0 and 1e9, got {val}")
+    except (TypeError, ValueError):
+        errors.append(f"default_initial_cash must be a number, got {val!r}")
+    cfg["default_initial_cash"] = val
+
+    # sync_granularity: one of minute/hourly/daily
+    val = str(cfg.get("sync_granularity", "hourly"))
+    if val not in _VALID_GRANULARITIES:
+        errors.append(f"sync_granularity must be one of {_VALID_GRANULARITIES}, got {val!r}")
+    cfg["sync_granularity"] = val
+
+    # max_sync_days: int, 1 – 3650
+    val = cfg.get("max_sync_days", 90)
+    try:
+        val = int(val)
+        if not (1 <= val <= 3650):
+            errors.append(f"max_sync_days must be between 1 and 3650, got {val}")
+    except (TypeError, ValueError):
+        errors.append(f"max_sync_days must be an integer, got {val!r}")
+    cfg["max_sync_days"] = val
+
+    if errors:
+        raise ConfigError("Invalid config:\n" + "\n".join(f"  - {e}" for e in errors))
+    return cfg
+
+
 def load_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
         raise ConfigError("agenttrader not initialized. Run: agenttrader init")
     data = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
     merged = dict(DEFAULT_CONFIG)
     merged.update(data)
-    return merged
+    return _validate_config(merged)
 
 
 def save_config(data: dict[str, Any]) -> None:

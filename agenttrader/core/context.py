@@ -19,6 +19,19 @@ from agenttrader.errors import AgentTraderError, MarketNotCachedError
 from agenttrader.core.fill_model import FillModel
 
 
+_VALID_ORDER_TYPES = ("market", "limit")
+
+
+def _validate_buy_params(contracts, order_type, limit_price):
+    """Shared validation for buy() across all context implementations."""
+    if float(contracts) <= 0:
+        raise AgentTraderError("InvalidOrder", "contracts must be > 0")
+    if order_type not in _VALID_ORDER_TYPES:
+        raise AgentTraderError("InvalidOrder", f"order_type must be 'market' or 'limit', got '{order_type}'")
+    if order_type == "limit" and limit_price is None:
+        raise AgentTraderError("InvalidOrder", "limit_price is required when order_type='limit'")
+
+
 class ExecutionContext(ABC):
     @abstractmethod
     def subscribe(self, platform, category, tags, market_ids) -> None: ...
@@ -173,6 +186,8 @@ class BacktestContext(ExecutionContext):
     def get_history(self, market_id: str, lookback_hours: int = 24) -> list[PricePoint]:
         cutoff = self._current_ts - int(lookback_hours * 3600)
         points = self._price_data.get(market_id, [])
+        if self._active_market_id is not None and market_id != self._active_market_id:
+            return [p for p in points if cutoff <= p.timestamp < self._current_ts]
         return [p for p in points if cutoff <= p.timestamp <= self._current_ts]
 
     def get_position(self, market_id: str) -> PositionModel | None:
@@ -192,9 +207,8 @@ class BacktestContext(ExecutionContext):
         return value
 
     def buy(self, market_id, contracts, side="yes", order_type="market", limit_price=None) -> str:
+        _validate_buy_params(contracts, order_type, limit_price)
         contracts = float(contracts)
-        if contracts <= 0:
-            raise AgentTraderError("InvalidOrder", "contracts must be > 0")
 
         if self._execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
             observed_price = self.get_price(market_id)
@@ -490,6 +504,8 @@ class StreamingBacktestContext(ExecutionContext):
 
     def get_history(self, market_id: str, lookback_hours: int = 24) -> list[PricePoint]:
         cutoff = self._current_ts - int(lookback_hours * 3600)
+        if self._active_market_id is not None and market_id != self._active_market_id:
+            return [p for p in self._history[market_id] if cutoff <= p.timestamp < self._current_ts]
         return [p for p in self._history[market_id] if cutoff <= p.timestamp <= self._current_ts]
 
     def get_orderbook(self, market_id: str) -> OrderBook:
@@ -527,9 +543,8 @@ class StreamingBacktestContext(ExecutionContext):
         return value
 
     def buy(self, market_id, contracts, side="yes", order_type="market", limit_price=None) -> str:
+        _validate_buy_params(contracts, order_type, limit_price)
         contracts = float(contracts)
-        if contracts <= 0:
-            raise AgentTraderError("InvalidOrder", "contracts must be > 0")
 
         if self._execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
             observed_price = self._price_cursors.get(market_id)
@@ -783,6 +798,7 @@ class LiveContext(ExecutionContext):
         return value
 
     def buy(self, market_id, contracts, side="yes", order_type="market", limit_price=None) -> str:
+        _validate_buy_params(contracts, order_type, limit_price)
         contracts = float(contracts)
         ob = self.get_orderbook(market_id)
         fill = self._fill_model.simulate_buy(contracts, ob, order_type=order_type, limit_price=limit_price)

@@ -75,11 +75,16 @@ class ParquetDataAdapter:
         self._kalshi_markets_view: str | None = None
 
         if self._conn is not None:
-            self._poly_trades_view = self._create_view("poly_trades", self._poly_trades_files)
-            self._poly_markets_view = self._create_view("poly_markets", self._poly_markets_files)
-            self._poly_blocks_view = self._create_view("poly_blocks", self._poly_blocks_files)
-            self._kalshi_trades_view = self._create_view("kalshi_trades", self._kalshi_trades_files)
-            self._kalshi_markets_view = self._create_view("kalshi_markets", self._kalshi_markets_files)
+            try:
+                self._poly_trades_view = self._create_view("poly_trades", self._poly_trades_files)
+                self._poly_markets_view = self._create_view("poly_markets", self._poly_markets_files)
+                self._poly_blocks_view = self._create_view("poly_blocks", self._poly_blocks_files)
+                self._kalshi_trades_view = self._create_view("kalshi_trades", self._kalshi_trades_files)
+                self._kalshi_markets_view = self._create_view("kalshi_markets", self._kalshi_markets_files)
+            except Exception:
+                self._conn.close()
+                self._conn = None
+                raise
 
     def is_available(self) -> bool:
         if self._conn is None:
@@ -504,6 +509,8 @@ class ParquetDataAdapter:
 
     def _create_view(self, view_name: str, files: list[str]) -> str | None:
         self._require_conn()
+        if not re.fullmatch(r"[a-z_][a-z0-9_]*", view_name):
+            raise ValueError(f"Invalid view name: {view_name!r}")
         if not files:
             return None
         quoted_files = ", ".join("'" + str(path).replace("'", "''") + "'" for path in files)

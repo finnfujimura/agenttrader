@@ -20,7 +20,18 @@ def _base_strategy_methods() -> set[str]:
         if not name.startswith("_")
     }
 
-FORBIDDEN_IMPORTS = {"requests", "httpx", "aiohttp", "urllib", "dome_api_sdk", "pmxt"}
+FORBIDDEN_IMPORTS = {
+    # Network libraries
+    "requests", "httpx", "aiohttp", "urllib",
+    # System/process access
+    "os", "subprocess", "shutil", "sys",
+    # Low-level / dangerous
+    "socket", "ctypes", "sqlite3",
+    # Dynamic import bypass
+    "importlib",
+    # Internal SDK
+    "dome_api_sdk", "pmxt",
+}
 
 
 class StrategyValidator(ast.NodeVisitor):
@@ -42,10 +53,10 @@ class StrategyValidator(ast.NodeVisitor):
         for alias in node.names:
             root = alias.name.split(".")[0]
             if root in FORBIDDEN_IMPORTS:
-                self.warnings.append(
+                self.errors.append(
                     {
-                        "type": "NetworkImport",
-                        "message": f"Import '{alias.name}' detected. Network calls from strategies are not supported.",
+                        "type": "ForbiddenImport",
+                        "message": f"Import '{alias.name}' is forbidden in strategies.",
                         "file": self.file_path,
                         "line": node.lineno,
                     }
@@ -55,14 +66,37 @@ class StrategyValidator(ast.NodeVisitor):
         if node.module:
             root = node.module.split(".")[0]
             if root in FORBIDDEN_IMPORTS:
-                self.warnings.append(
+                self.errors.append(
                     {
-                        "type": "NetworkImport",
-                        "message": f"Import '{node.module}' detected. Network calls from strategies are not supported.",
+                        "type": "ForbiddenImport",
+                        "message": f"Import '{node.module}' is forbidden in strategies.",
                         "file": self.file_path,
                         "line": node.lineno,
                     }
                 )
+
+    def visit_Call(self, node: ast.Call) -> None:
+        # Detect __import__("module") calls — these bypass AST import checks
+        if isinstance(node.func, ast.Name) and node.func.id == "__import__":
+            self.errors.append(
+                {
+                    "type": "DynamicImport",
+                    "message": "__import__() bypasses static import checks and is not allowed in strategies.",
+                    "file": self.file_path,
+                    "line": node.lineno,
+                }
+            )
+        # Detect importlib.import_module() calls
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "import_module":
+            self.errors.append(
+                {
+                    "type": "DynamicImport",
+                    "message": "importlib.import_module() bypasses static import checks and is not allowed in strategies.",
+                    "file": self.file_path,
+                    "line": node.lineno,
+                }
+            )
+        self.generic_visit(node)
 
     def validate_structure(self) -> None:
         if len(self.strategy_classes) != 1:

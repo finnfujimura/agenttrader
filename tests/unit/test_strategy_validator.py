@@ -235,8 +235,8 @@ class MyStrat(BaseStrategy):
     assert "not defined in this class" in result["errors"][0]["message"]
 
 
-def test_forbidden_import_warns(tmp_path):
-    """Forbidden imports should produce warnings (not errors)."""
+def test_forbidden_import_rejected(tmp_path):
+    """Forbidden imports should produce errors and fail validation."""
     path = _write_strategy(tmp_path, """
 import requests
 from agenttrader import BaseStrategy
@@ -246,12 +246,11 @@ class MyStrat(BaseStrategy):
         pass
 """)
     result = validate_strategy_file(path)
-    assert result["valid"] is True  # warnings, not errors
-    assert len(result["warnings"]) >= 1
-    assert result["warnings"][0]["type"] == "NetworkImport"
+    assert result["valid"] is False
+    assert any(e["type"] == "ForbiddenImport" for e in result["errors"])
 
 
-def test_forbidden_from_import_warns(tmp_path):
+def test_forbidden_from_import_rejected(tmp_path):
     path = _write_strategy(tmp_path, """
 from httpx import Client
 from agenttrader import BaseStrategy
@@ -261,8 +260,8 @@ class MyStrat(BaseStrategy):
         pass
 """)
     result = validate_strategy_file(path)
-    assert result["valid"] is True
-    assert any(w["type"] == "NetworkImport" for w in result["warnings"])
+    assert result["valid"] is False
+    assert any(e["type"] == "ForbiddenImport" for e in result["errors"])
 
 
 def test_file_not_found(tmp_path):

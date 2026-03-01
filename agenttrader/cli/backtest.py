@@ -128,7 +128,7 @@ def _backtest_run(strategy_path: str, args: list[str]) -> None:
     cfg = load_config()
     from_date = from_date or datetime.now(tz=UTC).strftime("%Y-01-01")
     to_date = to_date or datetime.now(tz=UTC).strftime("%Y-%m-%d")
-    initial_cash = float(initial_cash if initial_cash is not None else cfg.get("default_initial_cash", 10000.0))
+    initial_cash = float(initial_cash if initial_cash is not None else cfg["default_initial_cash"])
 
     run_id = str(uuid.uuid4())
     strategy_hash = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -164,7 +164,7 @@ def _backtest_run(strategy_path: str, args: list[str]) -> None:
                 start_date=from_date,
                 end_date=to_date,
                 initial_cash=initial_cash,
-                schedule_interval_minutes=int(cfg.get("schedule_interval_minutes", 15)),
+                schedule_interval_minutes=cfg["schedule_interval_minutes"],
                 max_markets=max_markets,
                 fidelity=fidelity,
             ),

@@ -11,6 +11,10 @@ thousands of parquet files on each __init__).
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # Module-level cache — populated on first call, reused thereafter.
 _cached_all_sources: list | None = None
 _cached_best_source: tuple | None = None
@@ -64,7 +68,7 @@ def get_all_sources():
         if provider.is_available():
             sources.append((provider, "normalized-index"))
     except Exception:
-        pass
+        logger.warning("Failed to initialize IndexProvider (DuckDB index)", exc_info=True)
 
     # Only add raw-parquet if IndexProvider wasn't available (it wraps parquet)
     if not sources:
@@ -73,13 +77,13 @@ def get_all_sources():
             if parquet.is_available():
                 sources.append((parquet, "raw-parquet"))
         except Exception:
-            pass
+            logger.warning("Failed to initialize ParquetDataAdapter", exc_info=True)
 
     try:
         cache = DataCache(get_engine())
         sources.append((cache, "sqlite-cache"))
     except Exception:
-        pass
+        logger.warning("Failed to initialize SQLite cache", exc_info=True)
 
     _cached_all_sources = sources
     return sources

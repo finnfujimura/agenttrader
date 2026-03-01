@@ -91,7 +91,9 @@ class PaperDaemon:
             ],
             **kwargs,
         )
-        self._stderr_file = stderr_file
+        # Close the file handle in the parent process — the subprocess
+        # inherited its own copy via Popen.
+        stderr_file.close()
         self._stderr_path = stderr_path
         return proc
 
@@ -185,7 +187,7 @@ class PaperDaemon:
             raise RuntimeError("Daemon not initialized")
 
         cfg = load_config()
-        interval_seconds = int(cfg.get("schedule_interval_minutes", 15)) * 60
+        interval_seconds = cfg["schedule_interval_minutes"] * 60
         next_schedule = time.time() + interval_seconds
 
         while not self._runtime.shutdown:

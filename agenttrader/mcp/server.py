@@ -45,6 +45,16 @@ def _text(obj) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=json.dumps(obj, default=str))]
 
 
+def _bounded_int(args: dict, key: str, default: int, lo: int, hi: int) -> int:
+    """Extract an integer parameter clamped to [lo, hi]."""
+    return max(lo, min(hi, int(args.get(key, default))))
+
+
+def _bounded_float(args: dict, key: str, default: float, lo: float, hi: float) -> float:
+    """Extract a float parameter clamped to [lo, hi]."""
+    return max(lo, min(hi, float(args.get(key, default))))
+
+
 _cached_index_adapter: BacktestIndexAdapter | None = None
 _cached_index_checked = False
 
@@ -661,7 +671,7 @@ async def call_tool(name: str, arguments: dict):
                 kwargs = {
                     "platform": platform,
                     "category": args.get("category"),
-                    "limit": int(args.get("limit", 20)),
+                    "limit": _bounded_int(args, "limit", 20, 1, 1000),
                 }
                 if source_name == "sqlite-cache" and args.get("tags"):
                     kwargs["tags"] = args.get("tags")
@@ -702,7 +712,7 @@ async def call_tool(name: str, arguments: dict):
 
         if name == "get_history":
             market_id = args["market_id"]
-            days = int(args.get("days", 7))
+            days = _bounded_int(args, "days", 7, 1, 3650)
             end_ts = int(time.time())
             start_ts = end_ts - days * 24 * 3600
             platform = args.get("platform", "polymarket")
@@ -787,7 +797,7 @@ async def call_tool(name: str, arguments: dict):
                         strategy_hash=strategy_hash,
                         start_date=args["start_date"],
                         end_date=args["end_date"],
-                        initial_cash=float(args.get("initial_cash", 10000.0)),
+                        initial_cash=_bounded_float(args, "initial_cash", 10000.0, 1.0, 1e9),
                         status="running",
                         created_at=now_ts,
                     )
@@ -821,8 +831,8 @@ async def call_tool(name: str, arguments: dict):
                         strategy_path=str(strategy_path),
                         start_date=args["start_date"],
                         end_date=args["end_date"],
-                        initial_cash=float(args.get("initial_cash", 10000.0)),
-                        schedule_interval_minutes=int(load_config().get("schedule_interval_minutes", 15)),
+                        initial_cash=_bounded_float(args, "initial_cash", 10000.0, 1.0, 1e9),
+                        schedule_interval_minutes=load_config()["schedule_interval_minutes"],
                         max_markets=int(args["max_markets"]) if args.get("max_markets") is not None else None,
                         fidelity=str(args.get("fidelity", "exact_trade")),
                         execution_mode=execution_mode,
@@ -864,13 +874,13 @@ async def call_tool(name: str, arguments: dict):
                 return _respond(_error_payload("StrategyError", str(exc), fix="Fix the strategy and retry."))
 
         if name == "research_markets":
-            days = int(args.get("days", 7))
+            days = _bounded_int(args, "days", 7, 1, 3650)
             platform = args.get("platform", "all")
             category = args.get("category")
             tags = args.get("tags")
             market_ids = args.get("market_ids")
-            limit = int(args.get("limit", 20))
-            sync_limit = int(args.get("sync_limit", 100))
+            limit = _bounded_int(args, "limit", 20, 1, 1000)
+            sync_limit = _bounded_int(args, "sync_limit", 100, 1, 1000)
             include_raw = bool(args.get("include_raw", False))
             active_only = bool(args.get("active_only", True))
 
@@ -1040,7 +1050,7 @@ async def call_tool(name: str, arguments: dict):
                 )
 
             portfolio_id = str(uuid.uuid4())
-            initial_cash = float(args.get("initial_cash", 10000.0))
+            initial_cash = _bounded_float(args, "initial_cash", 10000.0, 1.0, 1e9)
             strategy_hash = hashlib.sha256(strategy_path.read_bytes()).hexdigest()
             with get_session(get_engine()) as session:
                 session.add(
@@ -1192,10 +1202,10 @@ async def call_tool(name: str, arguments: dict):
 
         if name == "sync_data":
             client = PmxtClient()
-            days = int(args.get("days", 7))
+            days = _bounded_int(args, "days", 7, 1, 3650)
             platform = args.get("platform", "all")
             market_ids = args.get("market_ids")
-            limit = int(args.get("limit", 100))
+            limit = _bounded_int(args, "limit", 100, 1, 1000)
             category = args.get("category")
             resolved = args.get("resolved", False)
             granularity = args.get("granularity", "hourly")

@@ -51,7 +51,7 @@ def paper_start(strategy_path: str, initial_cash: float | None, no_daemon: bool,
         raise AgentTraderError("StrategyValidationError", "Strategy validation failed", payload)
 
     cfg = load_config()
-    initial_cash = float(initial_cash if initial_cash is not None else cfg.get("default_initial_cash", 10000.0))
+    initial_cash = float(initial_cash if initial_cash is not None else cfg["default_initial_cash"])
 
     strategy_file = Path(strategy_path)
     portfolio_id = str(uuid.uuid4())
