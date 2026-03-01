@@ -26,7 +26,7 @@ from agenttrader.core.paper_daemon import PaperDaemon
 from agenttrader.data.backtest_artifacts import read_backtest_artifact, write_backtest_artifact
 from agenttrader.data.cache import DataCache
 from agenttrader.data.models import ExecutionMode
-from agenttrader.data.source_selector import get_best_data_source
+from agenttrader.data.source_selector import get_best_data_source, get_all_sources
 from agenttrader.db.health import check_schema
 from agenttrader.errors import AgentTraderError
 from agenttrader.data.pmxt_client import PmxtClient
@@ -230,6 +230,14 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "sync_limit": {"type": "integer", "default": 100},
                     "include_raw": {"type": "boolean", "default": False},
+                    "active_only": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": (
+                            "If true (default), filter out resolved/expired markets. "
+                            "Set to false to include historical markets."
+                        ),
+                    },
                 },
             },
         ),
@@ -353,47 +361,61 @@ async def call_tool(name: str, arguments: dict):
         if name == "get_price":
             market_id = args["market_id"]
             platform = args.get("platform", "polymarket")
-            source, source_name = get_best_data_source()
-            latest = source.get_latest_price(market_id, platform)
-            if not latest:
-                return _respond(
-                    _error_payload(
-                        "MarketNotFound",
-                        f"No price data found for {market_id}",
-                        fix=f"Call sync_data(market_ids=['{market_id}']) or check market_id is correct.",
-                    )
+            for source, source_name in get_all_sources():
+                try:
+                    if source_name == "sqlite-cache":
+                        latest = source.get_latest_price(market_id)
+                    else:
+                        latest = source.get_latest_price(market_id, platform)
+                    if latest:
+                        return _respond({"ok": True, "data_source": source_name, "market_id": market_id, "price": latest.__dict__})
+                except Exception:
+                    continue
+            return _respond(
+                _error_payload(
+                    "MarketNotFound",
+                    f"No price data found for {market_id}",
+                    fix=f"Call sync_data(market_ids=['{market_id}']) or check market_id is correct.",
                 )
-            return _respond({"ok": True, "data_source": source_name, "market_id": market_id, "price": latest.__dict__})
+            )
 
         if name == "get_history":
             market_id = args["market_id"]
-            source, source_name = get_best_data_source()
-
-            if source_name == "sqlite-cache":
-                market = cache.get_market(market_id)
-                if not market:
-                    return _respond(
-                        _error_payload(
-                            "MarketNotCached",
-                            f"Market {market_id} not found in local cache",
-                            fix=f"Call sync_data(market_ids=['{market_id}']) and retry.",
-                        )
-                    )
-
             days = int(args.get("days", 7))
             end_ts = int(time.time())
             start_ts = end_ts - days * 24 * 3600
+            platform = args.get("platform", "polymarket")
 
-            if source_name == "sqlite-cache":
-                history = source.get_price_history(market_id, start_ts, end_ts)
-            else:
-                platform = args.get("platform", "polymarket")
-                history = source.get_price_history(market_id, platform, start_ts, end_ts)
+            history = None
+            used_source = None
+            for source, source_name in get_all_sources():
+                try:
+                    if source_name == "sqlite-cache":
+                        if not source.get_market(market_id):
+                            continue
+                        pts = source.get_price_history(market_id, start_ts, end_ts)
+                    else:
+                        pts = source.get_price_history(market_id, platform, start_ts, end_ts)
+                    if pts:
+                        history = pts
+                        used_source = source_name
+                        break
+                except Exception:
+                    continue
+
+            if history is None:
+                return _respond(
+                    _error_payload(
+                        "MarketNotFound",
+                        f"No history data found for {market_id}",
+                        fix=f"Call sync_data(market_ids=['{market_id}']) and retry.",
+                    )
+                )
 
             include_raw = bool(args.get("include_raw", False))
             payload = {
                 "ok": True,
-                "data_source": source_name,
+                "data_source": used_source,
                 "market_id": market_id,
                 "days": days,
                 "analytics": _compute_history_analytics(history, end_ts),
@@ -526,6 +548,7 @@ async def call_tool(name: str, arguments: dict):
             limit = int(args.get("limit", 20))
             sync_limit = int(args.get("sync_limit", 100))
             include_raw = bool(args.get("include_raw", False))
+            active_only = bool(args.get("active_only", True))
 
             source, source_name = get_best_data_source()
             sync_payload = None
@@ -565,19 +588,34 @@ async def call_tool(name: str, arguments: dict):
                     mkwargs["tags"] = tags
                 markets = source.get_markets(**mkwargs)
 
-            # Get history for each market
+            # Filter out resolved markets unless active_only=false
+            if active_only:
+                markets = [m for m in markets if not getattr(m, "resolved", False)]
+
+            # Get history for each market — try all sources per market
             end_ts = int(time.time())
             start_ts = end_ts - days * 24 * 3600
+            all_sources = get_all_sources()
             history = []
             history_errors = []
             for market in markets:
                 try:
                     mid = market.id if hasattr(market, "id") else market["id"]
                     plat = market.platform.value if hasattr(market.platform, "value") else str(market.platform)
-                    if source_name == "sqlite-cache":
-                        pts = source.get_price_history(mid, start_ts, end_ts)
-                    else:
-                        pts = source.get_price_history(mid, plat, start_ts, end_ts)
+                    pts = None
+                    for src, sname in all_sources:
+                        try:
+                            if sname == "sqlite-cache":
+                                if not src.get_market(mid):
+                                    continue
+                                pts = src.get_price_history(mid, start_ts, end_ts)
+                            else:
+                                pts = src.get_price_history(mid, plat, start_ts, end_ts)
+                            if pts:
+                                break
+                        except Exception:
+                            continue
+                    pts = pts or []
                     analytics = _compute_history_analytics(pts, end_ts)
                     entry = {"ok": True, "market_id": mid, "days": days, "analytics": analytics}
                     if include_raw:
@@ -870,18 +908,26 @@ async def call_tool(name: str, arguments: dict):
                     "ok": False,
                     "error": "NoMarketsFound",
                     "message": f"None of the {len(market_ids)} requested market_ids were found.",
-                    "fix": "Check market_ids are correct and PMXT credentials are configured.",
+                    "fix": (
+                        "These market_ids may be historical/expired and unavailable via the live API. "
+                        "Use get_markets or get_history to query parquet data for historical markets. "
+                        "If these are active markets, check that PMXT credentials are configured."
+                    ),
                 })
 
-            return _respond(
-                {
-                    "ok": len(errors) == 0,
-                    "markets_synced": synced,
-                    "price_points_fetched": pp,
-                    "orderbook_files_written": ob_files,
-                    "errors": errors,
-                }
-            )
+            result = {
+                "ok": len(errors) == 0,
+                "markets_synced": synced,
+                "price_points_fetched": pp,
+                "orderbook_files_written": ob_files,
+                "errors": errors,
+            }
+            if synced == 0 and not errors and not market_ids and (category or platform != "all"):
+                result["warning"] = (
+                    "No markets matched your filters. "
+                    "Try broadening category/platform or check available markets with get_markets."
+                )
+            return _respond(result)
 
         if name == "debug_data_sources":
             base = Path.home() / ".agenttrader"

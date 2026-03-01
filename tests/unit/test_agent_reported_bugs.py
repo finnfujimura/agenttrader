@@ -98,6 +98,7 @@ def test_research_markets_direct_id_lookup(monkeypatch):
 
     fake_source = FakeSource()
     monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (fake_source, "fake-source"))
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(fake_source, "fake-source")])
 
     result = _run(mcp_server.call_tool("research_markets", {
         "platform": "polymarket",
@@ -127,6 +128,7 @@ def test_research_markets_without_ids_uses_get_markets(monkeypatch):
 
     fake_source = FakeSource()
     monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (fake_source, "fake-source"))
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(fake_source, "fake-source")])
 
     result = _run(mcp_server.call_tool("research_markets", {
         "platform": "polymarket",
@@ -589,3 +591,216 @@ def test_get_markets_with_market_ids(monkeypatch):
     assert payload["ok"]
     assert len(payload["markets"]) == 1
     assert payload["markets"][0]["id"] == "m1"
+
+
+# ---------------------------------------------------------------------------
+# Source fallback: get_all_sources
+# ---------------------------------------------------------------------------
+
+
+def test_get_all_sources_returns_sqlite_last(monkeypatch):
+    """get_all_sources should return sqlite-cache as the last source."""
+    from agenttrader.data.source_selector import get_all_sources
+
+    class FakeIndex:
+        def is_available(self):
+            return True
+
+    class FakeCache:
+        pass
+
+    monkeypatch.setattr("agenttrader.data.index_provider.IndexProvider", FakeIndex)
+    monkeypatch.setattr("agenttrader.data.cache.DataCache", lambda _: FakeCache())
+    monkeypatch.setattr("agenttrader.db.get_engine", lambda: None)
+
+    sources = get_all_sources()
+    names = [name for _, name in sources]
+    assert names[-1] == "sqlite-cache"
+    assert "normalized-index" in names
+
+
+# ---------------------------------------------------------------------------
+# Source fallback: get_price falls back to cache
+# ---------------------------------------------------------------------------
+
+
+def test_get_price_falls_back_to_cache(monkeypatch):
+    """get_price should try cache when index returns None."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+    from agenttrader.data.models import PricePoint
+
+    pp = PricePoint(timestamp=100, yes_price=0.55, no_price=0.45, volume=10)
+
+    class FakeIndex:
+        def get_latest_price(self, market_id, platform):
+            return None  # No data in index
+
+    class FakeCache:
+        def get_latest_price(self, market_id):
+            return pp
+
+    monkeypatch.setattr(
+        mcp_server, "get_all_sources",
+        lambda: [(FakeIndex(), "normalized-index"), (FakeCache(), "sqlite-cache")],
+    )
+
+    result = _run(mcp_server.call_tool("get_price", {"market_id": "m1", "platform": "polymarket"}))
+    payload = _payload(result)
+    assert payload["ok"]
+    assert payload["data_source"] == "sqlite-cache"
+    assert payload["price"]["yes_price"] == 0.55
+
+
+# ---------------------------------------------------------------------------
+# Source fallback: get_history falls back to cache
+# ---------------------------------------------------------------------------
+
+
+def test_get_history_falls_back_to_cache(monkeypatch):
+    """get_history should try cache when index returns empty list."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+    from agenttrader.data.models import PricePoint
+
+    pp = PricePoint(timestamp=100, yes_price=0.60, no_price=0.40, volume=5)
+
+    class FakeIndex:
+        def get_price_history(self, market_id, platform, start, end):
+            return []  # Empty in index
+
+    class FakeCache:
+        def get_market(self, market_id):
+            return _make_market(market_id)
+
+        def get_price_history(self, market_id, start, end):
+            return [pp]
+
+    monkeypatch.setattr(
+        mcp_server, "get_all_sources",
+        lambda: [(FakeIndex(), "normalized-index"), (FakeCache(), "sqlite-cache")],
+    )
+
+    result = _run(mcp_server.call_tool("get_history", {"market_id": "m1", "days": 7}))
+    payload = _payload(result)
+    assert payload["ok"]
+    assert payload["data_source"] == "sqlite-cache"
+
+
+# ---------------------------------------------------------------------------
+# research_markets active_only filters resolved markets
+# ---------------------------------------------------------------------------
+
+
+def test_research_markets_active_only_filters_resolved(monkeypatch):
+    """research_markets with active_only=true should exclude resolved markets."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+
+    active = _make_market("m-active")
+    resolved = _make_market("m-resolved")
+    resolved.resolved = True
+
+    class FakeSource:
+        def get_markets(self, **kw):
+            return [active, resolved]
+
+        def get_price_history(self, *a, **kw):
+            return []
+
+    monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (FakeSource(), "fake-source"))
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(FakeSource(), "fake-source")])
+
+    result = _run(mcp_server.call_tool("research_markets", {
+        "platform": "polymarket",
+        "active_only": True,
+    }))
+    payload = _payload(result)
+    market_ids = [m["id"] for m in payload.get("markets", [])]
+    assert "m-active" in market_ids
+    assert "m-resolved" not in market_ids
+
+
+def test_research_markets_active_only_false_includes_resolved(monkeypatch):
+    """research_markets with active_only=false should include resolved markets."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+
+    active = _make_market("m-active")
+    resolved = _make_market("m-resolved")
+    resolved.resolved = True
+
+    class FakeSource:
+        def get_markets(self, **kw):
+            return [active, resolved]
+
+        def get_price_history(self, *a, **kw):
+            return []
+
+    monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (FakeSource(), "fake-source"))
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(FakeSource(), "fake-source")])
+
+    result = _run(mcp_server.call_tool("research_markets", {
+        "platform": "polymarket",
+        "active_only": False,
+    }))
+    payload = _payload(result)
+    market_ids = [m["id"] for m in payload.get("markets", [])]
+    assert "m-active" in market_ids
+    assert "m-resolved" in market_ids
+
+
+# ---------------------------------------------------------------------------
+# sync_data zero with category filter includes warning
+# ---------------------------------------------------------------------------
+
+
+def test_sync_data_zero_with_category_includes_warning(monkeypatch):
+    """sync_data with 0 results and category filter should include a warning."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+
+    class FakeClient:
+        def get_markets(self, **kw):
+            return []
+
+    class FakeCache:
+        pass
+
+    monkeypatch.setattr(mcp_server, "PmxtClient", FakeClient)
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _: FakeCache())
+
+    with patch.object(mcp_server, "get_engine"):
+        result = _run(mcp_server.call_tool("sync_data", {
+            "platform": "polymarket",
+            "category": "nonexistent_category",
+        }))
+
+    payload = _payload(result)
+    assert payload["ok"] is True
+    assert "warning" in payload
+
+
+# ---------------------------------------------------------------------------
+# sync_data historical market_ids error mentions parquet
+# ---------------------------------------------------------------------------
+
+
+def test_sync_data_historical_market_ids_mentions_parquet(monkeypatch):
+    """sync_data with unfound market_ids should mention parquet/get_history in the fix."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+
+    class FakeClient:
+        def get_markets(self, **kw):
+            return []
+
+    class FakeCache:
+        pass
+
+    monkeypatch.setattr(mcp_server, "PmxtClient", FakeClient)
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _: FakeCache())
+
+    with patch.object(mcp_server, "get_engine"):
+        result = _run(mcp_server.call_tool("sync_data", {
+            "market_ids": ["old-market-1"],
+            "platform": "polymarket",
+        }))
+
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert "parquet" in payload["fix"].lower() or "get_history" in payload["fix"]

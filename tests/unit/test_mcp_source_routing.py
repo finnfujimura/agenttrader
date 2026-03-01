@@ -23,11 +23,13 @@ def test_get_markets_uses_source_selector():
 
 
 def test_get_history_uses_source_selector():
-    """get_history should route through get_best_data_source with platform param."""
+    """get_history should route through get_all_sources with platform param."""
+    from types import SimpleNamespace
+
     mock_source = MagicMock()
-    mock_source.get_price_history.return_value = []
+    mock_source.get_price_history.return_value = [SimpleNamespace(timestamp=100, yes_price=0.5, no_price=0.5, volume=10)]
     with patch("agenttrader.mcp.server.is_initialized", return_value=True), \
-         patch("agenttrader.mcp.server.get_best_data_source", return_value=(mock_source, "raw-parquet")):
+         patch("agenttrader.mcp.server.get_all_sources", return_value=[(mock_source, "raw-parquet")]):
         from agenttrader.mcp.server import call_tool
         result = _run(call_tool("get_history", {"market_id": "test-123", "days": 7, "platform": "polymarket"}))
     payload = json.loads(result[0].text)
@@ -40,13 +42,13 @@ def test_get_history_uses_source_selector():
 
 def test_get_history_cache_fallback_no_platform():
     """get_history with sqlite-cache should not pass platform to get_price_history."""
+    from types import SimpleNamespace
+
     mock_source = MagicMock()
-    mock_source.get_price_history.return_value = []
-    mock_cache = MagicMock()
-    mock_cache.get_market.return_value = MagicMock()
+    mock_source.get_market.return_value = MagicMock()
+    mock_source.get_price_history.return_value = [SimpleNamespace(timestamp=100, yes_price=0.5, no_price=0.5, volume=10)]
     with patch("agenttrader.mcp.server.is_initialized", return_value=True), \
-         patch("agenttrader.mcp.server.get_best_data_source", return_value=(mock_source, "sqlite-cache")), \
-         patch("agenttrader.mcp.server.DataCache", return_value=mock_cache):
+         patch("agenttrader.mcp.server.get_all_sources", return_value=[(mock_source, "sqlite-cache")]):
         from agenttrader.mcp.server import call_tool
         result = _run(call_tool("get_history", {"market_id": "test-456"}))
     payload = json.loads(result[0].text)

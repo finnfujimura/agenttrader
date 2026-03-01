@@ -51,6 +51,7 @@ def test_call_tool_market_not_found_returns_fix(monkeypatch):
     monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: object())
     monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
     monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (FakeSource(), "sqlite-cache"))
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(FakeSource(), "sqlite-cache")])
 
     result = _run(mcp_server.call_tool("get_price", {"market_id": "0xabc"}))
     payload = _payload(result)
@@ -70,6 +71,7 @@ def test_get_price_routes_through_source_selector(monkeypatch):
     monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: object())
     monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
     monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (FakeSource(), "normalized-index"))
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(FakeSource(), "normalized-index")])
 
     result = _run(mcp_server.call_tool("get_price", {"market_id": "0xabc"}))
     payload = _payload(result)
@@ -107,6 +109,7 @@ def test_get_history_returns_analytics_by_default(monkeypatch):
     monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: fake_cache)
     monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
     monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (fake_cache, "sqlite-cache"))
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(fake_cache, "sqlite-cache")])
 
     result = _run(mcp_server.call_tool("get_history", {"market_id": "0xabc", "days": 7}))
     payload = _payload(result)
@@ -134,6 +137,7 @@ def test_get_history_include_raw_true_returns_history(monkeypatch):
     monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: fake_cache)
     monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
     monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (fake_cache, "sqlite-cache"))
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(fake_cache, "sqlite-cache")])
 
     result = _run(mcp_server.call_tool(
         "get_history",
@@ -251,6 +255,7 @@ def test_research_markets_runs_compound_flow(monkeypatch):
     monkeypatch.setattr(mcp_server, "PmxtClient", lambda: FakeClient())
     monkeypatch.setattr(mcp_server, "OrderBookStore", lambda: FakeOrderBookStore())
     monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (shared_cache, "sqlite-cache"))
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(shared_cache, "sqlite-cache")])
 
     result = _run(mcp_server.call_tool(
         "research_markets",

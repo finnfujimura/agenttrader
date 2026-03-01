@@ -15,12 +15,14 @@ def test_research_skips_sync_when_indexed():
     mock_market.id = "m1"
     mock_market.platform = MagicMock(value="polymarket")
     mock_market.market_type = MagicMock(value="binary")
-    mock_market.__dict__ = {"id": "m1", "platform": mock_market.platform, "market_type": mock_market.market_type}
+    mock_market.resolved = False
+    mock_market.__dict__ = {"id": "m1", "platform": mock_market.platform, "market_type": mock_market.market_type, "resolved": False}
     mock_source.get_markets.return_value = [mock_market]
     mock_source.get_price_history.return_value = []
 
     with patch("agenttrader.mcp.server.is_initialized", return_value=True), \
-         patch("agenttrader.mcp.server.get_best_data_source", return_value=(mock_source, "normalized-index")):
+         patch("agenttrader.mcp.server.get_best_data_source", return_value=(mock_source, "normalized-index")), \
+         patch("agenttrader.mcp.server.get_all_sources", return_value=[(mock_source, "normalized-index")]):
         from agenttrader.mcp.server import call_tool
         result = _run(call_tool("research_markets", {"platform": "polymarket", "limit": 1}))
 
@@ -37,7 +39,8 @@ def test_research_includes_data_source():
     mock_source.get_markets.return_value = []
 
     with patch("agenttrader.mcp.server.is_initialized", return_value=True), \
-         patch("agenttrader.mcp.server.get_best_data_source", return_value=(mock_source, "raw-parquet")):
+         patch("agenttrader.mcp.server.get_best_data_source", return_value=(mock_source, "raw-parquet")), \
+         patch("agenttrader.mcp.server.get_all_sources", return_value=[(mock_source, "raw-parquet")]):
         from agenttrader.mcp.server import call_tool
         result = _run(call_tool("research_markets", {"platform": "all"}))
 
