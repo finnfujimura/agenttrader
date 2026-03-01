@@ -119,6 +119,9 @@ def test_get_history_returns_analytics_by_default(monkeypatch):
     assert payload["analytics"]["price_change_24h"] == pytest.approx(0.05)
     assert payload["analytics"]["trend_direction"] == "up"
     assert payload["analytics"]["points"] == 3
+    assert payload["analytics"]["last_point_timestamp"] == now
+    assert payload["analytics"]["hours_since_last_point"] == pytest.approx(0.0, abs=0.01)
+    assert payload["analytics"]["has_24h_reference"] is True
 
 
 def test_get_history_include_raw_true_returns_history(monkeypatch):

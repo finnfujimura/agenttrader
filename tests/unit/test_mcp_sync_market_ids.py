@@ -34,10 +34,16 @@ def test_sync_data_market_ids_uses_exact_lookup(monkeypatch):
             closed=True,
         )
     ]
-    client.get_candlesticks = lambda *_args, **_kwargs: [
-        models.PricePoint(timestamp=1737392619, yes_price=0.99, no_price=0.01, volume=1500.0)
-    ]
-    client.get_orderbook_snapshots = lambda *_args, **_kwargs: []
+    client.get_candlesticks_with_status = lambda *_args, **_kwargs: {
+        "points": [models.PricePoint(timestamp=1737392619, yes_price=0.99, no_price=0.01, volume=1500.0)],
+        "status": "ok",
+        "error": None,
+    }
+    client.get_orderbook_snapshots_with_status = lambda *_args, **_kwargs: {
+        "snapshots": [],
+        "status": "empty",
+        "error": None,
+    }
 
     class FakeCache:
         def __init__(self):

@@ -785,6 +785,30 @@ def test_research_markets_history_prefers_fresher_source(monkeypatch):
     assert payload["history"][0]["analytics"]["current_price"] == 0.85
 
 
+def test_research_markets_flags_missing_lookback_history(monkeypatch):
+    """research_markets should flag markets with no data in the requested lookback window."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+
+    market = _make_market("m-active")
+
+    class FakeSource:
+        def get_markets(self, **kw):
+            return [market]
+
+        def get_price_history(self, *a, **kw):
+            return []
+
+    monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (FakeSource(), "fake-source"))
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(FakeSource(), "fake-source")])
+
+    result = _run(mcp_server.call_tool("research_markets", {"platform": "polymarket", "limit": 1}))
+    payload = _payload(result)
+    assert payload["ok"]
+    assert payload["history"][0]["warning"] == "No price data found in the requested lookback window."
+    assert payload["history"][0]["analytics"]["last_point_timestamp"] is None
+    assert payload["history"][0]["analytics"]["has_24h_reference"] is False
+
+
 # ---------------------------------------------------------------------------
 # research_markets active_only filters resolved markets
 # ---------------------------------------------------------------------------
@@ -911,6 +935,98 @@ def test_sync_data_zero_with_category_includes_warning(monkeypatch):
     payload = _payload(result)
     assert payload["ok"] is True
     assert "warning" in payload
+
+
+def test_sync_data_processed_without_live_data_adds_warning(monkeypatch):
+    """sync_data should warn when a market is processed but no live data is fetched."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+
+    class FakeClient:
+        def get_markets(self, **kw):
+            return [_make_market("m1")]
+
+        def get_candlesticks(self, *a, **kw):
+            return []
+
+        def get_orderbook_snapshots(self, *a, **kw):
+            return []
+
+    class FakeCache:
+        def upsert_market(self, _m):
+            pass
+
+        def upsert_price_points_batch(self, *a, **kw):
+            pass
+
+        def mark_market_synced(self, *a):
+            pass
+
+    class FakeObStore:
+        def write(self, *a):
+            return 0
+
+    monkeypatch.setattr(mcp_server, "PmxtClient", FakeClient)
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _: FakeCache())
+    monkeypatch.setattr(mcp_server, "OrderBookStore", FakeObStore)
+
+    with patch.object(mcp_server, "get_engine"):
+        result = _run(mcp_server.call_tool("sync_data", {"platform": "polymarket", "limit": 1}))
+
+    payload = _payload(result)
+    assert payload["ok"] is True
+    assert payload["markets_synced"] == 1
+    assert payload["markets_processed"] == 1
+    assert payload["markets_with_live_data"] == 0
+    assert "warning" in payload
+    assert any(w["type"] == "NoLiveData" for w in payload["warnings"])
+    assert payload["market_results"][0]["has_live_data"] is False
+    assert payload["market_results"][0]["candles_status"] == "empty"
+    assert payload["market_results"][0]["orderbook_status"] == "empty"
+
+
+def test_sync_data_surfaces_pmxt_fetch_errors(monkeypatch):
+    """sync_data should expose PMXT fetch errors in warnings instead of collapsing them silently."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+
+    class FakeClient:
+        def get_markets(self, **kw):
+            return [_make_market("m1")]
+
+        def get_candlesticks_with_status(self, *a, **kw):
+            return {"points": [], "status": "error", "error": "ohlcv boom"}
+
+        def get_orderbook_snapshots_with_status(self, *a, **kw):
+            return {"snapshots": [], "status": "error", "error": "book boom"}
+
+    class FakeCache:
+        def upsert_market(self, _m):
+            pass
+
+        def upsert_price_points_batch(self, *a, **kw):
+            pass
+
+        def mark_market_synced(self, *a):
+            pass
+
+    class FakeObStore:
+        def write(self, *a):
+            return 0
+
+    monkeypatch.setattr(mcp_server, "PmxtClient", FakeClient)
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _: FakeCache())
+    monkeypatch.setattr(mcp_server, "OrderBookStore", FakeObStore)
+
+    with patch.object(mcp_server, "get_engine"):
+        result = _run(mcp_server.call_tool("sync_data", {"platform": "polymarket", "limit": 1}))
+
+    payload = _payload(result)
+    warning_types = {w["type"] for w in payload["warnings"]}
+    assert payload["ok"] is True
+    assert "CandlesFetchError" in warning_types
+    assert "OrderbookFetchError" in warning_types
+    assert "NoLiveData" in warning_types
+    assert payload["market_results"][0]["candles_status"] == "error"
+    assert payload["market_results"][0]["orderbook_status"] == "error"
 
 
 # ---------------------------------------------------------------------------

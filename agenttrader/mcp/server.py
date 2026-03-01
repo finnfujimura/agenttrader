@@ -86,13 +86,18 @@ def _compute_history_analytics(history: list, end_ts: int) -> dict:
             "trend_direction": None,
             "volatility": None,
             "points": 0,
+            "last_point_timestamp": None,
+            "hours_since_last_point": None,
+            "has_24h_reference": False,
         }
 
     prices = [float(h.yes_price) for h in history]
     current_price = prices[-1]
     avg_7d = sum(prices) / len(prices)
+    last_point_ts = int(history[-1].timestamp)
     cutoff_24h = end_ts - 24 * 3600
     recent_24h = [h for h in history if int(h.timestamp) >= cutoff_24h]
+    has_24h_reference = bool(recent_24h)
     if recent_24h:
         oldest_24h_price = float(recent_24h[0].yes_price)
         price_change_24h = current_price - oldest_24h_price
@@ -116,6 +121,9 @@ def _compute_history_analytics(history: list, end_ts: int) -> dict:
         "trend_direction": trend_direction,
         "volatility": statistics.pstdev(prices) if len(prices) > 1 else 0.0,
         "points": len(prices),
+        "last_point_timestamp": last_point_ts,
+        "hours_since_last_point": max(0.0, (end_ts - last_point_ts) / 3600.0),
+        "has_24h_reference": has_24h_reference,
     }
 
 
@@ -303,6 +311,42 @@ def _select_freshest_history(market_id: str, platform: str, start_ts: int, end_t
             freshest = (source_name, history)
             freshest_ts = latest_ts
     return freshest
+
+
+def _fetch_pmxt_candles(client, market, start_ts: int, end_ts: int, interval_minutes: int) -> dict:
+    condition_id = _candlestick_market_id(market)
+    if hasattr(client, "get_candlesticks_with_status"):
+        result = client.get_candlesticks_with_status(condition_id, market.platform, start_ts, end_ts, interval_minutes)
+        return {
+            "points": list(result.get("points", [])),
+            "status": str(result.get("status", "empty")),
+            "error": result.get("error"),
+        }
+
+    points = client.get_candlesticks(condition_id, market.platform, start_ts, end_ts, interval_minutes)
+    return {
+        "points": list(points),
+        "status": "ok" if points else "empty",
+        "error": None,
+    }
+
+
+def _fetch_pmxt_orderbooks(client, market, start_ts: int, end_ts: int, limit: int = 100) -> dict:
+    if hasattr(client, "get_orderbook_snapshots_with_status"):
+        result = client.get_orderbook_snapshots_with_status(market.id, market.platform, start_ts, end_ts, limit)
+        return {
+            "snapshots": list(result.get("snapshots", [])),
+            "status": str(result.get("status", "empty")),
+            "error": result.get("error"),
+        }
+
+    snapshots = client.get_orderbook_snapshots(market.id, market.platform, start_ts, end_ts, limit)
+    status = "ok" if any(getattr(snapshot, "bids", None) or getattr(snapshot, "asks", None) for snapshot in snapshots) else "empty"
+    return {
+        "snapshots": list(snapshots),
+        "status": status,
+        "error": None,
+    }
 
 
 @server.list_tools()
@@ -782,6 +826,8 @@ async def call_tool(name: str, arguments: dict):
                     pts = freshest[1] if freshest is not None else []
                     analytics = _compute_history_analytics(pts, end_ts)
                     entry = {"ok": True, "market_id": mid, "days": days, "analytics": analytics}
+                    if analytics["points"] == 0:
+                        entry["warning"] = "No price data found in the requested lookback window."
                     if include_raw:
                         entry["history"] = [h.__dict__ for h in pts]
                     history.append(entry)
@@ -1084,18 +1130,77 @@ async def call_tool(name: str, arguments: dict):
             pp = 0
             ob_files = 0
             synced = 0
+            markets_with_price_points = 0
+            markets_with_orderbooks = 0
+            markets_with_live_data = 0
             errors = []
+            warnings = []
+            market_results = []
             for m in markets:
                 try:
                     cache.upsert_market(m)
-                    candles = client.get_candlesticks(_candlestick_market_id(m), m.platform, start_ts, end_ts, interval_minutes)
+                    candles_result = _fetch_pmxt_candles(client, m, start_ts, end_ts, interval_minutes)
+                    candles = candles_result["points"]
                     gran_label = {"minute": "1m", "hourly": "1h", "daily": "1d"}.get(granularity, "1h")
                     cache.upsert_price_points_batch(m.id, _market_platform_value(m), candles, source="pmxt", granularity=gran_label)
                     pp += len(candles)
-                    ob = client.get_orderbook_snapshots(m.id, m.platform, start_ts, end_ts, 100)
-                    ob_files += ob_store.write(_market_platform_value(m), m.id, ob)
+                    if candles:
+                        markets_with_price_points += 1
+
+                    orderbook_result = _fetch_pmxt_orderbooks(client, m, start_ts, end_ts, 100)
+                    ob = orderbook_result["snapshots"]
+                    written_files = ob_store.write(_market_platform_value(m), m.id, ob)
+                    ob_files += written_files
+                    if written_files > 0:
+                        markets_with_orderbooks += 1
+
+                    has_live_data = bool(candles) or written_files > 0
+                    if has_live_data:
+                        markets_with_live_data += 1
+
+                    market_warning_types = []
+                    if candles_result["status"] == "error":
+                        warnings.append({
+                            "market_id": m.id,
+                            "type": "CandlesFetchError",
+                            "message": f"PMXT candles fetch failed for {m.id}",
+                            "detail": candles_result["error"],
+                        })
+                        market_warning_types.append("CandlesFetchError")
+                    elif not candles:
+                        market_warning_types.append("NoPricePoints")
+
+                    if orderbook_result["status"] == "error":
+                        warnings.append({
+                            "market_id": m.id,
+                            "type": "OrderbookFetchError",
+                            "message": f"PMXT orderbook fetch failed for {m.id}",
+                            "detail": orderbook_result["error"],
+                        })
+                        market_warning_types.append("OrderbookFetchError")
+                    elif written_files == 0:
+                        market_warning_types.append("NoOrderbooks")
+
+                    if not has_live_data:
+                        warnings.append({
+                            "market_id": m.id,
+                            "type": "NoLiveData",
+                            "message": f"No live candles or orderbook snapshots were returned for {m.id} in the requested window.",
+                        })
+                        market_warning_types.append("NoLiveData")
+
                     cache.mark_market_synced(m.id, int(time.time()))
                     synced += 1
+                    market_results.append({
+                        "market_id": m.id,
+                        "platform": _market_platform_value(m),
+                        "price_points_fetched": len(candles),
+                        "orderbook_files_written": written_files,
+                        "has_live_data": has_live_data,
+                        "candles_status": candles_result["status"],
+                        "orderbook_status": orderbook_result["status"],
+                        "warning_types": market_warning_types,
+                    })
                 except Exception as exc:
                     errors.append({"market_id": m.id, "error": str(exc)})
 
@@ -1114,10 +1219,22 @@ async def call_tool(name: str, arguments: dict):
             result = {
                 "ok": len(errors) == 0,
                 "markets_synced": synced,
+                "markets_processed": synced,
                 "price_points_fetched": pp,
                 "orderbook_files_written": ob_files,
+                "markets_with_price_points": markets_with_price_points,
+                "markets_with_orderbooks": markets_with_orderbooks,
+                "markets_with_live_data": markets_with_live_data,
+                "market_results": market_results,
                 "errors": errors,
             }
+            if warnings:
+                result["warnings"] = warnings
+            if synced > 0 and markets_with_live_data == 0 and not errors:
+                result["warning"] = (
+                    "Markets were processed, but no live candles or orderbook snapshots were returned "
+                    "for the requested sync window."
+                )
             if synced == 0 and not errors and not market_ids and (category or platform != "all"):
                 result["warning"] = (
                     "No markets matched your filters. "

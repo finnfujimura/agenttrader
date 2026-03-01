@@ -118,8 +118,19 @@ class PmxtClient:
         end_time: int,
         interval: int = 60,
     ) -> list[PricePoint]:
+        return self.get_candlesticks_with_status(condition_id, platform, start_time, end_time, interval)["points"]
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    def get_candlesticks_with_status(
+        self,
+        condition_id: str,
+        platform: Platform,
+        start_time: int,
+        end_time: int,
+        interval: int = 60,
+    ) -> dict[str, Any]:
         if end_time <= start_time:
-            return []
+            return {"points": [], "status": "empty", "error": None}
 
         client = self._poly if platform == Platform.POLYMARKET else self._kalshi
         resolution = self._resolution_from_interval(interval)
@@ -138,8 +149,8 @@ class PmxtClient:
                 end=end_dt,
                 limit=limit,
             )
-        except Exception:
-            return []
+        except Exception as exc:
+            return {"points": [], "status": "error", "error": str(exc)}
 
         points: list[PricePoint] = []
         for candle in candles or []:
@@ -160,7 +171,8 @@ class PmxtClient:
             )
 
         points.sort(key=lambda p: p.timestamp)
-        return points
+        status = "ok" if points else "empty"
+        return {"points": points, "status": status, "error": None}
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def get_orderbook_snapshots(
@@ -171,13 +183,24 @@ class PmxtClient:
         end_time: int,
         limit: int = 100,
     ) -> list[OrderBook]:
+        return self.get_orderbook_snapshots_with_status(market_id, platform, start_time, end_time, limit)["snapshots"]
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    def get_orderbook_snapshots_with_status(
+        self,
+        market_id: str,
+        platform: Platform,
+        start_time: int,
+        end_time: int,
+        limit: int = 100,
+    ) -> dict[str, Any]:
         # pmxt provides current live book snapshots rather than historical snapshots.
         _ = (start_time, end_time, limit)
         client = self._poly if platform == Platform.POLYMARKET else self._kalshi
         try:
             book = client.fetch_order_book(market_id)
-        except Exception:
-            return []
+        except Exception as exc:
+            return {"snapshots": [], "status": "error", "error": str(exc)}
         timestamp = int(time.time())
         bids = [
             OrderLevel(
@@ -193,7 +216,9 @@ class PmxtClient:
             )
             for level in (getattr(book, "asks", None) or [])
         ]
-        return [OrderBook(market_id=market_id, timestamp=timestamp, bids=bids, asks=asks)]
+        snapshots = [OrderBook(market_id=market_id, timestamp=timestamp, bids=bids, asks=asks)]
+        status = "ok" if bids or asks else "empty"
+        return {"snapshots": snapshots, "status": status, "error": None}
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def get_matching_markets(
