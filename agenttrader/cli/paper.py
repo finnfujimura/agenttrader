@@ -85,7 +85,8 @@ def paper_start(strategy_path: str, initial_cash: float | None, no_daemon: bool,
         daemon._run()
         return
 
-    pid = daemon.start_as_daemon()
+    proc = daemon.start_as_daemon()
+    pid = proc.pid
     with get_session(db_engine) as session:
         row = session.get(PaperPortfolio, portfolio_id)
         if row:

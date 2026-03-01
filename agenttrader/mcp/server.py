@@ -273,7 +273,7 @@ async def list_tools() -> list[types.Tool]:
                 "Use for paper trading or when you need real-time prices. "
                 "Not needed for backtesting if the indexed dataset is available."
             ),
-            inputSchema={"type": "object", "properties": {"days": {"type": "integer", "default": 7}, "platform": {"type": "string", "default": "all"}, "market_ids": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "default": 100}}},
+            inputSchema={"type": "object", "properties": {"days": {"type": "integer", "default": 7}, "platform": {"type": "string", "default": "all"}, "market_ids": {"type": "array", "items": {"type": "string"}}, "limit": {"type": "integer", "default": 100}, "category": {"type": "string", "description": "Filter markets by category (e.g. politics, crypto, sports)"}, "resolved": {"type": "boolean", "default": False, "description": "Include resolved/closed markets"}, "granularity": {"type": "string", "enum": ["minute", "hourly", "daily"], "default": "hourly", "description": "Candlestick granularity"}}},
         ),
         types.Tool(
             name="debug_data_sources",
@@ -542,6 +542,11 @@ async def call_tool(name: str, arguments: dict):
                 mkwargs["tags"] = tags
             markets = source.get_markets(**mkwargs)
 
+            # Post-filter by market_ids if provided
+            if market_ids:
+                id_set = set(market_ids)
+                markets = [m for m in markets if m.id in id_set]
+
             # Get history for each market
             end_ts = int(time.time())
             start_ts = end_ts - days * 24 * 3600
@@ -792,6 +797,15 @@ async def call_tool(name: str, arguments: dict):
 
         if name == "list_paper_trades":
             rows = cache.list_paper_portfolios()
+            # Auto-correct stale "running" rows where the daemon PID is dead
+            for p in rows:
+                if p.status == "running" and p.pid and not _pid_alive(int(p.pid)):
+                    with get_session(get_engine()) as session:
+                        row = session.get(PaperPortfolio, p.id)
+                        if row:
+                            row.status = "dead"
+                            session.commit()
+                    p.status = "dead"
             return _respond({"ok": True, "portfolios": [{"id": p.id, "status": p.status, "pid": p.pid} for p in rows]})
 
         if name == "sync_data":
@@ -800,7 +814,17 @@ async def call_tool(name: str, arguments: dict):
             platform = args.get("platform", "all")
             market_ids = args.get("market_ids")
             limit = int(args.get("limit", 100))
-            markets = client.get_markets(platform=platform, market_ids=market_ids, limit=limit)
+            category = args.get("category")
+            resolved = args.get("resolved", False)
+            granularity = args.get("granularity", "hourly")
+            granularity_map = {"minute": 1, "hourly": 60, "daily": 1440}
+            interval_minutes = granularity_map.get(granularity, 60)
+            mk = {"platform": platform, "market_ids": market_ids, "limit": limit}
+            if category:
+                mk["category"] = category
+            if resolved:
+                mk["resolved"] = resolved
+            markets = client.get_markets(**mk)
 
             start_ts = int(time.time()) - days * 24 * 3600
             end_ts = int(time.time())
@@ -812,8 +836,9 @@ async def call_tool(name: str, arguments: dict):
             for m in markets:
                 try:
                     cache.upsert_market(m)
-                    candles = client.get_candlesticks(m.condition_id, m.platform, start_ts, end_ts, 60)
-                    cache.upsert_price_points_batch(m.id, m.platform.value, candles, source="pmxt", granularity="1h")
+                    candles = client.get_candlesticks(m.condition_id, m.platform, start_ts, end_ts, interval_minutes)
+                    gran_label = {"minute": "1m", "hourly": "1h", "daily": "1d"}.get(granularity, "1h")
+                    cache.upsert_price_points_batch(m.id, m.platform.value, candles, source="pmxt", granularity=gran_label)
                     pp += len(candles)
                     ob = client.get_orderbook_snapshots(m.id, m.platform, start_ts, end_ts, 100)
                     ob_files += ob_store.write(m.platform.value, m.id, ob)
@@ -821,6 +846,14 @@ async def call_tool(name: str, arguments: dict):
                     synced += 1
                 except Exception as exc:
                     errors.append({"market_id": m.id, "error": str(exc)})
+
+            if market_ids and synced == 0 and len(errors) == 0:
+                return _respond({
+                    "ok": False,
+                    "error": "NoMarketsFound",
+                    "message": f"None of the {len(market_ids)} requested market_ids were found.",
+                    "fix": "Check market_ids are correct and PMXT credentials are configured.",
+                })
 
             return _respond(
                 {

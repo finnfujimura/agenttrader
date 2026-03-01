@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import inspect
+import logging
 import os
 import signal
 import subprocess
@@ -18,12 +19,14 @@ from types import ModuleType
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
+LOGGER = logging.getLogger(__name__)
+
 from agenttrader.config import load_config
 from agenttrader.core.base_strategy import BaseStrategy
 from agenttrader.core.context import LiveContext
 from agenttrader.data.cache import DataCache
 from agenttrader.data.orderbook_store import OrderBookStore
-from agenttrader.db import get_engine
+from agenttrader.db import get_engine, get_session
 from agenttrader.db.schema import PaperPortfolio
 
 
@@ -114,6 +117,17 @@ class PaperDaemon:
 
         try:
             asyncio.run(self._main_loop())
+        except Exception:
+            LOGGER.exception("Daemon crash for portfolio %s", self.portfolio_id)
+            try:
+                with get_session(get_engine()) as session:
+                    row = session.get(PaperPortfolio, self.portfolio_id)
+                    if row:
+                        row.status = "failed"
+                        session.commit()
+            except Exception:
+                LOGGER.exception("Failed to mark portfolio %s as failed", self.portfolio_id)
+            raise
         finally:
             if self._runtime.observer:
                 self._runtime.observer.stop()
@@ -190,7 +204,10 @@ class PaperDaemon:
                     orderbook = self._runtime.context.get_orderbook(market_id)
                 except Exception:
                     orderbook = None
-                self._runtime.strategy.on_market_data(market, latest.yes_price, orderbook)
+                try:
+                    self._runtime.strategy.on_market_data(market, latest.yes_price, orderbook)
+                except Exception:
+                    LOGGER.exception("on_market_data error for %s", market_id)
                 msg = f"Price update: {market.title[:30]} = {latest.yes_price:.3f}"
                 self._runtime.context.log(msg)
                 if self._emit_stdout:
@@ -200,7 +217,10 @@ class PaperDaemon:
             if now >= next_schedule:
                 now_dt = datetime.now(tz=UTC)
                 for market in subscriptions.values():
-                    self._runtime.strategy.on_schedule(now_dt, market)
+                    try:
+                        self._runtime.strategy.on_schedule(now_dt, market)
+                    except Exception:
+                        LOGGER.exception("on_schedule error for %s", getattr(market, "id", "?"))
                 next_schedule = now + interval_seconds
 
             await asyncio.sleep(1.0)

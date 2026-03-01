@@ -133,7 +133,9 @@ class ParquetDataAdapter:
         if min_volume is not None:
             where.append("volume >= ?")
             params.append(float(min_volume))
-        params.append(int(limit))
+        # Overfetch when category filter is active (category is inferred in Python, not SQL)
+        sql_limit = limit * 10 if category else limit
+        params.append(int(sql_limit))
         query = f"""
             SELECT
                 json_extract_string(clob_token_ids, '$[0]') AS id,
@@ -182,7 +184,7 @@ class ParquetDataAdapter:
                     scalar_high=None,
                 )
             )
-        return out
+        return out[:limit]
 
     def _get_kalshi_markets(
         self,
@@ -201,7 +203,9 @@ class ParquetDataAdapter:
         if min_volume is not None:
             where.append("volume / 100.0 >= ?")
             params.append(float(min_volume))
-        params.append(int(limit))
+        # Overfetch when category filter is active (category is inferred in Python, not SQL)
+        sql_limit = limit * 10 if category else limit
+        params.append(int(sql_limit))
         query = f"""
             SELECT
                 ticker,
@@ -244,7 +248,7 @@ class ParquetDataAdapter:
                     scalar_high=None,
                 )
             )
-        return out
+        return out[:limit]
 
     def _get_polymarket_price_history(self, market_id: str, start_ts: int, end_ts: int) -> list[PricePoint]:
         self._require_conn()
