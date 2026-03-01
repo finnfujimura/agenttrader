@@ -22,7 +22,8 @@
       "Bash(du:*)",
       "Bash(rtk grep:*)",
       "Bash(rtk test:*)",
-      "Bash(source:*)"
+      "Bash(source:*)",
+      "Bash(rtk git:*)"
     ]
   }
 }
