@@ -6,10 +6,14 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _clean_selector_cache():
-    """Remove cached module so each test gets fresh imports."""
-    sys.modules.pop("agenttrader.data.source_selector", None)
+    """Remove cached module so each test gets fresh imports and clear source cache."""
+    mod = sys.modules.pop("agenttrader.data.source_selector", None)
+    if mod and hasattr(mod, "invalidate_source_cache"):
+        mod.invalidate_source_cache()
     yield
-    sys.modules.pop("agenttrader.data.source_selector", None)
+    mod = sys.modules.pop("agenttrader.data.source_selector", None)
+    if mod and hasattr(mod, "invalidate_source_cache"):
+        mod.invalidate_source_cache()
 
 
 def _make_mock_module(name, **attrs):

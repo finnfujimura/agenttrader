@@ -63,14 +63,13 @@ def test_compute_capabilities_with_index():
     from agenttrader.mcp.server import _compute_capabilities
 
     mock_adapter = MagicMock()
-    mock_adapter.is_available.return_value = True
     mock_adapter.get_market_date_ranges.return_value = {"m1": (1717200000, 1739577600)}
 
     mock_cache = MagicMock()
     mock_cache.get_latest_price.return_value = None
 
     markets = [_make_market("m1")]
-    with patch("agenttrader.mcp.server.BacktestIndexAdapter", return_value=mock_adapter):
+    with patch("agenttrader.mcp.server._get_cached_index_adapter", return_value=mock_adapter):
         caps = _compute_capabilities(markets, mock_cache)
 
     assert caps["m1"]["backtest"]["index_available"] is True
@@ -82,15 +81,11 @@ def test_compute_capabilities_without_index():
     """Backtest fields are false/null when no index available."""
     from agenttrader.mcp.server import _compute_capabilities
 
-    mock_adapter = MagicMock()
-    mock_adapter.is_available.return_value = False
-    mock_adapter.get_market_date_ranges.return_value = {}
-
     mock_cache = MagicMock()
     mock_cache.get_latest_price.return_value = None
 
     markets = [_make_market("m1")]
-    with patch("agenttrader.mcp.server.BacktestIndexAdapter", return_value=mock_adapter):
+    with patch("agenttrader.mcp.server._get_cached_index_adapter", return_value=None):
         caps = _compute_capabilities(markets, mock_cache)
 
     assert caps["m1"]["backtest"]["index_available"] is False
@@ -102,15 +97,11 @@ def test_compute_capabilities_cache_available():
     """history.cache_available is true when cache has data."""
     from agenttrader.mcp.server import _compute_capabilities
 
-    mock_adapter = MagicMock()
-    mock_adapter.is_available.return_value = False
-    mock_adapter.get_market_date_ranges.return_value = {}
-
     mock_cache = MagicMock()
     mock_cache.get_latest_price.return_value = SimpleNamespace(timestamp=1709049600, yes_price=0.65)
 
     markets = [_make_market("m1")]
-    with patch("agenttrader.mcp.server.BacktestIndexAdapter", return_value=mock_adapter):
+    with patch("agenttrader.mcp.server._get_cached_index_adapter", return_value=None):
         caps = _compute_capabilities(markets, mock_cache)
 
     assert caps["m1"]["history"]["cache_available"] is True
@@ -121,15 +112,11 @@ def test_compute_capabilities_cache_empty():
     """History fields are false/null when no cache data."""
     from agenttrader.mcp.server import _compute_capabilities
 
-    mock_adapter = MagicMock()
-    mock_adapter.is_available.return_value = False
-    mock_adapter.get_market_date_ranges.return_value = {}
-
     mock_cache = MagicMock()
     mock_cache.get_latest_price.return_value = None
 
     markets = [_make_market("m1")]
-    with patch("agenttrader.mcp.server.BacktestIndexAdapter", return_value=mock_adapter):
+    with patch("agenttrader.mcp.server._get_cached_index_adapter", return_value=None):
         caps = _compute_capabilities(markets, mock_cache)
 
     assert caps["m1"]["history"]["cache_available"] is False
@@ -140,15 +127,11 @@ def test_compute_capabilities_resolved_market():
     """sync.can_attempt_live_sync is false for resolved markets."""
     from agenttrader.mcp.server import _compute_capabilities
 
-    mock_adapter = MagicMock()
-    mock_adapter.is_available.return_value = False
-    mock_adapter.get_market_date_ranges.return_value = {}
-
     mock_cache = MagicMock()
     mock_cache.get_latest_price.return_value = None
 
     markets = [_make_market("m1", resolved=True)]
-    with patch("agenttrader.mcp.server.BacktestIndexAdapter", return_value=mock_adapter):
+    with patch("agenttrader.mcp.server._get_cached_index_adapter", return_value=None):
         caps = _compute_capabilities(markets, mock_cache)
 
     assert caps["m1"]["sync"]["can_attempt_live_sync"] is False
@@ -163,14 +146,10 @@ def test_research_markets_includes_capabilities():
     mock_source.get_markets.return_value = [market]
     mock_source.get_price_history.return_value = []
 
-    mock_adapter = MagicMock()
-    mock_adapter.is_available.return_value = False
-    mock_adapter.get_market_date_ranges.return_value = {}
-
     with patch("agenttrader.mcp.server.is_initialized", return_value=True), \
          patch("agenttrader.mcp.server.get_best_data_source", return_value=(mock_source, "sqlite-cache")), \
          patch("agenttrader.mcp.server.get_all_sources", return_value=[(mock_source, "sqlite-cache")]), \
-         patch("agenttrader.mcp.server.BacktestIndexAdapter", return_value=mock_adapter):
+         patch("agenttrader.mcp.server._get_cached_index_adapter", return_value=None):
         from agenttrader.mcp.server import call_tool
         result = _run(call_tool("research_markets", {"platform": "polymarket", "limit": 1, "days": 1}))
 
@@ -189,13 +168,9 @@ def test_get_markets_capabilities_opt_in():
     mock_source = MagicMock()
     mock_source.get_markets.return_value = [market]
 
-    mock_adapter = MagicMock()
-    mock_adapter.is_available.return_value = False
-    mock_adapter.get_market_date_ranges.return_value = {}
-
     with patch("agenttrader.mcp.server.is_initialized", return_value=True), \
          patch("agenttrader.mcp.server.get_best_data_source", return_value=(mock_source, "normalized-index")), \
-         patch("agenttrader.mcp.server.BacktestIndexAdapter", return_value=mock_adapter):
+         patch("agenttrader.mcp.server._get_cached_index_adapter", return_value=None):
         from agenttrader.mcp.server import call_tool
         result = _run(call_tool("get_markets", {"platform": "polymarket", "limit": 5, "include_capabilities": True}))
 

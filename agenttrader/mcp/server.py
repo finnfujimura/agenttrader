@@ -27,7 +27,7 @@ from agenttrader.data.backtest_artifacts import read_backtest_artifact, write_ba
 from agenttrader.data.cache import DataCache
 from agenttrader.data.models import ExecutionMode
 from agenttrader.data.index_adapter import BacktestIndexAdapter
-from agenttrader.data.source_selector import get_best_data_source, get_all_sources
+from agenttrader.data.source_selector import get_best_data_source, get_all_sources, invalidate_source_cache
 from agenttrader.db.health import check_schema
 from agenttrader.errors import AgentTraderError
 from agenttrader.data.pmxt_client import PmxtClient
@@ -43,6 +43,27 @@ MCP_SESSION_ID = f"mcp-{uuid.uuid4().hex[:12]}"
 
 def _text(obj) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=json.dumps(obj, default=str))]
+
+
+_cached_index_adapter: BacktestIndexAdapter | None = None
+_cached_index_checked = False
+
+
+def _get_cached_index_adapter() -> BacktestIndexAdapter | None:
+    """Return a cached BacktestIndexAdapter if the index is available, else None."""
+    global _cached_index_adapter, _cached_index_checked
+    if _cached_index_checked:
+        return _cached_index_adapter
+    _cached_index_checked = True
+    try:
+        adapter = BacktestIndexAdapter()
+        if adapter.is_available():
+            _cached_index_adapter = adapter
+        else:
+            adapter.close()
+    except Exception:
+        pass
+    return _cached_index_adapter
 
 
 DEFAULT_FIXES = {
@@ -136,13 +157,12 @@ def _compute_capabilities(markets: list, cache) -> dict[str, dict]:
     ids = [getattr(m, "id", None) or m.get("id") for m in markets]
     ids = [mid for mid in ids if mid]
 
-    # Backtest index ranges (single DuckDB query)
+    # Backtest index ranges (single DuckDB query, reuse cached adapter)
     index_ranges: dict[str, tuple[int, int]] = {}
     try:
-        adapter = BacktestIndexAdapter()
-        if adapter.is_available():
+        adapter = _get_cached_index_adapter()
+        if adapter is not None:
             index_ranges = adapter.get_market_date_ranges(ids)
-        adapter.close()
     except Exception:
         pass
 
@@ -323,10 +343,10 @@ def _resolve_market_ids_for_sync(market_ids: list[str] | None, *, platform: str,
 
 
 def _candlestick_market_id(market) -> str:
-    if _market_platform_value(market) == "polymarket":
-        condition_id = getattr(market, "condition_id", None)
-        if condition_id is not None and str(condition_id).strip():
-            return str(condition_id)
+    # Always use market.id (the token/outcome ID) for OHLCV fetches.
+    # market.condition_id differs between sources (PmxtClient sets it to the
+    # outcome_id, while parquet uses the real Polymarket condition_id) and pmxt's
+    # fetch_ohlcv expects the token ID, not the event-level condition_id.
     return str(getattr(market, "id"))
 
 
@@ -689,6 +709,24 @@ async def call_tool(name: str, arguments: dict):
 
             freshest = _select_freshest_history(market_id, platform, start_ts, end_ts)
             if freshest is None:
+                # Distinguish "market exists but no data in window" from "market unknown"
+                known_price = _select_freshest_price(market_id, platform)
+                if known_price is not None:
+                    # Market exists — just no data in the requested lookback
+                    price_source, latest = known_price
+                    payload = {
+                        "ok": True,
+                        "data_source": price_source,
+                        "market_id": market_id,
+                        "days": days,
+                        "analytics": _compute_history_analytics([], end_ts),
+                        "warning": (
+                            f"No history points found in the requested {days}-day lookback window. "
+                            f"The market has data outside this range (last point: "
+                            f"{datetime.fromtimestamp(int(latest.timestamp), tz=UTC).isoformat()})."
+                        ),
+                    }
+                    return _respond(payload)
                 return _respond(
                     _error_payload(
                         "MarketNotFound",
@@ -1318,6 +1356,8 @@ async def call_tool(name: str, arguments: dict):
                     "No markets matched your filters. "
                     "Try broadening category/platform or check available markets with get_markets."
                 )
+            # Invalidate cached sources so subsequent calls see freshly synced data
+            invalidate_source_cache()
             return _respond(result)
 
         if name == "debug_data_sources":

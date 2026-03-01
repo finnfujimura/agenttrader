@@ -168,7 +168,9 @@ def test_sync_data_market_ids_prefers_local_metadata(monkeypatch):
     assert payload["markets_synced"] == 1
     assert payload["price_points_fetched"] == 1
     assert client.candle_args is not None
-    assert client.candle_args[0] == "poly-condition-id"
+    # Candles are fetched with market.id (token ID), not condition_id,
+    # to keep OHLCV identity consistent across all data sources.
+    assert client.candle_args[0] == "poly-yes-token"
     assert client.orderbook_args is not None
     assert client.orderbook_args[0] == "poly-yes-token"
     assert shared_cache.points[0][0] == "poly-yes-token"
