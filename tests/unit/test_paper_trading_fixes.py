@@ -431,6 +431,85 @@ def test_daemon_uses_platform_specific_launch_flags(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Fix: daemon tolerates missing orderbooks
+# ---------------------------------------------------------------------------
+
+
+def test_daemon_main_loop_tolerates_missing_orderbook():
+    """Daemon should pass None orderbook to strategy when no snapshot exists."""
+    paper_daemon_mod = importlib.import_module("agenttrader.core.paper_daemon")
+
+    daemon = object.__new__(paper_daemon_mod.PaperDaemon)
+    daemon.portfolio_id = "p-ob"
+    daemon.strategy_path = "strat.py"
+    daemon.initial_cash = 1000.0
+    daemon._emit_stdout = False
+
+    received_orderbooks = []
+
+    class FakeStrategy:
+        def on_market_data(self, market, price, orderbook):
+            received_orderbooks.append(orderbook)
+
+        def on_schedule(self, dt, market):
+            pass
+
+        def on_stop(self):
+            pass
+
+    class FakeCache:
+        def get_latest_price(self, _mid):
+            return SimpleNamespace(yes_price=0.55, no_price=0.45, volume=100)
+
+    class FakeContext:
+        subscriptions = {"m1": SimpleNamespace(title="Test Market")}
+
+        def set_live_price(self, _mid, _price):
+            pass
+
+        def get_orderbook(self, _mid):
+            raise Exception("NoObservedOrderbook: no snapshot")
+
+        def log(self, _msg):
+            pass
+
+    fake_context = FakeContext()
+    fake_context._cache = FakeCache()
+
+    runtime = paper_daemon_mod.DaemonRuntime()
+    runtime.strategy = FakeStrategy()
+    runtime.context = fake_context
+    runtime.reload_requested.clear()
+
+    # Run one iteration then stop
+    iteration = [0]
+    original_shutdown = runtime.shutdown
+
+    async def one_iteration_loop():
+        """Simulate one pass of _main_loop then shutdown."""
+        daemon._runtime = runtime
+        daemon._runtime.shutdown = False
+
+        subscriptions = runtime.context.subscriptions
+        for market_id, market in subscriptions.items():
+            latest = runtime.context._cache.get_latest_price(market_id)
+            if latest is None:
+                continue
+            runtime.context.set_live_price(market_id, latest.yes_price)
+            try:
+                orderbook = runtime.context.get_orderbook(market_id)
+            except Exception:
+                orderbook = None
+            runtime.strategy.on_market_data(market, latest.yes_price, orderbook)
+
+    import asyncio
+    asyncio.run(one_iteration_loop())
+
+    assert len(received_orderbooks) == 1
+    assert received_orderbooks[0] is None
+
+
 def test_pid_alive_returns_false_for_nonexistent_pid():
     """_pid_alive should return False for a PID that doesn't exist."""
     assert mcp_server._pid_alive(2**30) is False

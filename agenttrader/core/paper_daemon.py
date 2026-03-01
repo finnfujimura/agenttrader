@@ -186,7 +186,10 @@ class PaperDaemon:
                 if latest is None:
                     continue
                 self._runtime.context.set_live_price(market_id, latest.yes_price)
-                orderbook = self._runtime.context.get_orderbook(market_id)
+                try:
+                    orderbook = self._runtime.context.get_orderbook(market_id)
+                except Exception:
+                    orderbook = None
                 self._runtime.strategy.on_market_data(market, latest.yes_price, orderbook)
                 msg = f"Price update: {market.title[:30]} = {latest.yes_price:.3f}"
                 self._runtime.context.log(msg)
