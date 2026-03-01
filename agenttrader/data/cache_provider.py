@@ -16,8 +16,15 @@ class CacheProvider:
         self._cache = cache
         self._ob_store = ob_store
 
-    def get_markets(self, platform="all", category=None, limit=1000) -> list[Market]:
-        return self._cache.get_markets(platform=platform, category=category, limit=limit)
+    def get_markets(self, platform="all", category=None, active_only=False, limit=1000) -> list[Market]:
+        kwargs = {
+            "platform": platform,
+            "category": category,
+            "limit": limit,
+        }
+        if active_only:
+            kwargs["active_only"] = True
+        return self._cache.get_markets(**kwargs)
 
     def get_markets_by_ids(self, market_ids: list[str], platform: str = "all") -> list[Market]:
         out = []

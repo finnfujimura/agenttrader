@@ -73,6 +73,7 @@ class DataCache:
         platform: str | None = None,
         category: str | None = None,
         tags: list[str] | None = None,
+        active_only: bool = False,
         min_volume: float | None = None,
         limit: int = 100,
     ) -> list[Market]:
@@ -81,6 +82,8 @@ class DataCache:
             query = query.where(MarketRow.platform == platform)
         if category:
             query = query.where(MarketRow.category == category)
+        if active_only:
+            query = query.where(MarketRow.resolved == 0)
         if min_volume is not None:
             query = query.where(MarketRow.volume >= min_volume)
         query = query.order_by(desc(MarketRow.volume)).limit(limit)

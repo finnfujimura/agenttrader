@@ -90,6 +90,7 @@ class ParquetDataAdapter:
         self,
         platform: str = "all",
         category: str | None = None,
+        active_only: bool = False,
         resolved_only: bool = False,
         min_volume: float | None = None,
         limit: int = 100,
@@ -97,13 +98,13 @@ class ParquetDataAdapter:
         self._require_conn()
         wanted = platform.lower()
         if wanted == "polymarket":
-            return self._get_polymarket_markets(category, resolved_only, min_volume, limit)
+            return self._get_polymarket_markets(category, active_only, resolved_only, min_volume, limit)
         if wanted == "kalshi":
-            return self._get_kalshi_markets(category, resolved_only, min_volume, limit)
+            return self._get_kalshi_markets(category, active_only, resolved_only, min_volume, limit)
         if wanted == "all":
             per_platform = max(limit // 2, 1)
-            poly = self._get_polymarket_markets(category, resolved_only, min_volume, per_platform)
-            kalshi = self._get_kalshi_markets(category, resolved_only, min_volume, per_platform)
+            poly = self._get_polymarket_markets(category, active_only, resolved_only, min_volume, per_platform)
+            kalshi = self._get_kalshi_markets(category, active_only, resolved_only, min_volume, per_platform)
             combined = poly + kalshi
             combined.sort(key=lambda m: float(m.volume or 0.0), reverse=True)
             return combined[:limit]
@@ -235,15 +236,18 @@ class ParquetDataAdapter:
     def _get_polymarket_markets(
         self,
         category: str | None,
-        resolved_only: bool,
-        min_volume: float | None,
-        limit: int,
+        active_only: bool = False,
+        resolved_only: bool = False,
+        min_volume: float | None = None,
+        limit: int = 100,
     ) -> list[Market]:
         self._require_conn()
         if not self._poly_markets_view:
             return []
         where = ["1=1"]
         params: list[object] = []
+        if active_only:
+            where.append("closed = FALSE")
         if resolved_only:
             where.append("closed = TRUE")
         if min_volume is not None:
@@ -319,15 +323,18 @@ class ParquetDataAdapter:
     def _get_kalshi_markets(
         self,
         category: str | None,
-        resolved_only: bool,
-        min_volume: float | None,
-        limit: int,
+        active_only: bool = False,
+        resolved_only: bool = False,
+        min_volume: float | None = None,
+        limit: int = 100,
     ) -> list[Market]:
         self._require_conn()
         if not self._kalshi_markets_view:
             return []
         where = ["1=1"]
         params: list[object] = []
+        if active_only:
+            where.append("LOWER(status) != 'finalized'")
         if resolved_only:
             where.append("status = 'finalized'")
         if min_volume is not None:

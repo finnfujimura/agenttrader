@@ -374,6 +374,7 @@ def test_sync_data_zero_markets_returns_error(monkeypatch):
 
     monkeypatch.setattr(mcp_server, "PmxtClient", FakeClient)
     monkeypatch.setattr(mcp_server, "DataCache", lambda _: FakeCache())
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [])
 
     with patch.object(mcp_server, "get_engine"):
         result = _run(mcp_server.call_tool("sync_data", {
@@ -427,6 +428,7 @@ def test_sync_data_forwards_new_params(monkeypatch):
     monkeypatch.setattr(mcp_server, "PmxtClient", FakeClient)
     monkeypatch.setattr(mcp_server, "DataCache", lambda _: FakeCache())
     monkeypatch.setattr(mcp_server, "OrderBookStore", FakeObStore)
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [])
 
     with patch.object(mcp_server, "get_engine"):
         result = _run(mcp_server.call_tool("sync_data", {
@@ -685,6 +687,104 @@ def test_get_history_falls_back_to_cache(monkeypatch):
     assert payload["data_source"] == "sqlite-cache"
 
 
+def test_get_price_prefers_fresher_cache_over_stale_index(monkeypatch):
+    """get_price should prefer the freshest timestamp, not the first non-empty source."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+    from agenttrader.data.models import PricePoint
+
+    stale = PricePoint(timestamp=100, yes_price=0.25, no_price=0.75, volume=1)
+    fresh = PricePoint(timestamp=200, yes_price=0.85, no_price=0.15, volume=2)
+
+    class FakeIndex:
+        def get_latest_price(self, market_id, platform):
+            return stale
+
+    class FakeCache:
+        def get_latest_price(self, market_id):
+            return fresh
+
+    monkeypatch.setattr(
+        mcp_server,
+        "get_all_sources",
+        lambda: [(FakeIndex(), "normalized-index"), (FakeCache(), "sqlite-cache")],
+    )
+
+    result = _run(mcp_server.call_tool("get_price", {"market_id": "m1", "platform": "polymarket"}))
+    payload = _payload(result)
+    assert payload["ok"]
+    assert payload["data_source"] == "sqlite-cache"
+    assert payload["price"]["yes_price"] == 0.85
+
+
+def test_get_history_prefers_fresher_cache_over_stale_index(monkeypatch):
+    """get_history should prefer the freshest non-empty source."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+    from agenttrader.data.models import PricePoint
+
+    stale = PricePoint(timestamp=100, yes_price=0.25, no_price=0.75, volume=1)
+    fresh = PricePoint(timestamp=200, yes_price=0.85, no_price=0.15, volume=2)
+
+    class FakeIndex:
+        def get_price_history(self, market_id, platform, start, end):
+            return [stale]
+
+    class FakeCache:
+        def get_market(self, market_id):
+            return _make_market(market_id)
+
+        def get_price_history(self, market_id, start, end):
+            return [fresh]
+
+    monkeypatch.setattr(
+        mcp_server,
+        "get_all_sources",
+        lambda: [(FakeIndex(), "normalized-index"), (FakeCache(), "sqlite-cache")],
+    )
+
+    result = _run(mcp_server.call_tool("get_history", {"market_id": "m1", "days": 7}))
+    payload = _payload(result)
+    assert payload["ok"]
+    assert payload["data_source"] == "sqlite-cache"
+    assert payload["analytics"]["current_price"] == 0.85
+
+
+def test_research_markets_history_prefers_fresher_source(monkeypatch):
+    """research_markets should use the freshest history data for analytics."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+    from agenttrader.data.models import PricePoint
+
+    market = _make_market("m-active")
+    stale = PricePoint(timestamp=100, yes_price=0.25, no_price=0.75, volume=1)
+    fresh = PricePoint(timestamp=200, yes_price=0.85, no_price=0.15, volume=2)
+
+    class FakeMarketSource:
+        def get_markets(self, **kw):
+            return [market]
+
+    class FakeIndex:
+        def get_price_history(self, market_id, platform, start, end):
+            return [stale]
+
+    class FakeCache:
+        def get_market(self, market_id):
+            return market
+
+        def get_price_history(self, market_id, start, end):
+            return [fresh]
+
+    monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (FakeMarketSource(), "normalized-index"))
+    monkeypatch.setattr(
+        mcp_server,
+        "get_all_sources",
+        lambda: [(FakeIndex(), "normalized-index"), (FakeCache(), "sqlite-cache")],
+    )
+
+    result = _run(mcp_server.call_tool("research_markets", {"platform": "polymarket", "limit": 1}))
+    payload = _payload(result)
+    assert payload["ok"]
+    assert payload["history"][0]["analytics"]["current_price"] == 0.85
+
+
 # ---------------------------------------------------------------------------
 # research_markets active_only filters resolved markets
 # ---------------------------------------------------------------------------
@@ -746,6 +846,42 @@ def test_research_markets_active_only_false_includes_resolved(monkeypatch):
     assert "m-resolved" in market_ids
 
 
+def test_research_markets_active_only_refetches_past_resolved_limit(monkeypatch):
+    """research_markets should widen fetches when top-N markets are resolved."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+
+    resolved_1 = _make_market("m-resolved-1")
+    resolved_1.resolved = True
+    resolved_2 = _make_market("m-resolved-2")
+    resolved_2.resolved = True
+    active_1 = _make_market("m-active-1")
+    active_2 = _make_market("m-active-2")
+    ordered_markets = [resolved_1, resolved_2, active_1, active_2]
+    requested_limits = []
+
+    class FakeSource:
+        def get_markets(self, **kw):
+            requested_limits.append(int(kw["limit"]))
+            return ordered_markets[: int(kw["limit"])]
+
+        def get_price_history(self, *a, **kw):
+            return []
+
+    monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (FakeSource(), "fake-source"))
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(FakeSource(), "fake-source")])
+
+    result = _run(mcp_server.call_tool("research_markets", {
+        "platform": "polymarket",
+        "limit": 2,
+        "active_only": True,
+    }))
+    payload = _payload(result)
+
+    assert payload["ok"] is True
+    assert [m["id"] for m in payload.get("markets", [])] == ["m-active-1", "m-active-2"]
+    assert requested_limits == [2, 10]
+
+
 # ---------------------------------------------------------------------------
 # sync_data zero with category filter includes warning
 # ---------------------------------------------------------------------------
@@ -764,6 +900,7 @@ def test_sync_data_zero_with_category_includes_warning(monkeypatch):
 
     monkeypatch.setattr(mcp_server, "PmxtClient", FakeClient)
     monkeypatch.setattr(mcp_server, "DataCache", lambda _: FakeCache())
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [])
 
     with patch.object(mcp_server, "get_engine"):
         result = _run(mcp_server.call_tool("sync_data", {

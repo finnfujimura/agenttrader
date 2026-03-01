@@ -16,6 +16,7 @@ class MarketDataProvider(Protocol):
         self,
         platform: str = "all",
         category: str | None = None,
+        active_only: bool = False,
         limit: int = 1000,
     ) -> list[Market]: ...
 

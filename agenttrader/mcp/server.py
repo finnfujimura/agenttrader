@@ -119,6 +119,192 @@ def _compute_history_analytics(history: list, end_ts: int) -> dict:
     }
 
 
+def _is_market_resolved(market) -> bool:
+    return bool(getattr(market, "resolved", False))
+
+
+def _get_research_markets(source, source_name: str, *, platform: str, category: str | None, tags: list[str] | None, limit: int, market_ids: list[str] | None, active_only: bool):
+    if market_ids and hasattr(source, "get_markets_by_ids"):
+        return source.get_markets_by_ids(market_ids, platform=platform)
+    if market_ids and source_name == "sqlite-cache":
+        markets = []
+        for mid in market_ids:
+            m = source.get_market(mid)
+            if m and (platform == "all" or m.platform.value == platform):
+                markets.append(m)
+        return markets
+
+    mkwargs = {"platform": platform, "category": category, "limit": max(int(limit), 1)}
+    if source_name == "sqlite-cache" and tags:
+        mkwargs["tags"] = tags
+
+    fetch_limit = mkwargs["limit"]
+    while True:
+        request_kwargs = dict(mkwargs)
+        request_kwargs["limit"] = fetch_limit
+        if active_only:
+            request_kwargs["active_only"] = True
+        try:
+            markets = source.get_markets(**request_kwargs)
+        except TypeError:
+            request_kwargs.pop("active_only", None)
+            markets = source.get_markets(**request_kwargs)
+
+        if not active_only:
+            return markets[:limit]
+
+        active_markets = [m for m in markets if not _is_market_resolved(m)]
+        if len(active_markets) >= limit or fetch_limit >= 1000 or len(markets) < fetch_limit:
+            return active_markets[:limit]
+        fetch_limit = min(fetch_limit * 5, 1000)
+
+
+def _market_platform_value(market) -> str:
+    platform = getattr(market, "platform", None)
+    if hasattr(platform, "value"):
+        return str(platform.value)
+    return str(platform or "")
+
+
+def _market_matches_platform(market, platform: str) -> bool:
+    return platform == "all" or _market_platform_value(market) == platform
+
+
+def _market_matches_category(market, category: str | None) -> bool:
+    if not category:
+        return True
+    wanted = str(category).strip().lower()
+    if not wanted:
+        return True
+    market_category = str(getattr(market, "category", "") or "").lower()
+    if market_category == wanted:
+        return True
+    market_tags = {str(tag).lower() for tag in (getattr(market, "tags", None) or [])}
+    return wanted in market_tags
+
+
+def _market_identifier_aliases(market) -> set[str]:
+    aliases = set()
+    for value in (getattr(market, "id", None), getattr(market, "condition_id", None)):
+        if value is not None and str(value).strip():
+            aliases.add(str(value).strip().lower())
+    return aliases
+
+
+def _resolve_market_ids_for_sync(market_ids: list[str] | None, *, platform: str, category: str | None, include_resolved: bool) -> tuple[list, set[str]]:
+    requested_ids = [str(market_id).strip() for market_id in (market_ids or []) if str(market_id).strip()]
+    if not requested_ids:
+        return [], set()
+
+    matched_by_request: dict[str, object] = {}
+    matched_request_ids: set[str] = set()
+    for source, source_name in get_all_sources():
+        try:
+            if hasattr(source, "get_markets_by_ids"):
+                candidates = source.get_markets_by_ids(requested_ids, platform=platform)
+            elif source_name == "sqlite-cache":
+                candidates = []
+                for market_id in requested_ids:
+                    market = source.get_market(market_id)
+                    if market is not None:
+                        candidates.append(market)
+            else:
+                continue
+        except Exception:
+            continue
+
+        for market in candidates:
+            if not _market_matches_platform(market, platform):
+                continue
+            if not include_resolved and _is_market_resolved(market):
+                continue
+            if not _market_matches_category(market, category):
+                continue
+
+            aliases = _market_identifier_aliases(market)
+            for requested_id in requested_ids:
+                normalized_requested_id = requested_id.lower()
+                if normalized_requested_id not in aliases:
+                    continue
+                matched_request_ids.add(normalized_requested_id)
+                matched_by_request.setdefault(requested_id, market)
+
+        if len(matched_request_ids) == len({market_id.lower() for market_id in requested_ids}):
+            break
+
+    ordered_markets = []
+    seen_market_keys: set[tuple[str, str]] = set()
+    for requested_id in requested_ids:
+        market = matched_by_request.get(requested_id)
+        if market is None:
+            continue
+        market_key = (_market_platform_value(market), str(getattr(market, "id", "")))
+        if market_key in seen_market_keys:
+            continue
+        seen_market_keys.add(market_key)
+        ordered_markets.append(market)
+
+    return ordered_markets, matched_request_ids
+
+
+def _candlestick_market_id(market) -> str:
+    if _market_platform_value(market) == "polymarket":
+        condition_id = getattr(market, "condition_id", None)
+        if condition_id is not None and str(condition_id).strip():
+            return str(condition_id)
+    return str(getattr(market, "id"))
+
+
+def _load_latest_price_from_source(source, source_name: str, market_id: str, platform: str):
+    if source_name == "sqlite-cache":
+        return source.get_latest_price(market_id)
+    return source.get_latest_price(market_id, platform)
+
+
+def _select_freshest_price(market_id: str, platform: str):
+    freshest = None
+    freshest_ts = None
+    for source, source_name in get_all_sources():
+        try:
+            latest = _load_latest_price_from_source(source, source_name, market_id, platform)
+        except Exception:
+            continue
+        if latest is None:
+            continue
+
+        latest_ts = int(getattr(latest, "timestamp", 0) or 0)
+        if freshest is None or latest_ts > freshest_ts:
+            freshest = (source_name, latest)
+            freshest_ts = latest_ts
+    return freshest
+
+
+def _load_history_from_source(source, source_name: str, market_id: str, platform: str, start_ts: int, end_ts: int):
+    if source_name == "sqlite-cache":
+        if not source.get_market(market_id):
+            return []
+        return source.get_price_history(market_id, start_ts, end_ts)
+    return source.get_price_history(market_id, platform, start_ts, end_ts)
+
+
+def _select_freshest_history(market_id: str, platform: str, start_ts: int, end_ts: int, sources=None):
+    freshest = None
+    freshest_ts = None
+    for source, source_name in (sources or get_all_sources()):
+        try:
+            history = _load_history_from_source(source, source_name, market_id, platform, start_ts, end_ts)
+        except Exception:
+            continue
+        if not history:
+            continue
+
+        latest_ts = int(getattr(history[-1], "timestamp", 0) or 0)
+        if freshest is None or latest_ts > freshest_ts:
+            freshest = (source_name, history)
+            freshest_ts = latest_ts
+    return freshest
+
+
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
@@ -361,16 +547,10 @@ async def call_tool(name: str, arguments: dict):
         if name == "get_price":
             market_id = args["market_id"]
             platform = args.get("platform", "polymarket")
-            for source, source_name in get_all_sources():
-                try:
-                    if source_name == "sqlite-cache":
-                        latest = source.get_latest_price(market_id)
-                    else:
-                        latest = source.get_latest_price(market_id, platform)
-                    if latest:
-                        return _respond({"ok": True, "data_source": source_name, "market_id": market_id, "price": latest.__dict__})
-                except Exception:
-                    continue
+            freshest = _select_freshest_price(market_id, platform)
+            if freshest is not None:
+                source_name, latest = freshest
+                return _respond({"ok": True, "data_source": source_name, "market_id": market_id, "price": latest.__dict__})
             return _respond(
                 _error_payload(
                     "MarketNotFound",
@@ -386,24 +566,8 @@ async def call_tool(name: str, arguments: dict):
             start_ts = end_ts - days * 24 * 3600
             platform = args.get("platform", "polymarket")
 
-            history = None
-            used_source = None
-            for source, source_name in get_all_sources():
-                try:
-                    if source_name == "sqlite-cache":
-                        if not source.get_market(market_id):
-                            continue
-                        pts = source.get_price_history(market_id, start_ts, end_ts)
-                    else:
-                        pts = source.get_price_history(market_id, platform, start_ts, end_ts)
-                    if pts:
-                        history = pts
-                        used_source = source_name
-                        break
-                except Exception:
-                    continue
-
-            if history is None:
+            freshest = _select_freshest_history(market_id, platform, start_ts, end_ts)
+            if freshest is None:
                 return _respond(
                     _error_payload(
                         "MarketNotFound",
@@ -411,6 +575,7 @@ async def call_tool(name: str, arguments: dict):
                         fix=f"Call sync_data(market_ids=['{market_id}']) and retry.",
                     )
                 )
+            used_source, history = freshest
 
             include_raw = bool(args.get("include_raw", False))
             payload = {
@@ -586,11 +751,22 @@ async def call_tool(name: str, arguments: dict):
                 mkwargs = {"platform": platform, "category": category, "limit": limit}
                 if source_name == "sqlite-cache" and tags:
                     mkwargs["tags"] = tags
-                markets = source.get_markets(**mkwargs)
+                markets = []
+
+            markets = _get_research_markets(
+                source,
+                source_name,
+                platform=platform,
+                category=category,
+                tags=tags,
+                limit=limit,
+                market_ids=market_ids,
+                active_only=active_only,
+            )
 
             # Filter out resolved markets unless active_only=false
             if active_only:
-                markets = [m for m in markets if not getattr(m, "resolved", False)]
+                markets = [m for m in markets if not _is_market_resolved(m)][:limit]
 
             # Get history for each market — try all sources per market
             end_ts = int(time.time())
@@ -602,20 +778,8 @@ async def call_tool(name: str, arguments: dict):
                 try:
                     mid = market.id if hasattr(market, "id") else market["id"]
                     plat = market.platform.value if hasattr(market.platform, "value") else str(market.platform)
-                    pts = None
-                    for src, sname in all_sources:
-                        try:
-                            if sname == "sqlite-cache":
-                                if not src.get_market(mid):
-                                    continue
-                                pts = src.get_price_history(mid, start_ts, end_ts)
-                            else:
-                                pts = src.get_price_history(mid, plat, start_ts, end_ts)
-                            if pts:
-                                break
-                        except Exception:
-                            continue
-                    pts = pts or []
+                    freshest = _select_freshest_history(mid, plat, start_ts, end_ts, sources=all_sources)
+                    pts = freshest[1] if freshest is not None else []
                     analytics = _compute_history_analytics(pts, end_ts)
                     entry = {"ok": True, "market_id": mid, "days": days, "analytics": analytics}
                     if include_raw:
@@ -875,12 +1039,44 @@ async def call_tool(name: str, arguments: dict):
             granularity = args.get("granularity", "hourly")
             granularity_map = {"minute": 1, "hourly": 60, "daily": 1440}
             interval_minutes = granularity_map.get(granularity, 60)
-            mk = {"platform": platform, "market_ids": market_ids, "limit": limit}
-            if category:
-                mk["category"] = category
-            if resolved:
-                mk["resolved"] = resolved
-            markets = client.get_markets(**mk)
+            markets = []
+            resolved_market_ids = set()
+            if market_ids:
+                markets, resolved_market_ids = _resolve_market_ids_for_sync(
+                    market_ids,
+                    platform=platform,
+                    category=category,
+                    include_resolved=bool(resolved),
+                )
+
+            remaining_market_ids = None
+            if market_ids:
+                remaining_market_ids = [
+                    market_id
+                    for market_id in market_ids
+                    if str(market_id).strip().lower() not in resolved_market_ids
+                ]
+
+            if not market_ids or remaining_market_ids:
+                mk = {"platform": platform, "limit": limit}
+                if remaining_market_ids:
+                    mk["market_ids"] = remaining_market_ids
+                if category:
+                    mk["category"] = category
+                if resolved:
+                    mk["resolved"] = resolved
+
+                live_markets = client.get_markets(**mk)
+                seen_market_keys = {
+                    (_market_platform_value(market), str(getattr(market, "id", "")))
+                    for market in markets
+                }
+                for market in live_markets:
+                    market_key = (_market_platform_value(market), str(getattr(market, "id", "")))
+                    if market_key in seen_market_keys:
+                        continue
+                    seen_market_keys.add(market_key)
+                    markets.append(market)
 
             start_ts = int(time.time()) - days * 24 * 3600
             end_ts = int(time.time())
@@ -892,12 +1088,12 @@ async def call_tool(name: str, arguments: dict):
             for m in markets:
                 try:
                     cache.upsert_market(m)
-                    candles = client.get_candlesticks(m.condition_id, m.platform, start_ts, end_ts, interval_minutes)
+                    candles = client.get_candlesticks(_candlestick_market_id(m), m.platform, start_ts, end_ts, interval_minutes)
                     gran_label = {"minute": "1m", "hourly": "1h", "daily": "1d"}.get(granularity, "1h")
-                    cache.upsert_price_points_batch(m.id, m.platform.value, candles, source="pmxt", granularity=gran_label)
+                    cache.upsert_price_points_batch(m.id, _market_platform_value(m), candles, source="pmxt", granularity=gran_label)
                     pp += len(candles)
                     ob = client.get_orderbook_snapshots(m.id, m.platform, start_ts, end_ts, 100)
-                    ob_files += ob_store.write(m.platform.value, m.id, ob)
+                    ob_files += ob_store.write(_market_platform_value(m), m.id, ob)
                     cache.mark_market_synced(m.id, int(time.time()))
                     synced += 1
                 except Exception as exc:

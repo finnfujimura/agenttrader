@@ -25,8 +25,15 @@ class IndexProvider:
     def close(self) -> None:
         self._index.close()
 
-    def get_markets(self, platform="all", category=None, limit=1000) -> list[Market]:
-        return self._parquet.get_markets(platform=platform, category=category, limit=limit)
+    def get_markets(self, platform="all", category=None, active_only=False, limit=1000) -> list[Market]:
+        kwargs = {
+            "platform": platform,
+            "category": category,
+            "limit": limit,
+        }
+        if active_only:
+            kwargs["active_only"] = True
+        return self._parquet.get_markets(**kwargs)
 
     def get_markets_by_ids(self, market_ids: list[str], platform: str = "all") -> list[Market]:
         return self._parquet.get_markets_by_ids(market_ids=market_ids, platform=platform)

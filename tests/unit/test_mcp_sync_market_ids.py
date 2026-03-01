@@ -62,6 +62,7 @@ def test_sync_data_market_ids_uses_exact_lookup(monkeypatch):
     monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
     monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: shared_cache)
     monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [])
     monkeypatch.setattr(mcp_server, "PmxtClient", lambda: client)
     monkeypatch.setattr(mcp_server, "OrderBookStore", lambda: FakeOrderBookStore())
 
@@ -80,3 +81,89 @@ def test_sync_data_market_ids_uses_exact_lookup(monkeypatch):
     assert payload["errors"] == []
     assert len(shared_cache.markets) == 1
     assert shared_cache.markets[0].platform == models.Platform.KALSHI
+
+
+def test_sync_data_market_ids_prefers_local_metadata(monkeypatch):
+    local_market = models.Market(
+        id="poly-yes-token",
+        condition_id="poly-condition-id",
+        platform=models.Platform.POLYMARKET,
+        title="Polymarket market",
+        category="politics",
+        tags=[],
+        market_type=models.MarketType.BINARY,
+        volume=123.0,
+        close_time=9999999999,
+        resolved=False,
+        resolution=None,
+        scalar_low=None,
+        scalar_high=None,
+    )
+
+    class FakeSource:
+        def get_markets_by_ids(self, market_ids, platform="all"):
+            assert market_ids == ["poly-yes-token"]
+            assert platform == "polymarket"
+            return [local_market]
+
+    class FakeClient:
+        def __init__(self):
+            self.candle_args = None
+            self.orderbook_args = None
+
+        def get_markets(self, **_kw):
+            raise AssertionError("PmxtClient.get_markets should not run when local metadata resolves the market_id")
+
+        def get_candlesticks(self, cond_id, platform, start, end, interval):
+            self.candle_args = (cond_id, platform, start, end, interval)
+            return [models.PricePoint(timestamp=1737392619, yes_price=0.55, no_price=0.45, volume=25.0)]
+
+        def get_orderbook_snapshots(self, market_id, platform, start, end, limit):
+            self.orderbook_args = (market_id, platform, start, end, limit)
+            return []
+
+    class FakeCache:
+        def __init__(self):
+            self.markets = []
+            self.points = []
+            self.synced = []
+
+        def upsert_market(self, market):
+            self.markets.append(market)
+
+        def upsert_price_points_batch(self, market_id, platform, batch, **_kwargs):
+            self.points.append((market_id, platform, list(batch)))
+
+        def mark_market_synced(self, market_id, timestamp):
+            self.synced.append((market_id, timestamp))
+
+    class FakeOrderBookStore:
+        def write(self, *_args, **_kwargs):
+            return 0
+
+    client = FakeClient()
+    shared_cache = FakeCache()
+    monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: shared_cache)
+    monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(FakeSource(), "normalized-index")])
+    monkeypatch.setattr(mcp_server, "PmxtClient", lambda: client)
+    monkeypatch.setattr(mcp_server, "OrderBookStore", lambda: FakeOrderBookStore())
+
+    result = _run(
+        mcp_server.call_tool(
+            "sync_data",
+            {"platform": "polymarket", "market_ids": ["poly-yes-token"], "days": 1, "limit": 1},
+        )
+    )
+    payload = importlib.import_module("json").loads(result[0].text)
+
+    assert payload["ok"] is True
+    assert payload["markets_synced"] == 1
+    assert payload["price_points_fetched"] == 1
+    assert client.candle_args is not None
+    assert client.candle_args[0] == "poly-condition-id"
+    assert client.orderbook_args is not None
+    assert client.orderbook_args[0] == "poly-yes-token"
+    assert shared_cache.points[0][0] == "poly-yes-token"
+    assert shared_cache.points[0][1] == "polymarket"
