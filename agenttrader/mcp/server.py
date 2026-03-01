@@ -131,6 +131,7 @@ async def list_tools() -> list[types.Tool]:
                     "platform": {"type": "string", "enum": ["polymarket", "kalshi", "all"], "default": "all"},
                     "category": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
+                    "market_ids": {"type": "array", "items": {"type": "string"}, "description": "Look up specific markets by ID. Bypasses volume/limit ordering."},
                     "limit": {"type": "integer", "default": 20},
                 },
             },
@@ -320,14 +321,25 @@ async def call_tool(name: str, arguments: dict):
     try:
         if name == "get_markets":
             source, source_name = get_best_data_source()
-            kwargs = {
-                "platform": args.get("platform", "all"),
-                "category": args.get("category"),
-                "limit": int(args.get("limit", 20)),
-            }
-            if source_name == "sqlite-cache" and args.get("tags"):
-                kwargs["tags"] = args.get("tags")
-            markets = source.get_markets(**kwargs)
+            platform = args.get("platform", "all")
+            market_ids = args.get("market_ids")
+            if market_ids and hasattr(source, "get_markets_by_ids"):
+                markets = source.get_markets_by_ids(market_ids, platform=platform)
+            elif market_ids and source_name == "sqlite-cache":
+                markets = []
+                for mid in market_ids:
+                    m = cache.get_market(mid)
+                    if m and (platform == "all" or m.platform.value == platform):
+                        markets.append(m)
+            else:
+                kwargs = {
+                    "platform": platform,
+                    "category": args.get("category"),
+                    "limit": int(args.get("limit", 20)),
+                }
+                if source_name == "sqlite-cache" and args.get("tags"):
+                    kwargs["tags"] = args.get("tags")
+                markets = source.get_markets(**kwargs)
             return _respond({
                 "ok": True,
                 "data_source": source_name,
@@ -537,15 +549,21 @@ async def call_tool(name: str, arguments: dict):
                     )
 
             # Get markets from best source
-            mkwargs = {"platform": platform, "category": category, "limit": limit}
-            if source_name == "sqlite-cache" and tags:
-                mkwargs["tags"] = tags
-            markets = source.get_markets(**mkwargs)
-
-            # Post-filter by market_ids if provided
-            if market_ids:
-                id_set = set(market_ids)
-                markets = [m for m in markets if m.id in id_set]
+            if market_ids and hasattr(source, "get_markets_by_ids"):
+                # Direct ID lookup — bypasses volume-ordered LIMIT
+                markets = source.get_markets_by_ids(market_ids, platform=platform)
+            elif market_ids and source_name == "sqlite-cache":
+                # SQLite cache: look up each ID directly
+                markets = []
+                for mid in market_ids:
+                    m = cache.get_market(mid)
+                    if m and (platform == "all" or m.platform.value == platform):
+                        markets.append(m)
+            else:
+                mkwargs = {"platform": platform, "category": category, "limit": limit}
+                if source_name == "sqlite-cache" and tags:
+                    mkwargs["tags"] = tags
+                markets = source.get_markets(**mkwargs)
 
             # Get history for each market
             end_ts = int(time.time())

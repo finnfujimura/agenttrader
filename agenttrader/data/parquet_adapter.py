@@ -104,6 +104,117 @@ class ParquetDataAdapter:
             return combined[:limit]
         raise ValueError(f"Unknown platform: {platform}. Use 'polymarket', 'kalshi', or 'all'.")
 
+    def get_markets_by_ids(
+        self,
+        market_ids: list[str],
+        platform: str = "all",
+    ) -> list[Market]:
+        """Look up specific markets by ID. Queries parquet directly — no volume/limit filtering."""
+        self._require_conn()
+        if not market_ids:
+            return []
+        wanted = platform.lower()
+        results: list[Market] = []
+        if wanted in ("polymarket", "all") and self._poly_markets_view:
+            results.extend(self._get_polymarket_markets_by_ids(market_ids))
+        if wanted in ("kalshi", "all") and self._kalshi_markets_view:
+            results.extend(self._get_kalshi_markets_by_ids(market_ids))
+        return results
+
+    def _get_polymarket_markets_by_ids(self, market_ids: list[str]) -> list[Market]:
+        """Look up polymarket markets where the yes-token ID or condition_id matches."""
+        placeholders = ", ".join("?" for _ in market_ids)
+        query = f"""
+            SELECT
+                json_extract_string(clob_token_ids, '$[0]') AS id,
+                condition_id,
+                question AS title,
+                slug,
+                volume,
+                closed,
+                end_date,
+                json_extract_string(outcome_prices, '$[0]') AS yes_price_str
+            FROM {self._poly_markets_view}
+            WHERE json_extract_string(clob_token_ids, '$[0]') IN ({placeholders})
+               OR condition_id IN ({placeholders})
+        """
+        params = list(market_ids) + list(market_ids)
+        rows = self._conn.execute(query, params).fetchall()
+        out: list[Market] = []
+        for row in rows:
+            market_id, condition_id, title, slug, volume, closed, end_date, yes_price_str = row
+            if not market_id:
+                continue
+            yes_price = self._to_float(yes_price_str)
+            resolution = None
+            if bool(closed) and yes_price is not None:
+                if yes_price >= 0.999:
+                    resolution = "yes"
+                elif yes_price <= 0.001:
+                    resolution = "no"
+            inferred_category = self._infer_polymarket_category(str(slug or ""), str(title or ""))
+            out.append(
+                Market(
+                    id=str(market_id),
+                    condition_id=str(condition_id or market_id),
+                    platform=Platform.POLYMARKET,
+                    title=str(title or ""),
+                    category=inferred_category,
+                    tags=[],
+                    market_type=MarketType.BINARY,
+                    volume=float(volume or 0.0),
+                    close_time=self._to_unix_ts(end_date),
+                    resolved=bool(closed),
+                    resolution=resolution,
+                    scalar_low=None,
+                    scalar_high=None,
+                )
+            )
+        return out
+
+    def _get_kalshi_markets_by_ids(self, market_ids: list[str]) -> list[Market]:
+        """Look up kalshi markets where the ticker matches."""
+        placeholders = ", ".join("?" for _ in market_ids)
+        query = f"""
+            SELECT
+                ticker,
+                event_ticker,
+                title,
+                market_type,
+                status,
+                volume / 100.0 AS volume_dollars,
+                close_time,
+                result
+            FROM {self._kalshi_markets_view}
+            WHERE ticker IN ({placeholders})
+        """
+        rows = self._conn.execute(query, list(market_ids)).fetchall()
+        out: list[Market] = []
+        for row in rows:
+            ticker, event_ticker, title, market_type, status, volume, close_time, result = row
+            if not ticker:
+                continue
+            norm_result = str(result or "").strip().lower() or None
+            inferred_category = self._infer_kalshi_category(str(event_ticker or ""))
+            out.append(
+                Market(
+                    id=str(ticker),
+                    condition_id=str(event_ticker or ticker),
+                    platform=Platform.KALSHI,
+                    title=str(title or ticker),
+                    category=inferred_category,
+                    tags=[],
+                    market_type=MarketType.BINARY if str(market_type or "").lower() == "binary" else MarketType.SCALAR,
+                    volume=float(volume or 0.0),
+                    close_time=self._to_unix_ts(close_time),
+                    resolved=str(status or "").lower() == "finalized",
+                    resolution=norm_result,
+                    scalar_low=None,
+                    scalar_high=None,
+                )
+            )
+        return out
+
     def get_price_history(
         self,
         market_id: str,
@@ -133,9 +244,12 @@ class ParquetDataAdapter:
         if min_volume is not None:
             where.append("volume >= ?")
             params.append(float(min_volume))
-        # Overfetch when category filter is active (category is inferred in Python, not SQL)
-        sql_limit = limit * 10 if category else limit
-        params.append(int(sql_limit))
+        # When category is active, skip SQL LIMIT — category is inferred in Python
+        # so we must scan all rows to find matches, then trim to `limit` afterward.
+        limit_clause = ""
+        if not category:
+            params.append(int(limit))
+            limit_clause = "LIMIT ?"
         query = f"""
             SELECT
                 json_extract_string(clob_token_ids, '$[0]') AS id,
@@ -149,7 +263,7 @@ class ParquetDataAdapter:
             FROM {self._poly_markets_view}
             WHERE {' AND '.join(where)}
             ORDER BY volume DESC
-            LIMIT ?
+            {limit_clause}
         """
         rows = self._conn.execute(query, params).fetchall()
         out: list[Market] = []
@@ -203,9 +317,11 @@ class ParquetDataAdapter:
         if min_volume is not None:
             where.append("volume / 100.0 >= ?")
             params.append(float(min_volume))
-        # Overfetch when category filter is active (category is inferred in Python, not SQL)
-        sql_limit = limit * 10 if category else limit
-        params.append(int(sql_limit))
+        # When category is active, skip SQL LIMIT — category is inferred in Python
+        limit_clause = ""
+        if not category:
+            params.append(int(limit))
+            limit_clause = "LIMIT ?"
         query = f"""
             SELECT
                 ticker,
@@ -219,7 +335,7 @@ class ParquetDataAdapter:
             FROM {self._kalshi_markets_view}
             WHERE {' AND '.join(where)}
             ORDER BY volume DESC
-            LIMIT ?
+            {limit_clause}
         """
         rows = self._conn.execute(query, params).fetchall()
         out: list[Market] = []

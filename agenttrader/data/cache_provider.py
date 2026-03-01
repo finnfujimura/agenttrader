@@ -19,6 +19,14 @@ class CacheProvider:
     def get_markets(self, platform="all", category=None, limit=1000) -> list[Market]:
         return self._cache.get_markets(platform=platform, category=category, limit=limit)
 
+    def get_markets_by_ids(self, market_ids: list[str], platform: str = "all") -> list[Market]:
+        out = []
+        for mid in market_ids:
+            m = self._cache.get_market(mid)
+            if m and (platform == "all" or m.platform.value == platform):
+                out.append(m)
+        return out
+
     def get_price_history(self, market_id, platform, start_ts, end_ts) -> list[PricePoint]:
         return self._cache.get_price_history(market_id, start_ts, end_ts)
 

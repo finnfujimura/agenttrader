@@ -78,17 +78,20 @@ def test_index_provider_forwards_category():
 # ---------------------------------------------------------------------------
 
 
-def test_research_markets_filters_by_market_ids(monkeypatch):
-    """research_markets should post-filter markets by market_ids when provided."""
+def test_research_markets_direct_id_lookup(monkeypatch):
+    """research_markets with market_ids should use get_markets_by_ids, not get_markets."""
     mcp_server = importlib.import_module("agenttrader.mcp.server")
 
     m1 = _make_market("m1")
-    m2 = _make_market("m2")
     m3 = _make_market("m3")
 
     class FakeSource:
         def get_markets(self, **kw):
-            return [m1, m2, m3]
+            # Should NOT be called when market_ids is provided
+            raise AssertionError("get_markets should not be called when market_ids is set")
+
+        def get_markets_by_ids(self, market_ids, platform="all"):
+            return [m for m in [m1, m3] if m.id in market_ids]
 
         def get_price_history(self, *a, **kw):
             return []
@@ -102,18 +105,43 @@ def test_research_markets_filters_by_market_ids(monkeypatch):
     }))
     payload = _payload(result)
     market_ids = [m["id"] for m in payload.get("markets", [])]
-    assert "m2" not in market_ids
     assert "m1" in market_ids
     assert "m3" in market_ids
 
 
+def test_research_markets_without_ids_uses_get_markets(monkeypatch):
+    """research_markets without market_ids should still use normal get_markets path."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+
+    m1 = _make_market("m1")
+
+    class FakeSource:
+        def get_markets(self, **kw):
+            return [m1]
+
+        def get_markets_by_ids(self, market_ids, platform="all"):
+            raise AssertionError("get_markets_by_ids should not be called without market_ids")
+
+        def get_price_history(self, *a, **kw):
+            return []
+
+    fake_source = FakeSource()
+    monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (fake_source, "fake-source"))
+
+    result = _run(mcp_server.call_tool("research_markets", {
+        "platform": "polymarket",
+    }))
+    payload = _payload(result)
+    assert len(payload.get("markets", [])) == 1
+
+
 # ---------------------------------------------------------------------------
-# Bug 3: Parquet overfetch when category is set
+# Bug 3: Parquet drops SQL LIMIT when category is active
 # ---------------------------------------------------------------------------
 
 
-def test_parquet_polymarket_overfetch_on_category():
-    """When category is provided, SQL LIMIT should be 10x the requested limit."""
+def test_parquet_polymarket_no_sql_limit_with_category():
+    """When category is provided, SQL should have no LIMIT clause (scan all rows)."""
     from agenttrader.data.parquet_adapter import ParquetDataAdapter
 
     adapter = ParquetDataAdapter.__new__(ParquetDataAdapter)
@@ -123,13 +151,15 @@ def test_parquet_polymarket_overfetch_on_category():
 
     adapter._get_polymarket_markets(category="crypto", resolved_only=False, min_volume=None, limit=10)
 
-    # The last param should be sql_limit = 10 * 10 = 100
     call_args = adapter._conn.execute.call_args
+    sql = call_args[0][0]
     params = call_args[0][1]
-    assert params[-1] == 100, f"Expected SQL limit of 100 (10*10), got {params[-1]}"
+    assert "LIMIT" not in sql, f"SQL should not have LIMIT when category is set, got: {sql}"
+    # No limit param should be in params
+    assert len(params) == 0, f"Expected no params, got {params}"
 
 
-def test_parquet_polymarket_no_overfetch_without_category():
+def test_parquet_polymarket_has_sql_limit_without_category():
     """Without category, SQL LIMIT should equal the requested limit."""
     from agenttrader.data.parquet_adapter import ParquetDataAdapter
 
@@ -141,12 +171,14 @@ def test_parquet_polymarket_no_overfetch_without_category():
     adapter._get_polymarket_markets(category=None, resolved_only=False, min_volume=None, limit=10)
 
     call_args = adapter._conn.execute.call_args
+    sql = call_args[0][0]
     params = call_args[0][1]
+    assert "LIMIT" in sql
     assert params[-1] == 10, f"Expected SQL limit of 10, got {params[-1]}"
 
 
-def test_parquet_kalshi_overfetch_on_category():
-    """Kalshi should also overfetch when category is set."""
+def test_parquet_kalshi_no_sql_limit_with_category():
+    """Kalshi should also drop SQL LIMIT when category is set."""
     from agenttrader.data.parquet_adapter import ParquetDataAdapter
 
     adapter = ParquetDataAdapter.__new__(ParquetDataAdapter)
@@ -157,8 +189,8 @@ def test_parquet_kalshi_overfetch_on_category():
     adapter._get_kalshi_markets(category="politics", resolved_only=False, min_volume=None, limit=5)
 
     call_args = adapter._conn.execute.call_args
-    params = call_args[0][1]
-    assert params[-1] == 50, f"Expected SQL limit of 50 (5*10), got {params[-1]}"
+    sql = call_args[0][0]
+    assert "LIMIT" not in sql, f"SQL should not have LIMIT when category is set"
 
 
 # ---------------------------------------------------------------------------
@@ -401,3 +433,130 @@ def test_cli_paper_start_uses_pid_not_popen():
     assert "pid = proc.pid" in source
     # Should NOT have "pid = daemon.start_as_daemon()" (old buggy form)
     assert "pid = daemon.start_as_daemon()" not in source
+
+
+# ---------------------------------------------------------------------------
+# Parquet get_markets_by_ids
+# ---------------------------------------------------------------------------
+
+
+def test_parquet_get_markets_by_ids_polymarket():
+    """get_markets_by_ids queries polymarket by token ID or condition_id."""
+    from agenttrader.data.parquet_adapter import ParquetDataAdapter
+
+    adapter = ParquetDataAdapter.__new__(ParquetDataAdapter)
+    adapter._conn = MagicMock()
+    adapter._poly_markets_view = "poly_markets"
+    adapter._kalshi_markets_view = None
+    # Return one row matching
+    adapter._conn.execute.return_value.fetchall.return_value = [
+        ("tok-1", "cond-1", "Test Q", "test-slug", 100.0, False, None, "0.50"),
+    ]
+
+    results = adapter.get_markets_by_ids(["tok-1"], platform="polymarket")
+    assert len(results) == 1
+    assert results[0].id == "tok-1"
+
+    # Verify SQL uses IN clause, not LIMIT
+    sql = adapter._conn.execute.call_args[0][0]
+    assert "IN" in sql
+    assert "LIMIT" not in sql
+
+
+def test_parquet_get_markets_by_ids_kalshi():
+    """get_markets_by_ids queries kalshi by ticker."""
+    from agenttrader.data.parquet_adapter import ParquetDataAdapter
+
+    adapter = ParquetDataAdapter.__new__(ParquetDataAdapter)
+    adapter._conn = MagicMock()
+    adapter._poly_markets_view = None
+    adapter._kalshi_markets_view = "kalshi_markets"
+    adapter._conn.execute.return_value.fetchall.return_value = [
+        ("KXFED-DEC-T475", "KXFED", "Fed rate", "binary", "finalized", 500.0, None, "yes"),
+    ]
+
+    results = adapter.get_markets_by_ids(["KXFED-DEC-T475"], platform="kalshi")
+    assert len(results) == 1
+    assert results[0].id == "KXFED-DEC-T475"
+
+
+def test_parquet_get_markets_by_ids_empty():
+    """get_markets_by_ids with empty list returns empty."""
+    from agenttrader.data.parquet_adapter import ParquetDataAdapter
+
+    adapter = ParquetDataAdapter.__new__(ParquetDataAdapter)
+    adapter._conn = MagicMock()
+    results = adapter.get_markets_by_ids([], platform="all")
+    assert results == []
+    adapter._conn.execute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# IndexProvider get_markets_by_ids delegation
+# ---------------------------------------------------------------------------
+
+
+def test_index_provider_forwards_get_markets_by_ids():
+    """IndexProvider.get_markets_by_ids delegates to parquet adapter."""
+    from agenttrader.data.index_provider import IndexProvider
+
+    provider = IndexProvider.__new__(IndexProvider)
+    provider._parquet = MagicMock()
+    provider._parquet.get_markets_by_ids.return_value = [_make_market("m1")]
+
+    result = provider.get_markets_by_ids(["m1"], platform="kalshi")
+    assert len(result) == 1
+    provider._parquet.get_markets_by_ids.assert_called_once_with(
+        market_ids=["m1"], platform="kalshi"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CacheProvider get_markets_by_ids
+# ---------------------------------------------------------------------------
+
+
+def test_cache_provider_get_markets_by_ids():
+    """CacheProvider.get_markets_by_ids looks up each ID via cache.get_market."""
+    from agenttrader.data.cache_provider import CacheProvider
+
+    m1 = _make_market("m1", platform=Platform.KALSHI)
+    fake_cache = MagicMock()
+    fake_cache.get_market.side_effect = lambda mid: m1 if mid == "m1" else None
+
+    provider = CacheProvider(fake_cache, MagicMock())
+    result = provider.get_markets_by_ids(["m1", "m-missing"], platform="all")
+    assert len(result) == 1
+    assert result[0].id == "m1"
+
+
+# ---------------------------------------------------------------------------
+# get_markets MCP tool with market_ids
+# ---------------------------------------------------------------------------
+
+
+def test_get_markets_with_market_ids(monkeypatch):
+    """get_markets tool should use direct ID lookup when market_ids is provided."""
+    mcp_server = importlib.import_module("agenttrader.mcp.server")
+
+    m1 = _make_market("m1")
+
+    class FakeSource:
+        def get_markets(self, **kw):
+            raise AssertionError("get_markets should not be called")
+
+        def get_markets_by_ids(self, market_ids, platform="all"):
+            return [m1] if "m1" in market_ids else []
+
+        def get_price_history(self, *a, **kw):
+            return []
+
+    monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (FakeSource(), "fake-source"))
+
+    result = _run(mcp_server.call_tool("get_markets", {
+        "market_ids": ["m1"],
+    }))
+    payload = _payload(result)
+    assert payload["ok"]
+    assert len(payload["markets"]) == 1
+    assert payload["markets"][0]["id"] == "m1"

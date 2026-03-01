@@ -28,6 +28,9 @@ class IndexProvider:
     def get_markets(self, platform="all", category=None, limit=1000) -> list[Market]:
         return self._parquet.get_markets(platform=platform, category=category, limit=limit)
 
+    def get_markets_by_ids(self, market_ids: list[str], platform: str = "all") -> list[Market]:
+        return self._parquet.get_markets_by_ids(market_ids=market_ids, platform=platform)
+
     def get_price_history(self, market_id, platform, start_ts, end_ts) -> list[PricePoint]:
         return self._parquet.get_price_history(market_id, platform, start_ts, end_ts)
 
