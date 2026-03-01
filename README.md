@@ -23,38 +23,9 @@ That's it. `init` sets up your local database and walks you through the optional
 
 ---
 
-## Get the Historical Dataset (Recommended)
-
-Backtesting works best with the full historical dataset — thousands of resolved Polymarket and Kalshi markets going back to 2021.
-
-For the most reliable large dataset download, install `aria2` first. `agenttrader` will automatically use `aria2c` when it is available, and fall back to the built-in Python downloader otherwise.
-
-```bash
-# macOS
-brew install aria2
-
-# Windows
-choco install aria2
-
-# WSL / Ubuntu / Debian
-sudo apt install aria2
-```
-
-```bash
-agenttrader dataset download      # ~36GB, one-time
-agenttrader dataset build-index   # ~5-10 min, also one-time
-```
-
-
-Once built, backtests run against the full dataset automatically. No sync required.
-
-> **Don't want to download 36GB?** Backtesting still works using live-synced data. Just run `agenttrader sync` before backtesting and it'll use whatever is cached locally.
-
----
-
 ## Quickstart
 
-### Option A — Use with an AI agent (recommended)
+### 1. Set up the MCP server
 
 Add to your MCP config (e.g. `.claude/mcp.json`):
 
@@ -69,7 +40,21 @@ Add to your MCP config (e.g. `.claude/mcp.json`):
 }
 ```
 
-Then give your agent a prompt like:
+### 2. Download the historical dataset (recommended)
+
+Backtesting works best with the full dataset — thousands of resolved Polymarket and Kalshi markets going back to 2021.
+
+```bash
+# Optional: install aria2 for faster downloads
+# macOS: brew install aria2 | Windows: choco install aria2 | Linux: sudo apt install aria2
+
+agenttrader dataset download      # ~36GB, one-time
+agenttrader dataset build-index   # ~5-10 min, one-time
+```
+
+> **Don't want to download 36GB?** Backtesting still works using live-synced data. Run `agenttrader sync` before backtesting and it'll use whatever is cached locally.
+
+### 3. Give your agent a prompt
 
 ```
 Use agenttrader to find liquid Polymarket politics markets,
@@ -78,26 +63,108 @@ to 2024-12-31, and iterate until Sharpe > 1.0. Then start
 paper trading with $10,000 and report the portfolio ID.
 ```
 
-The agent handles everything — research, writing, validation, backtesting, iteration, and deployment.
+The agent handles research, strategy writing, validation, backtesting, iteration, and deployment.
 
-### Option B — Use from the CLI
+---
 
-```bash
-# Sync some live data
-agenttrader sync --platform polymarket --days 30 --limit 20
+## Core Workflow
 
-# List available markets
-agenttrader markets list --platform polymarket --limit 10
+This is the loop an agent (or human) follows when using agenttrader. Every step maps to an MCP tool call.
 
-# Write a strategy, then validate it
-agenttrader validate ./strategy.py
-
-# Backtest it
-agenttrader backtest ./strategy.py --from 2024-01-01 --to 2024-12-31
-
-# Start paper trading
-agenttrader paper start ./strategy.py --cash 10000
 ```
+ research_markets          Find markets with price analytics and capabilities
+        │
+        ▼
+ Write strategy.py         Python class extending BaseStrategy
+        │
+        ▼
+ validate_and_backtest     Validate syntax + run backtest in one call
+        │
+        ▼
+ Evaluate metrics          Sharpe, return %, max drawdown, win rate
+        │
+   ┌────┴────┐
+   │ Good?   │
+   │  No ────┼──▶ Edit strategy, re-run backtest
+   │  Yes    │
+   └────┬────┘
+        ▼
+ start_paper_trade         Deploy to live paper trading
+        │
+        ▼
+ get_portfolio             Monitor positions and P&L
+```
+
+### Example: full autonomous session
+
+Here's a single prompt that exercises the complete workflow:
+
+```
+I want to trade Polymarket politics markets using a contrarian strategy.
+
+1. Use research_markets to find 10 active politics markets with 30 days
+   of history. Check their capabilities to confirm they're backtestable.
+
+2. Write a strategy that buys YES when the price drops more than 10%
+   below its 7-day average, and sells when it recovers to the average.
+   Use position sizing of 5% of portfolio per trade.
+
+3. Backtest from 2024-01-01 to 2024-12-31 with $10,000.
+
+4. If Sharpe < 0.5, adjust the entry threshold and retest. Iterate
+   up to 3 times.
+
+5. Once satisfied, start paper trading with the best-performing version
+   and report the portfolio ID and initial positions.
+```
+
+This prompt will trigger ~10-15 tool calls across research, validation, backtesting (with iteration), and paper trading deployment.
+
+---
+
+## Data Architecture
+
+```
+              ┌──────────────┐
+              │   PMXT API   │  Live prices, orderbooks, candles
+              └──────┬───────┘
+                     │ sync_data
+                     ▼
+              ┌──────────────┐
+              │ SQLite Cache │  Paper trading, live lookups
+              │  db.sqlite   │
+              └──────────────┘
+
+   ┌─────────────────┐          ┌──────────────────┐
+   │ Parquet Dataset  │  build   │  DuckDB Index    │
+   │ ~36GB raw files  │────────▶│  ~13GB normalized │  Backtesting (fastest)
+   │ data/poly+kalshi │  index   │  backtest_index   │
+   └─────────────────┘          └──────────────────┘
+```
+
+Tools automatically select the best available source: **DuckDB index > raw parquet > SQLite cache**. You don't need to specify which source to use.
+
+---
+
+## Market Capabilities
+
+When researching markets, each result includes capability annotations that tell you upfront what's possible:
+
+```json
+{
+  "capabilities": {
+    "backtest": { "index_available": true, "index_start": "2024-06-01", "index_end": "2025-02-15" },
+    "history":  { "cache_available": true, "last_point_timestamp": "2026-02-27T18:00:00+00:00" },
+    "sync":     { "can_attempt_live_sync": true }
+  }
+}
+```
+
+- **backtest** — whether this market has indexed historical data and the date range covered
+- **history** — whether this market has cached price data in SQLite
+- **sync** — whether live data sync is possible (false for resolved markets)
+
+This eliminates trial-and-error discovery — agents know immediately which markets can be backtested, which have cached data, and which need a sync first.
 
 ---
 
@@ -219,15 +286,6 @@ def on_market_data(self, market, price, orderbook):
         best_bid = price
 ```
 
-### Data Sources
-
-Two upstream sources normalize into one canonical interface:
-
-- **Historical parquet dataset** — Thousands of resolved markets (2021–present). Best for backtesting. No orderbook data.
-- **Live PMXT API** — Real-time prices and orderbook snapshots. Used by `agenttrader sync` for paper trading.
-
-Provenance metadata (`source`, `granularity`) is recorded for all stored price points, so you can distinguish parquet-sourced data from live-synced data.
-
 ---
 
 ## Paper Trading
@@ -293,6 +351,15 @@ agenttrader markets screen --condition "days_until_close < 7" --json
 ```
 
 Supported condition metrics: `price_vs_7d_avg`, `current_price`, `volume`, `days_until_close`, `price_change_24h`
+
+---
+
+## Reference
+
+| Document | Description |
+|----------|-------------|
+| [COMMANDS.md](COMMANDS.md) | Full MCP tool reference — every tool, parameter, type, default, and example |
+| [SCHEMA.md](SCHEMA.md) | Database schemas — SQLite tables, DuckDB index, parquet dataset layout |
 
 ---
 
@@ -384,7 +451,7 @@ agenttrader experiments compare <exp_id_1> <exp_id_2> --json
 ```
 ~/.agenttrader/
 ├── config.yaml
-├── db.sqlite                      # paper trading state
+├── db.sqlite                      # market metadata, paper trading state
 ├── data/                          # raw parquet dataset (if downloaded)
 ├── backtest_index.duckdb          # normalized index (if built)
 ├── backtest_artifacts/            # compressed backtest results
@@ -392,25 +459,6 @@ agenttrader experiments compare <exp_id_1> <exp_id_2> --json
 └── logs/
     └── performance.jsonl
 ```
-
----
-
-## Troubleshooting
-
-**`agenttrader: command not found`**
-Activate your virtual environment or reinstall: `pip install agenttrader`
-
-**`NotInitialized` error**
-Run `agenttrader init`
-
-**Backtest returns 0 trades**
-Either your strategy isn't subscribing to any markets, the date range has no data, or the index hasn't been built. Try `agenttrader dataset build-index` if you've downloaded the dataset.
-
-**PMXT import or sidecar errors**
-Make sure both are installed: `pip install pmxt` and `npm install -g pmxtjs`
-
-**`DatasetNotFound` when building index**
-Run `agenttrader dataset download` first, then `agenttrader dataset build-index`
 
 ---
 

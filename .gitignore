@@ -27,3 +27,5 @@ data/
 # Markdown files
 *.md
 !README.md
+!COMMANDS.md
+!SCHEMA.md
