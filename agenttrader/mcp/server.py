@@ -5,6 +5,8 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import os
+import signal
 import statistics
 import sys
 import time
@@ -82,6 +84,7 @@ DEFAULT_FIXES = {
     "BadRequest": "Check required tool arguments and retry.",
     "MarketNotCached": "Call sync_data with market_ids=['<market_id>'] (or sync the platform), then retry.",
     "NotFound": "Verify the id exists first (list_backtests or list_paper_trades), then retry.",
+    "InternalError": "This is a server bug, not a strategy issue. Report it or retry.",
 }
 
 
@@ -100,7 +103,6 @@ def _error_payload(error: str, message: str, fix: str | None = None, **extra):
 
 def _pid_alive(pid: int) -> bool:
     """Check whether a process with the given PID is still running."""
-    import os
     try:
         os.kill(pid, 0)
         return True
@@ -566,6 +568,14 @@ async def list_tools() -> list[types.Tool]:
                             "Set to false to include historical markets."
                         ),
                     },
+                    "min_history_points": {
+                        "type": "integer",
+                        "default": 0,
+                        "description": (
+                            "Minimum number of price history points a market must have "
+                            "to be included in results. Default: 0 (no filter)."
+                        ),
+                    },
                 },
             },
         ),
@@ -599,7 +609,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(name="get_backtest", description="Get backtest by run id. Returns metrics only by default. Set include_curve=true to also return the full equity curve and trades array.", inputSchema={"type": "object", "properties": {"run_id": {"type": "string"}, "include_curve": {"type": "boolean", "default": False, "description": "If true, include full equity_curve and trades arrays in response"}}, "required": ["run_id"]}),
         types.Tool(name="list_backtests", description="List recent backtest runs", inputSchema={"type": "object", "properties": {}}),
         types.Tool(name="validate_strategy", description="Validate strategy file", inputSchema={"type": "object", "properties": {"strategy_path": {"type": "string"}}, "required": ["strategy_path"]}),
-        types.Tool(name="start_paper_trade", description="Start paper trading daemon", inputSchema={"type": "object", "properties": {"strategy_path": {"type": "string"}, "initial_cash": {"type": "number", "default": 10000}}, "required": ["strategy_path"]}),
+        types.Tool(name="start_paper_trade", description="Start paper trading daemon", inputSchema={"type": "object", "properties": {"strategy_path": {"type": "string"}, "initial_cash": {"type": "number", "default": 10000}, "wait_for_ready": {"type": "boolean", "default": False, "description": "If true, poll until daemon is running (up to 30s) and return initial positions."}}, "required": ["strategy_path"]}),
         types.Tool(name="get_portfolio", description="Get paper portfolio status", inputSchema={"type": "object", "properties": {"portfolio_id": {"type": "string"}}, "required": ["portfolio_id"]}),
         types.Tool(name="stop_paper_trade", description="Stop paper trading daemon", inputSchema={"type": "object", "properties": {"portfolio_id": {"type": "string"}}, "required": ["portfolio_id"]}),
         types.Tool(name="list_paper_trades", description="List paper portfolios", inputSchema={"type": "object", "properties": {}}),
@@ -871,7 +881,9 @@ async def call_tool(name: str, arguments: dict):
                         row.error = traceback.format_exc()
                         row.completed_at = int(datetime.now(tz=UTC).timestamp())
                         session.commit()
-                return _respond(_error_payload("StrategyError", str(exc), fix="Fix the strategy and retry."))
+                if isinstance(exc, (AgentTraderError, RuntimeError)):
+                    return _respond(_error_payload("StrategyError", str(exc), fix="Fix the strategy and retry."))
+                return _respond(_error_payload("InternalError", str(exc)))
 
         if name == "research_markets":
             days = _bounded_int(args, "days", 7, 1, 3650)
@@ -881,6 +893,7 @@ async def call_tool(name: str, arguments: dict):
             market_ids = args.get("market_ids")
             limit = _bounded_int(args, "limit", 20, 1, 1000)
             sync_limit = _bounded_int(args, "sync_limit", 100, 1, 1000)
+            min_history_points = _bounded_int(args, "min_history_points", 0, 0, 100000)
             include_raw = bool(args.get("include_raw", False))
             active_only = bool(args.get("active_only", True))
 
@@ -959,12 +972,25 @@ async def call_tool(name: str, arguments: dict):
                 except Exception as exc:
                     history_errors.append({"market_id": getattr(market, "id", "?"), "error": str(exc)})
 
+            # Filter by min_history_points if requested
+            if min_history_points > 0:
+                passing_ids = {
+                    h["market_id"]
+                    for h in history
+                    if h.get("analytics", {}).get("points", 0) >= min_history_points
+                }
+                markets = [m for m in markets if m.id in passing_ids]
+                history = [h for h in history if h["market_id"] in passing_ids]
+
+            # Build analytics lookup for inline analytics on market objects
+            analytics_by_id = {h["market_id"]: h.get("analytics", {}) for h in history}
+
             caps = _compute_capabilities(markets, cache)
             payload = {
                 "ok": len(history_errors) == 0,
                 "data_source": source_name,
                 "markets": [
-                    m.__dict__ | {"platform": m.platform.value, "market_type": m.market_type.value, "capabilities": caps.get(m.id, {})}
+                    m.__dict__ | {"platform": m.platform.value, "market_type": m.market_type.value, "capabilities": caps.get(m.id, {}), "analytics": analytics_by_id.get(m.id, {})}
                     for m in markets
                 ],
                 "history": history,
@@ -1071,8 +1097,7 @@ async def call_tool(name: str, arguments: dict):
             pid = proc.pid
 
             # Health check: wait briefly and verify daemon is still alive
-            import time as _time
-            _time.sleep(1.0)
+            time.sleep(1.0)
             runtime_status = read_runtime_status(portfolio_id)
             if runtime_status and runtime_status.get("state") == "failed":
                 with get_session(get_engine()) as session:
@@ -1091,12 +1116,12 @@ async def call_tool(name: str, arguments: dict):
                     )
                 )
             if runtime_status is None:
-                deadline = _time.time() + 4.0
-                while _time.time() < deadline and proc.poll() is None:
+                deadline = time.time() + 4.0
+                while time.time() < deadline and proc.poll() is None:
                     runtime_status = read_runtime_status(portfolio_id)
                     if runtime_status is not None:
                         break
-                    _time.sleep(0.25)
+                    time.sleep(0.25)
             exit_code = proc.poll()
             if exit_code is not None:
                 # Daemon died immediately — read stderr log for details
@@ -1128,7 +1153,47 @@ async def call_tool(name: str, arguments: dict):
                 if row:
                     row.pid = pid
                     session.commit()
-            return _respond({"ok": True, "portfolio_id": portfolio_id, "pid": pid, "live_status": runtime_status})
+
+            response = {"ok": True, "portfolio_id": portfolio_id, "pid": pid, "live_status": runtime_status}
+
+            wait_for_ready = bool(args.get("wait_for_ready", False))
+            if wait_for_ready:
+                deadline = time.time() + 30.0
+                while time.time() < deadline:
+                    rs = read_runtime_status(portfolio_id)
+                    if rs and rs.get("state") == "running":
+                        response["live_status"] = rs
+                        break
+                    if rs and rs.get("state") == "failed":
+                        response["live_status"] = rs
+                        response["warning"] = "Daemon entered failed state during wait."
+                        break
+                    if not _pid_alive(pid):
+                        response["warning"] = "Daemon process died during wait."
+                        break
+                    time.sleep(0.5)
+                else:
+                    response["warning"] = "Timed out waiting for daemon to reach running state (30s)."
+                # Include initial positions if daemon is running
+                rs = response.get("live_status") or {}
+                if rs.get("state") == "running":
+                    with get_session(get_engine()) as session:
+                        row = session.get(PaperPortfolio, portfolio_id)
+                        if row:
+                            response["cash_balance"] = row.cash_balance
+                    positions = cache.get_open_positions(portfolio_id)
+                    response["positions"] = [
+                        {
+                            "market_id": pos.market_id,
+                            "platform": pos.platform,
+                            "side": pos.side,
+                            "contracts": pos.contracts,
+                            "avg_cost": pos.avg_cost,
+                        }
+                        for pos in positions
+                    ]
+
+            return _respond(response)
 
         if name == "get_portfolio":
             portfolio_id = args["portfolio_id"]
@@ -1206,10 +1271,6 @@ async def call_tool(name: str, arguments: dict):
                         fix=f"Call list_paper_trades then retry with a valid portfolio_id (missing: {portfolio_id}).",
                     )
                 )
-            import os
-            import signal
-            import sys
-
             if p.pid:
                 try:
                     if sys.platform == "win32":
