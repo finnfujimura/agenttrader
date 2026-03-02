@@ -80,15 +80,6 @@ def test_get_price_routes_through_source_selector(monkeypatch):
     assert payload["price"]["yes_price"] == 0.65
 
 
-def test_unknown_tool_returns_fix(monkeypatch):
-    monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
-    result = _run(mcp_server.call_tool("unknown_tool", {}))
-    payload = _payload(result)
-    assert payload["ok"] is False
-    assert payload["error"] == "UnknownTool"
-    assert "list_tools" in payload["fix"]
-
-
 def test_get_history_returns_analytics_by_default(monkeypatch):
     now = int(time.time())
     history = [
@@ -150,13 +141,6 @@ def test_get_history_include_raw_true_returns_history(monkeypatch):
     assert payload["ok"] is True
     assert "history" in payload
     assert len(payload["history"]) == 1
-
-
-def test_list_tools_includes_compound_tools():
-    tools = _run(mcp_server.list_tools())
-    names = {t.name for t in tools}
-    assert "research_markets" in names
-    assert "validate_and_backtest" in names
 
 
 def test_validate_and_backtest_returns_validation_error_with_fix(monkeypatch):

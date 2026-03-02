@@ -20,16 +20,19 @@ venv/
 # Local app state
 .agenttrader/
 docs/
-/codex_tmp_test_runtime/
-/codex_tmp_test_live_manual/
-/codex_tmp_test*/
-/pytest_tmp_*/
-/.pytest_tmp*/
-/.codex_pytest_tmp*/
 /agenttrader/db/data/
+
+# Test temp directories
+codex_tmp_test*/
+pytest_tmp_*/
+.pytest_tmp*/
+.codex_pytest_tmp*/
 
 # Dataset (large parquet files)
 /data/
+
+# Performance / test data
+*.jsonl
 
 # Markdown files
 *.md

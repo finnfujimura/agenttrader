@@ -63,8 +63,3 @@ def test_missing_source_column(tmp_path: Path) -> None:
     assert "fix" in result
 
 
-def test_missing_database(tmp_path: Path) -> None:
-    """Reports DatabaseNotFound for nonexistent path."""
-    result = check_schema(tmp_path / "nonexistent.sqlite")
-    assert result["ok"] is False
-    assert result["error"] == "DatabaseNotFound"

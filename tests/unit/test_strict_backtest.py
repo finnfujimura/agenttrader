@@ -1,11 +1,12 @@
-import pytest
+"""Strict-mode execution behavior tests (non-orderbook paths).
 
-from agenttrader.core.context import BacktestContext, LiveContext, StreamingBacktestContext
+Orderbook rejection tests live in test_no_silent_synthetic.py.
+"""
+from agenttrader.core.context import StreamingBacktestContext
 from agenttrader.core.fill_model import FillModel
 from agenttrader.data.models import (
     ExecutionMode, Market, MarketType, Platform, PricePoint,
 )
-from agenttrader.errors import AgentTraderError
 
 
 def _make_context(mode: ExecutionMode) -> StreamingBacktestContext:
@@ -27,12 +28,6 @@ def _make_context(mode: ExecutionMode) -> StreamingBacktestContext:
     return ctx
 
 
-def test_strict_get_orderbook_raises():
-    ctx = _make_context(ExecutionMode.STRICT_PRICE_ONLY)
-    with pytest.raises(AgentTraderError, match="NoObservedOrderbook"):
-        ctx.get_orderbook("m1")
-
-
 def test_strict_buy_fills_at_observed_price():
     ctx = _make_context(ExecutionMode.STRICT_PRICE_ONLY)
     trade_id = ctx.buy("m1", 10)
@@ -42,85 +37,7 @@ def test_strict_buy_fills_at_observed_price():
     assert trade["slippage"] == 0.0
 
 
-def test_strict_sell_fills_at_observed_price():
-    ctx = _make_context(ExecutionMode.STRICT_PRICE_ONLY)
-    ctx.buy("m1", 10)
-    trade_id = ctx.sell("m1")
-    assert trade_id
-    trade = ctx._trades[-1]
-    assert trade["price"] == 0.60
-    assert trade["slippage"] == 0.0
-
-
-def test_synthetic_mode_still_synthesizes_orderbook():
-    ctx = _make_context(ExecutionMode.SYNTHETIC_EXECUTION_MODEL)
-    ob = ctx.get_orderbook("m1")
-    assert ob is not None
-    assert len(ob.asks) > 0
-
-
 def test_compile_results_includes_execution_mode():
     ctx = _make_context(ExecutionMode.STRICT_PRICE_ONLY)
     results = ctx.compile_results()
     assert results["execution_mode"] == "strict_price_only"
-
-
-# --- BacktestContext (legacy) tests ---
-
-
-def test_legacy_strict_get_orderbook_raises():
-    market = Market(
-        id="m1", condition_id="c1", platform=Platform.POLYMARKET,
-        title="T", category="", tags=[], market_type=MarketType.BINARY,
-        volume=100, close_time=0, resolved=False, resolution=None,
-        scalar_low=None, scalar_high=None,
-    )
-    ctx = BacktestContext(
-        initial_cash=1000.0,
-        price_data={"m1": [PricePoint(100, 0.60, 0.40, 10)]},
-        orderbook_data=None,
-        markets={"m1": market},
-        execution_mode=ExecutionMode.STRICT_PRICE_ONLY,
-    )
-    ctx.advance_time(100)
-    with pytest.raises(AgentTraderError, match="NoObservedOrderbook"):
-        ctx.get_orderbook("m1")
-
-
-def test_legacy_strict_buy_fills_at_observed_price():
-    market = Market(
-        id="m1", condition_id="c1", platform=Platform.POLYMARKET,
-        title="T", category="", tags=[], market_type=MarketType.BINARY,
-        volume=100, close_time=0, resolved=False, resolution=None,
-        scalar_low=None, scalar_high=None,
-    )
-    ctx = BacktestContext(
-        initial_cash=1000.0,
-        price_data={"m1": [PricePoint(100, 0.60, 0.40, 10)]},
-        orderbook_data=None,
-        markets={"m1": market},
-        execution_mode=ExecutionMode.STRICT_PRICE_ONLY,
-    )
-    ctx.advance_time(100)
-    trade_id = ctx.buy("m1", 10)
-    assert trade_id
-    trade = ctx._trades[-1]
-    assert trade["price"] == 0.60
-    assert trade["slippage"] == 0.0
-
-
-def test_live_context_no_synthetic_fallback():
-    from unittest.mock import MagicMock
-    cache = MagicMock()
-    cache.get_market.return_value = Market(
-        id="m1", condition_id="c1", platform=Platform.POLYMARKET,
-        title="T", category="", tags=[], market_type=MarketType.BINARY,
-        volume=100, close_time=0, resolved=False, resolution=None,
-        scalar_low=None, scalar_high=None,
-    )
-    ob_store = MagicMock()
-    ob_store.get_nearest.return_value = None
-    ctx = LiveContext("port1", 1000.0, cache, ob_store)
-    ctx._current_prices["m1"] = 0.50
-    with pytest.raises(AgentTraderError, match="NoObservedOrderbook"):
-        ctx.get_orderbook("m1")

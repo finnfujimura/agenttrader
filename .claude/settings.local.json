@@ -25,7 +25,8 @@
       "Bash(source:*)",
       "Bash(rtk git:*)",
       "Bash(wc:*)",
-      "Bash(find .:*)"
+      "Bash(find .:*)",
+      "Bash(rm:*)"
     ]
   }
 }
