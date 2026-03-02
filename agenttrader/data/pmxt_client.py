@@ -81,6 +81,99 @@ class PmxtClient:
         return results[:limit]
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    def search_markets(
+        self,
+        query: str,
+        platform: str = "all",
+        limit: int = 100,
+    ) -> list[Market]:
+        results_by_id: dict[tuple[str, str], Market] = {}
+        q = str(query or "").strip()
+        if not q:
+            return []
+
+        if platform in ("all", "polymarket"):
+            for item in self._poly.fetch_markets(query=q, status="all", limit=limit):
+                market = self._to_market(item, Platform.POLYMARKET, status_hint="all")
+                results_by_id[(market.platform.value, market.id)] = market
+
+        if platform in ("all", "kalshi"):
+            for item in self._kalshi.fetch_markets(query=q, status="all", limit=limit):
+                market = self._to_market(item, Platform.KALSHI, status_hint="all")
+                results_by_id[(market.platform.value, market.id)] = market
+
+        results = sorted(results_by_id.values(), key=lambda m: m.volume, reverse=True)
+        return results[:limit]
+
+    def get_live_snapshot(
+        self,
+        outcome_id: str,
+        platform: Platform,
+    ) -> dict[str, Any]:
+        client = self._poly if platform == Platform.POLYMARKET else self._kalshi
+        timestamp = int(time.time())
+        try:
+            book = client.fetch_order_book(outcome_id)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": str(exc),
+                "timestamp": timestamp,
+                "price": None,
+                "orderbook": None,
+            }
+
+        bids = [
+            OrderLevel(
+                price=self._safe_float(getattr(level, "price", None), 0.0),
+                size=self._safe_float(getattr(level, "size", None), 0.0),
+            )
+            for level in (getattr(book, "bids", None) or [])
+        ]
+        asks = [
+            OrderLevel(
+                price=self._safe_float(getattr(level, "price", None), 0.0),
+                size=self._safe_float(getattr(level, "size", None), 0.0),
+            )
+            for level in (getattr(book, "asks", None) or [])
+        ]
+        orderbook = OrderBook(
+            market_id=outcome_id,
+            timestamp=timestamp,
+            bids=bids,
+            asks=asks,
+        )
+
+        best_bid = bids[0].price if bids else None
+        best_ask = asks[0].price if asks else None
+        yes_price = None
+        if best_bid is not None and best_ask is not None:
+            yes_price = (best_bid + best_ask) / 2.0
+        elif best_bid is not None:
+            yes_price = best_bid
+        elif best_ask is not None:
+            yes_price = best_ask
+
+        price = None
+        if yes_price is not None:
+            clipped = max(0.0, min(1.0, float(yes_price)))
+            price = PricePoint(
+                timestamp=timestamp,
+                yes_price=clipped,
+                no_price=max(0.0, min(1.0, 1.0 - clipped)),
+                volume=0.0,
+            )
+
+        status = "ok" if price is not None else "empty"
+        return {
+            "status": status,
+            "error": None,
+            "timestamp": timestamp,
+            "price": price,
+            "orderbook": orderbook,
+        }
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def get_market_price(
         self,
         market_id: str,
@@ -235,29 +328,13 @@ class PmxtClient:
     ) -> dict[str, Any]:
         # pmxt provides current live book snapshots rather than historical snapshots.
         _ = (start_time, end_time, limit)
-        client = self._poly if platform == Platform.POLYMARKET else self._kalshi
-        try:
-            book = client.fetch_order_book(market_id)
-        except Exception as exc:
-            return {"snapshots": [], "status": "error", "error": str(exc)}
-        timestamp = int(time.time())
-        bids = [
-            OrderLevel(
-                price=self._safe_float(getattr(level, "price", None), 0.0),
-                size=self._safe_float(getattr(level, "size", None), 0.0),
-            )
-            for level in (getattr(book, "bids", None) or [])
-        ]
-        asks = [
-            OrderLevel(
-                price=self._safe_float(getattr(level, "price", None), 0.0),
-                size=self._safe_float(getattr(level, "size", None), 0.0),
-            )
-            for level in (getattr(book, "asks", None) or [])
-        ]
-        snapshots = [OrderBook(market_id=market_id, timestamp=timestamp, bids=bids, asks=asks)]
-        status = "ok" if bids or asks else "empty"
-        return {"snapshots": snapshots, "status": status, "error": None}
+        snapshot = self.get_live_snapshot(market_id, platform)
+        if snapshot["status"] == "error":
+            return {"snapshots": [], "status": "error", "error": snapshot["error"]}
+        orderbook = snapshot["orderbook"]
+        if orderbook is None:
+            return {"snapshots": [], "status": "empty", "error": None}
+        return {"snapshots": [orderbook], "status": snapshot["status"], "error": None}
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def get_matching_markets(

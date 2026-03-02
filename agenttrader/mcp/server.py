@@ -22,7 +22,7 @@ from agenttrader.cli.validate import validate_strategy_file
 from agenttrader.config import is_initialized, load_config
 from agenttrader.core.backtest_engine import BacktestConfig, BacktestEngine
 from agenttrader.core.base_strategy import BaseStrategy
-from agenttrader.core.paper_daemon import PaperDaemon
+from agenttrader.core.paper_daemon import PaperDaemon, read_runtime_status
 from agenttrader.data.backtest_artifacts import read_backtest_artifact, write_backtest_artifact
 from agenttrader.data.cache import DataCache
 from agenttrader.data.models import ExecutionMode
@@ -1073,6 +1073,30 @@ async def call_tool(name: str, arguments: dict):
             # Health check: wait briefly and verify daemon is still alive
             import time as _time
             _time.sleep(1.0)
+            runtime_status = read_runtime_status(portfolio_id)
+            if runtime_status and runtime_status.get("state") == "failed":
+                with get_session(get_engine()) as session:
+                    row = session.get(PaperPortfolio, portfolio_id)
+                    if row:
+                        row.status = "failed"
+                        row.pid = pid
+                        row.stopped_at = int(datetime.now(tz=UTC).timestamp())
+                        session.commit()
+                return _respond(
+                    _error_payload(
+                        "DaemonCrashed",
+                        "Paper trading daemon failed during live startup",
+                        fix="Check runtime_status.last_error and daemon log for details.",
+                        runtime_status=runtime_status,
+                    )
+                )
+            if runtime_status is None:
+                deadline = _time.time() + 4.0
+                while _time.time() < deadline and proc.poll() is None:
+                    runtime_status = read_runtime_status(portfolio_id)
+                    if runtime_status is not None:
+                        break
+                    _time.sleep(0.25)
             exit_code = proc.poll()
             if exit_code is not None:
                 # Daemon died immediately — read stderr log for details
@@ -1104,7 +1128,7 @@ async def call_tool(name: str, arguments: dict):
                 if row:
                     row.pid = pid
                     session.commit()
-            return _respond({"ok": True, "portfolio_id": portfolio_id, "pid": pid})
+            return _respond({"ok": True, "portfolio_id": portfolio_id, "pid": pid, "live_status": runtime_status})
 
         if name == "get_portfolio":
             portfolio_id = args["portfolio_id"]
@@ -1125,12 +1149,19 @@ async def call_tool(name: str, arguments: dict):
                         row.status = "dead"
                         session.commit()
                 p = cache.get_portfolio(portfolio_id)
+            runtime_status = read_runtime_status(p.id)
+            live_price_map = {
+                item["market_id"]: item.get("current_price")
+                for item in (runtime_status or {}).get("markets", [])
+                if item.get("market_id")
+            }
             positions = cache.get_open_positions(p.id)
             out = []
             unrealized = 0.0
             for pos in positions:
                 latest = cache.get_latest_price(pos.market_id)
-                current = latest.yes_price if latest else pos.avg_cost
+                live_price = live_price_map.get(pos.market_id)
+                current = live_price if live_price is not None else (latest.yes_price if latest else pos.avg_cost)
                 pnl = (current - pos.avg_cost) * pos.contracts
                 unrealized += pnl
                 out.append(
@@ -1157,6 +1188,10 @@ async def call_tool(name: str, arguments: dict):
                     "positions": out,
                     "last_reload": p.last_reload,
                     "reload_count": p.reload_count or 0,
+                    "last_live_update": runtime_status.get("last_live_update") if runtime_status else None,
+                    "markets_live": runtime_status.get("markets_with_live_price") if runtime_status else None,
+                    "markets_degraded": runtime_status.get("markets_degraded") if runtime_status else None,
+                    "live_status": runtime_status,
                 }
             )
 
@@ -1198,7 +1233,22 @@ async def call_tool(name: str, arguments: dict):
                             row.status = "dead"
                             session.commit()
                     p.status = "dead"
-            return _respond({"ok": True, "portfolios": [{"id": p.id, "status": p.status, "pid": p.pid} for p in rows]})
+            return _respond(
+                {
+                    "ok": True,
+                    "portfolios": [
+                        {
+                            "id": p.id,
+                            "status": p.status,
+                            "pid": p.pid,
+                            "last_live_update": (read_runtime_status(p.id) or {}).get("last_live_update"),
+                            "markets_live": (read_runtime_status(p.id) or {}).get("markets_with_live_price"),
+                            "markets_degraded": (read_runtime_status(p.id) or {}).get("markets_degraded"),
+                        }
+                        for p in rows
+                    ],
+                }
+            )
 
         if name == "sync_data":
             client = PmxtClient()

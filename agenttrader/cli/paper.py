@@ -16,7 +16,7 @@ from sqlalchemy import and_, select
 from agenttrader.cli.utils import emit_json, ensure_initialized, json_errors
 from agenttrader.cli.validate import validate_strategy_file
 from agenttrader.config import load_config
-from agenttrader.core.paper_daemon import PaperDaemon
+from agenttrader.core.paper_daemon import PaperDaemon, read_runtime_status
 from agenttrader.data.cache import DataCache
 from agenttrader.db import get_engine, get_session
 from agenttrader.db.schema import PaperPortfolio, Position, Trade
@@ -151,11 +151,18 @@ def paper_status(portfolio_id: str, json_output: bool) -> None:
         raise AgentTraderError("NotFound", f"Portfolio not found: {portfolio_id}")
 
     positions_rows = cache.get_open_positions(portfolio_id)
+    runtime_status = read_runtime_status(portfolio_id)
+    live_price_map = {
+        item["market_id"]: item.get("current_price")
+        for item in (runtime_status or {}).get("markets", [])
+        if item.get("market_id")
+    }
     positions = []
     unrealized_total = 0.0
     for pos in positions_rows:
         latest = cache.get_latest_price(pos.market_id)
-        current_price = latest.yes_price if latest else pos.avg_cost
+        live_price = live_price_map.get(pos.market_id)
+        current_price = live_price if live_price is not None else (latest.yes_price if latest else pos.avg_cost)
         upnl = (current_price - pos.avg_cost) * pos.contracts
         unrealized_total += upnl
         market = cache.get_market(pos.market_id)
@@ -187,6 +194,10 @@ def paper_status(portfolio_id: str, json_output: bool) -> None:
         "last_reload": portfolio.last_reload,
         "reload_count": portfolio.reload_count or 0,
     }
+    payload["last_live_update"] = runtime_status.get("last_live_update") if runtime_status else None
+    payload["markets_live"] = runtime_status.get("markets_with_live_price") if runtime_status else None
+    payload["markets_degraded"] = runtime_status.get("markets_degraded") if runtime_status else None
+    payload["live_status"] = runtime_status
 
     if json_output:
         emit_json(payload)
@@ -215,6 +226,9 @@ def paper_list(json_output: bool) -> None:
                 "initial_cash": p.initial_cash,
                 "last_reload": p.last_reload,
                 "reload_count": p.reload_count or 0,
+                "last_live_update": (read_runtime_status(p.id) or {}).get("last_live_update"),
+                "markets_live": (read_runtime_status(p.id) or {}).get("markets_with_live_price"),
+                "markets_degraded": (read_runtime_status(p.id) or {}).get("markets_degraded"),
             }
             for p in rows
         ],

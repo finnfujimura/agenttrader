@@ -730,26 +730,83 @@ class StreamingBacktestContext(ExecutionContext):
 
 
 class LiveContext(ExecutionContext):
-    def __init__(self, portfolio_id: str, initial_cash: float, cache: DataCache, ob_store: OrderBookStore):
+    def __init__(
+        self,
+        portfolio_id: str,
+        initial_cash: float,
+        cache: DataCache,
+        ob_store: OrderBookStore,
+        pmxt_client=None,
+        history_buffer_hours: int = 24,
+    ):
         self._portfolio_id = portfolio_id
         self._cash = float(initial_cash)
         self._cache = cache
         self._ob_store = ob_store
+        self._pmxt_client = pmxt_client
         self._fill_model = FillModel()
         self._state: dict[str, Any] = {}
         self._logs: list[str] = []
         self._subscriptions: dict[str, Market] = {}
         self._positions: dict[str, PositionModel] = {}
         self._current_prices: dict[str, float] = {}
+        self._live_orderbooks: dict[str, OrderBook] = {}
+        self._last_persisted_ts: dict[str, int] = {}
+        self._live_status: dict[str, dict[str, Any]] = {}
+        self._history_buffer_hours = max(int(history_buffer_hours), 1)
+        max_buffer = max(self._history_buffer_hours * 3600, 1)
+        self._history: dict[str, deque[PricePoint]] = defaultdict(lambda: deque(maxlen=max_buffer))
 
     def subscribe(self, platform="all", category=None, tags=None, market_ids=None) -> None:
-        markets = self._cache.get_markets(platform=platform, category=category, tags=tags, limit=1000)
+        live_markets: list[Market] = []
+        if self._pmxt_client:
+            try:
+                live_markets = self._pmxt_client.get_markets(
+                    platform=platform,
+                    category=category,
+                    tags=tags,
+                    market_ids=list(market_ids) if market_ids else None,
+                    resolved=False,
+                    limit=1000,
+                )
+            except Exception:
+                live_markets = []
+
+        for market in live_markets:
+            self._cache.upsert_market(market)
+
+        cache_markets: list[Market] = []
         if market_ids:
-            wanted = set(market_ids)
-            markets = [m for m in markets if m.id in wanted]
-        self._subscriptions = {m.id: m for m in markets}
+            for market_id in market_ids:
+                market = self._cache.get_market(str(market_id))
+                if market is None:
+                    continue
+                if platform != "all" and market.platform.value != platform:
+                    continue
+                if category and market.category != category:
+                    continue
+                if tags and not set(tags).issubset(set(market.tags)):
+                    continue
+                cache_markets.append(market)
+        else:
+            cache_markets = self._cache.get_markets(platform=platform, category=category, tags=tags, limit=1000)
+
+        combined = {market.id: market for market in cache_markets}
+        for market in live_markets:
+            combined[market.id] = market
+        self._subscriptions = combined
 
     def search_markets(self, query, platform="all") -> list[Market]:
+        if self._pmxt_client:
+            try:
+                markets = self._pmxt_client.search_markets(str(query or ""), platform=platform, limit=100)
+            except Exception:
+                markets = []
+            else:
+                for market in markets:
+                    self._cache.upsert_market(market)
+                if markets:
+                    return markets
         return self._cache.search_markets(query, platform)
 
     def get_price(self, market_id: str) -> float:
@@ -764,6 +821,8 @@ class LiveContext(ExecutionContext):
         self._current_prices[market_id] = float(price)
 
     def get_orderbook(self, market_id: str) -> OrderBook:
+        if market_id in self._live_orderbooks:
+            return self._live_orderbooks[market_id]
         market = self._cache.get_market(market_id)
         if not market:
             raise MarketNotCachedError(market_id)
@@ -771,15 +830,21 @@ class LiveContext(ExecutionContext):
         if not ob:
             raise AgentTraderError(
                 "NoObservedOrderbook",
-                f"No observed orderbook snapshot for {market_id}. "
-                "Run 'agenttrader sync' to fetch live orderbook data from PMXT.",
+                f"No observed orderbook snapshot for {market_id}.",
             )
         return ob
 
     def get_history(self, market_id: str, lookback_hours: int = 24) -> list[PricePoint]:
         now = int(datetime.now(tz=UTC).timestamp())
         start = now - int(lookback_hours * 3600)
-        return self._cache.get_price_history(market_id, start, now)
+        combined: dict[int, PricePoint] = {
+            point.timestamp: point
+            for point in self._cache.get_price_history(market_id, start, now)
+        }
+        for point in self._history.get(market_id, []):
+            if start <= point.timestamp <= now:
+                combined[point.timestamp] = point
+        return [combined[ts] for ts in sorted(combined)]
 
     def get_position(self, market_id: str) -> PositionModel | None:
         return self._positions.get(market_id)
@@ -796,6 +861,70 @@ class LiveContext(ExecutionContext):
                 mark = pos.avg_cost
             value += pos.contracts * mark
         return value
+
+    def refresh_market_live(
+        self,
+        market: Market,
+        persist_interval_seconds: int = 60,
+        force_persist: bool = False,
+    ) -> dict[str, Any]:
+        if not self._pmxt_client:
+            return self._mark_live_failure(market.id, "Live PMXT client is not configured.")
+
+        self._cache.upsert_market(market)
+        snapshot = self._pmxt_client.get_live_snapshot(market.id, market.platform)
+        if snapshot["status"] == "error":
+            return self._mark_live_failure(market.id, str(snapshot.get("error") or "Live snapshot failed."))
+
+        orderbook = snapshot.get("orderbook")
+        if orderbook is not None:
+            self._live_orderbooks[market.id] = orderbook
+
+        point = snapshot.get("price")
+        updated = False
+        if point is not None:
+            previous_price = self._current_prices.get(market.id)
+            self._current_prices[market.id] = float(point.yes_price)
+            history = self._history[market.id]
+            if history and history[-1].timestamp == point.timestamp:
+                history[-1] = point
+            else:
+                history.append(point)
+            updated = previous_price is None or abs(previous_price - point.yes_price) > 1e-12
+
+        persisted = False
+        if point is not None and (force_persist or self._should_persist_point(market.id, point.timestamp, persist_interval_seconds)):
+            self._cache.upsert_price_point(market.id, market.platform.value, point)
+            if orderbook is not None:
+                self._ob_store.write(market.platform.value, market.id, [orderbook])
+            self._cache.mark_market_synced(market.id, int(point.timestamp))
+            self._last_persisted_ts[market.id] = int(point.timestamp)
+            persisted = True
+
+        self._live_status[market.id] = {
+            "market_id": market.id,
+            "status": snapshot["status"],
+            "last_live_update_ts": point.timestamp if point is not None else None,
+            "last_orderbook_ts": orderbook.timestamp if orderbook is not None else None,
+            "last_error": None,
+            "consecutive_failures": 0,
+            "degraded": snapshot["status"] != "ok",
+            "has_live_price": point is not None,
+            "has_live_orderbook": orderbook is not None,
+            "current_price": point.yes_price if point is not None else self._current_prices.get(market.id),
+        }
+        return {
+            "market_id": market.id,
+            "status": snapshot["status"],
+            "price": point,
+            "orderbook": orderbook,
+            "updated": updated,
+            "persisted": persisted,
+            "error": None,
+        }
+
+    def get_live_status(self) -> dict[str, dict[str, Any]]:
+        return {market_id: dict(state) for market_id, state in self._live_status.items()}
 
     def buy(self, market_id, contracts, side="yes", order_type="market", limit_price=None) -> str:
         _validate_buy_params(contracts, order_type, limit_price)
@@ -970,6 +1099,37 @@ class LiveContext(ExecutionContext):
                 opened_at=int(row.opened_at),
             )
             for row in rows
+        }
+
+    def _should_persist_point(self, market_id: str, timestamp: int, persist_interval_seconds: int) -> bool:
+        last_persisted = self._last_persisted_ts.get(market_id)
+        if last_persisted is None:
+            return True
+        return int(timestamp) - int(last_persisted) >= max(int(persist_interval_seconds), 1)
+
+    def _mark_live_failure(self, market_id: str, error: str) -> dict[str, Any]:
+        previous = self._live_status.get(market_id, {})
+        failures = int(previous.get("consecutive_failures", 0)) + 1
+        self._live_status[market_id] = {
+            "market_id": market_id,
+            "status": "error",
+            "last_live_update_ts": previous.get("last_live_update_ts"),
+            "last_orderbook_ts": previous.get("last_orderbook_ts"),
+            "last_error": error,
+            "consecutive_failures": failures,
+            "degraded": True,
+            "has_live_price": market_id in self._current_prices,
+            "has_live_orderbook": market_id in self._live_orderbooks,
+            "current_price": self._current_prices.get(market_id),
+        }
+        return {
+            "market_id": market_id,
+            "status": "error",
+            "price": None,
+            "orderbook": None,
+            "updated": False,
+            "persisted": False,
+            "error": error,
         }
 
     @property

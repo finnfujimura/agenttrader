@@ -11,12 +11,17 @@ APP_DIR = Path.home() / ".agenttrader"
 CONFIG_PATH = APP_DIR / "config.yaml"
 DB_PATH = APP_DIR / "db.sqlite"
 ORDERBOOK_DIR = APP_DIR / "orderbooks"
+RUNTIME_DIR = APP_DIR / "runtime"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "schedule_interval_minutes": 15,
     "default_initial_cash": 10000.0,
     "sync_granularity": "hourly",
     "max_sync_days": 90,
+    "paper_poll_interval_seconds": 5,
+    "paper_persist_interval_seconds": 60,
+    "paper_max_concurrent_requests": 8,
+    "paper_history_buffer_hours": 24,
 }
 
 
@@ -31,6 +36,7 @@ def is_initialized() -> bool:
 def ensure_app_dir() -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
     ORDERBOOK_DIR.mkdir(parents=True, exist_ok=True)
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def write_default_config() -> None:
@@ -80,6 +86,46 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         errors.append(f"max_sync_days must be an integer, got {val!r}")
     cfg["max_sync_days"] = val
+
+    # paper_poll_interval_seconds: int, 1 â€“ 60
+    val = cfg.get("paper_poll_interval_seconds", 5)
+    try:
+        val = int(val)
+        if not (1 <= val <= 60):
+            errors.append(f"paper_poll_interval_seconds must be between 1 and 60, got {val}")
+    except (TypeError, ValueError):
+        errors.append(f"paper_poll_interval_seconds must be an integer, got {val!r}")
+    cfg["paper_poll_interval_seconds"] = val
+
+    # paper_persist_interval_seconds: int, 1 â€“ 3600
+    val = cfg.get("paper_persist_interval_seconds", 60)
+    try:
+        val = int(val)
+        if not (1 <= val <= 3600):
+            errors.append(f"paper_persist_interval_seconds must be between 1 and 3600, got {val}")
+    except (TypeError, ValueError):
+        errors.append(f"paper_persist_interval_seconds must be an integer, got {val!r}")
+    cfg["paper_persist_interval_seconds"] = val
+
+    # paper_max_concurrent_requests: int, 1 â€“ 64
+    val = cfg.get("paper_max_concurrent_requests", 8)
+    try:
+        val = int(val)
+        if not (1 <= val <= 64):
+            errors.append(f"paper_max_concurrent_requests must be between 1 and 64, got {val}")
+    except (TypeError, ValueError):
+        errors.append(f"paper_max_concurrent_requests must be an integer, got {val!r}")
+    cfg["paper_max_concurrent_requests"] = val
+
+    # paper_history_buffer_hours: int, 1 â€“ 720
+    val = cfg.get("paper_history_buffer_hours", 24)
+    try:
+        val = int(val)
+        if not (1 <= val <= 720):
+            errors.append(f"paper_history_buffer_hours must be between 1 and 720, got {val}")
+    except (TypeError, ValueError):
+        errors.append(f"paper_history_buffer_hours must be an integer, got {val!r}")
+    cfg["paper_history_buffer_hours"] = val
 
     if errors:
         raise ConfigError("Invalid config:\n" + "\n".join(f"  - {e}" for e in errors))
