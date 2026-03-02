@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import signal
+import sys
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,26 @@ from agenttrader.data.cache import DataCache
 from agenttrader.db import get_engine, get_session
 from agenttrader.db.schema import PaperPortfolio, Position, Trade
 from agenttrader.errors import AgentTraderError
+
+
+def _terminate_pid(pid: int) -> None:
+    """Terminate a process by PID, using the correct method per platform."""
+    if sys.platform == "win32":
+        # On Windows, SIGTERM is not deliverable cross-process via os.kill.
+        # Use os.kill with SIGTERM which maps to TerminateProcess on Windows,
+        # but wrap with kernel32 for reliable detached-process termination.
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_TERMINATE = 0x0001
+        handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+        if handle:
+            kernel32.TerminateProcess(handle, 1)
+            kernel32.CloseHandle(handle)
+        else:
+            # Fallback: try os.kill anyway (works for some process types)
+            os.kill(pid, signal.SIGTERM)
+    else:
+        os.kill(pid, signal.SIGTERM)
 
 
 @click.group("paper")
@@ -124,8 +145,8 @@ def paper_stop(portfolio_id: str | None, stop_all: bool, json_output: bool) -> N
                 continue
             if row.pid:
                 try:
-                    os.kill(int(row.pid), signal.SIGTERM)
-                except ProcessLookupError:
+                    _terminate_pid(int(row.pid))
+                except (ProcessLookupError, OSError):
                     pass
             row.status = "stopped"
             row.stopped_at = int(datetime.now(tz=UTC).timestamp())
@@ -212,27 +233,25 @@ def paper_list(json_output: bool) -> None:
     ensure_initialized()
     cache = DataCache(get_engine())
     rows = cache.list_paper_portfolios()
-    payload = {
-        "ok": True,
-        "portfolios": [
-            {
-                "id": p.id,
-                "strategy_path": p.strategy_path,
-                "status": p.status,
-                "pid": p.pid,
-                "started_at": p.started_at,
-                "stopped_at": p.stopped_at,
-                "cash_balance": p.cash_balance,
-                "initial_cash": p.initial_cash,
-                "last_reload": p.last_reload,
-                "reload_count": p.reload_count or 0,
-                "last_live_update": (read_runtime_status(p.id) or {}).get("last_live_update"),
-                "markets_live": (read_runtime_status(p.id) or {}).get("markets_with_live_price"),
-                "markets_degraded": (read_runtime_status(p.id) or {}).get("markets_degraded"),
-            }
-            for p in rows
-        ],
-    }
+    portfolios = []
+    for p in rows:
+        rs = read_runtime_status(p.id) or {}
+        portfolios.append({
+            "id": p.id,
+            "strategy_path": p.strategy_path,
+            "status": p.status,
+            "pid": p.pid,
+            "started_at": p.started_at,
+            "stopped_at": p.stopped_at,
+            "cash_balance": p.cash_balance,
+            "initial_cash": p.initial_cash,
+            "last_reload": p.last_reload,
+            "reload_count": p.reload_count or 0,
+            "last_live_update": rs.get("last_live_update"),
+            "markets_live": rs.get("markets_with_live_price"),
+            "markets_degraded": rs.get("markets_degraded"),
+        })
+    payload = {"ok": True, "portfolios": portfolios}
     if json_output:
         emit_json(payload)
     else:

@@ -1208,12 +1208,23 @@ async def call_tool(name: str, arguments: dict):
                 )
             import os
             import signal
+            import sys
 
             if p.pid:
                 try:
-                    os.kill(int(p.pid), signal.SIGTERM)
+                    if sys.platform == "win32":
+                        import ctypes
+                        kernel32 = ctypes.windll.kernel32
+                        handle = kernel32.OpenProcess(0x0001, False, int(p.pid))
+                        if handle:
+                            kernel32.TerminateProcess(handle, 1)
+                            kernel32.CloseHandle(handle)
+                        else:
+                            os.kill(int(p.pid), signal.SIGTERM)
+                    else:
+                        os.kill(int(p.pid), signal.SIGTERM)
                 except (ProcessLookupError, OSError):
-                    pass  # Process already dead or Windows WinError 87
+                    pass  # Process already dead
             with get_session(get_engine()) as session:
                 row = session.get(PaperPortfolio, p.id)
                 if row:
@@ -1233,22 +1244,18 @@ async def call_tool(name: str, arguments: dict):
                             row.status = "dead"
                             session.commit()
                     p.status = "dead"
-            return _respond(
-                {
-                    "ok": True,
-                    "portfolios": [
-                        {
-                            "id": p.id,
-                            "status": p.status,
-                            "pid": p.pid,
-                            "last_live_update": (read_runtime_status(p.id) or {}).get("last_live_update"),
-                            "markets_live": (read_runtime_status(p.id) or {}).get("markets_with_live_price"),
-                            "markets_degraded": (read_runtime_status(p.id) or {}).get("markets_degraded"),
-                        }
-                        for p in rows
-                    ],
-                }
-            )
+            portfolios = []
+            for p in rows:
+                rs = read_runtime_status(p.id) or {}
+                portfolios.append({
+                    "id": p.id,
+                    "status": p.status,
+                    "pid": p.pid,
+                    "last_live_update": rs.get("last_live_update"),
+                    "markets_live": rs.get("markets_with_live_price"),
+                    "markets_degraded": rs.get("markets_degraded"),
+                })
+            return _respond({"ok": True, "portfolios": portfolios})
 
         if name == "sync_data":
             client = PmxtClient()

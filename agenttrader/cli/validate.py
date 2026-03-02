@@ -27,6 +27,8 @@ FORBIDDEN_IMPORTS = {
     "os", "subprocess", "shutil", "sys",
     # Low-level / dangerous
     "socket", "ctypes", "sqlite3",
+    # Concurrency — can interfere with the daemon event loop or spawn threads
+    "threading", "asyncio", "multiprocessing", "concurrent",
     # Dynamic import bypass
     "importlib",
     # Internal SDK

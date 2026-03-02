@@ -38,6 +38,7 @@ class DaemonRuntime:
     context: LiveContext | None = None
     observer: Observer | None = None
     shutdown: bool = False
+    strategy_started: bool = False
     reload_requested: threading.Event = field(default_factory=threading.Event)
 
 
@@ -141,6 +142,7 @@ class PaperDaemon:
             ob_store,
             pmxt_client=client,
             history_buffer_hours=cfg["paper_history_buffer_hours"],
+            poll_interval_seconds=cfg["paper_poll_interval_seconds"],
         )
         self._runtime.context.load_positions_from_db()
         self._write_runtime_status("starting", {
@@ -155,7 +157,6 @@ class PaperDaemon:
         try:
             asyncio.run(loop_coro)
         except Exception as exc:
-            loop_coro.close()
             LOGGER.exception("Daemon crash for portfolio %s", self.portfolio_id)
             self._write_runtime_status("failed", {"last_error": str(exc)})
             try:
@@ -171,7 +172,7 @@ class PaperDaemon:
             if self._runtime.observer:
                 self._runtime.observer.stop()
                 self._runtime.observer.join(timeout=2)
-            if self._runtime.strategy:
+            if self._runtime.strategy and self._runtime.strategy_started:
                 self._runtime.strategy.on_stop()
             if self._runtime.shutdown:
                 self._write_runtime_status("stopped")
@@ -195,6 +196,7 @@ class PaperDaemon:
         strategy = strategy_class(self._runtime.context)
         strategy.on_start()
         self._runtime.strategy = strategy
+        self._runtime.strategy_started = True
         self._runtime.context.log(f"Strategy loaded: {strategy_class.__name__}")
 
     def _setup_file_watcher(self):
@@ -207,8 +209,9 @@ class PaperDaemon:
     def _reload_strategy(self):
         if not self._runtime.context:
             return
-        if self._runtime.strategy:
+        if self._runtime.strategy and self._runtime.strategy_started:
             self._runtime.strategy.on_stop()
+        self._runtime.strategy_started = False
 
         self._load_strategy()
         now_ts = int(datetime.now(tz=UTC).timestamp())

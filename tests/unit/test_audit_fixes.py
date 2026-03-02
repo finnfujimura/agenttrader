@@ -68,6 +68,26 @@ class MyStrategy(BaseStrategy):
         assert result["valid"] is False
         assert any(e["type"] == "ForbiddenImport" for e in result["errors"])
 
+    def test_threading_import_blocked(self):
+        result = self._validate(self._valid_strategy("import threading"))
+        assert result["valid"] is False
+        assert any(e["type"] == "ForbiddenImport" for e in result["errors"])
+
+    def test_asyncio_import_blocked(self):
+        result = self._validate(self._valid_strategy("import asyncio"))
+        assert result["valid"] is False
+        assert any(e["type"] == "ForbiddenImport" for e in result["errors"])
+
+    def test_multiprocessing_import_blocked(self):
+        result = self._validate(self._valid_strategy("import multiprocessing"))
+        assert result["valid"] is False
+        assert any(e["type"] == "ForbiddenImport" for e in result["errors"])
+
+    def test_concurrent_import_blocked(self):
+        result = self._validate(self._valid_strategy("from concurrent.futures import ThreadPoolExecutor"))
+        assert result["valid"] is False
+        assert any(e["type"] == "ForbiddenImport" for e in result["errors"])
+
     def test_dunder_import_blocked(self):
         """__import__() should produce a DynamicImport error (not just warning)."""
         source = self._valid_strategy(extra_body='def helper(self): __import__("os")')

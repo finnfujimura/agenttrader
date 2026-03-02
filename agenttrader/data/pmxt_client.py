@@ -105,6 +105,10 @@ class PmxtClient:
         results = sorted(results_by_id.values(), key=lambda m: m.volume, reverse=True)
         return results[:limit]
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    def _fetch_order_book_with_retry(self, client: Any, outcome_id: str) -> Any:
+        return client.fetch_order_book(outcome_id)
+
     def get_live_snapshot(
         self,
         outcome_id: str,
@@ -113,7 +117,7 @@ class PmxtClient:
         client = self._poly if platform == Platform.POLYMARKET else self._kalshi
         timestamp = int(time.time())
         try:
-            book = client.fetch_order_book(outcome_id)
+            book = self._fetch_order_book_with_retry(client, outcome_id)
         except Exception as exc:
             return {
                 "status": "error",

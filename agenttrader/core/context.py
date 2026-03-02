@@ -11,7 +11,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.dialects.sqlite import insert
 
 from agenttrader.data.cache import DataCache
-from agenttrader.data.models import ExecutionMode, Market, OrderBook, Platform, Position as PositionModel, PricePoint
+from agenttrader.data.models import ExecutionMode, FillResult, Market, OrderBook, Platform, Position as PositionModel, PricePoint
 from agenttrader.data.orderbook_store import OrderBookStore
 from agenttrader.db import get_session
 from agenttrader.db.schema import PaperPortfolio, Position, Trade
@@ -738,6 +738,7 @@ class LiveContext(ExecutionContext):
         ob_store: OrderBookStore,
         pmxt_client=None,
         history_buffer_hours: int = 24,
+        poll_interval_seconds: int = 5,
     ):
         self._portfolio_id = portfolio_id
         self._cash = float(initial_cash)
@@ -754,7 +755,10 @@ class LiveContext(ExecutionContext):
         self._last_persisted_ts: dict[str, int] = {}
         self._live_status: dict[str, dict[str, Any]] = {}
         self._history_buffer_hours = max(int(history_buffer_hours), 1)
-        max_buffer = max(self._history_buffer_hours * 3600, 1)
+        # Size buffer by expected data points, not seconds.
+        # At 5s polling (default), 24h = 17,280 points.
+        poll_interval = max(int(poll_interval_seconds), 1)
+        max_buffer = max(self._history_buffer_hours * 3600 // poll_interval, 1)
         self._history: dict[str, deque[PricePoint]] = defaultdict(lambda: deque(maxlen=max_buffer))
 
     def subscribe(self, platform="all", category=None, tags=None, market_ids=None) -> None:
@@ -901,14 +905,18 @@ class LiveContext(ExecutionContext):
             self._last_persisted_ts[market.id] = int(point.timestamp)
             persisted = True
 
+        previous = self._live_status.get(market.id, {})
+        prev_failures = int(previous.get("consecutive_failures", 0))
+        # Decrement toward 0 on success so recovery requires sustained stability
+        new_failures = max(prev_failures - 1, 0)
         self._live_status[market.id] = {
             "market_id": market.id,
             "status": snapshot["status"],
             "last_live_update_ts": point.timestamp if point is not None else None,
             "last_orderbook_ts": orderbook.timestamp if orderbook is not None else None,
             "last_error": None,
-            "consecutive_failures": 0,
-            "degraded": snapshot["status"] != "ok",
+            "consecutive_failures": new_failures,
+            "degraded": snapshot["status"] != "ok" or new_failures > 0,
             "has_live_price": point is not None,
             "has_live_orderbook": orderbook is not None,
             "current_price": point.yes_price if point is not None else self._current_prices.get(market.id),
@@ -929,8 +937,15 @@ class LiveContext(ExecutionContext):
     def buy(self, market_id, contracts, side="yes", order_type="market", limit_price=None) -> str:
         _validate_buy_params(contracts, order_type, limit_price)
         contracts = float(contracts)
-        ob = self.get_orderbook(market_id)
-        fill = self._fill_model.simulate_buy(contracts, ob, order_type=order_type, limit_price=limit_price)
+        try:
+            ob = self.get_orderbook(market_id)
+            fill = self._fill_model.simulate_buy(contracts, ob, order_type=order_type, limit_price=limit_price)
+        except AgentTraderError:
+            # Fall back to mid-price when no live orderbook is available yet
+            price = self._current_prices.get(market_id)
+            if price is None:
+                raise MarketNotCachedError(market_id)
+            fill = FillResult(filled=True, fill_price=price, contracts=float(contracts), slippage=0.0, partial=False)
         if not fill.filled or fill.contracts <= 0:
             raise AgentTraderError("OrderNotFilled", f"Buy not filled for market {market_id}")
 
@@ -1016,8 +1031,15 @@ class LiveContext(ExecutionContext):
             raise AgentTraderError("NoPositionError", f"No open position for market {market_id}")
 
         qty = min(float(contracts if contracts is not None else pos.contracts), pos.contracts)
-        ob = self.get_orderbook(market_id)
-        fill = self._fill_model.simulate_sell(qty, ob)
+        try:
+            ob = self.get_orderbook(market_id)
+            fill = self._fill_model.simulate_sell(qty, ob)
+        except AgentTraderError:
+            # Fall back to mid-price when no live orderbook is available yet
+            price = self._current_prices.get(market_id)
+            if price is None:
+                raise MarketNotCachedError(market_id)
+            fill = FillResult(filled=True, fill_price=price, contracts=float(qty), slippage=0.0, partial=False)
         if not fill.filled or fill.contracts <= 0:
             raise AgentTraderError("OrderNotFilled", f"Sell not filled for market {market_id}")
 
