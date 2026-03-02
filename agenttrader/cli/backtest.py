@@ -59,6 +59,69 @@ def get_backtest_engine() -> BacktestEngine:
     )
 
 
+def _format_elapsed(seconds: float | None) -> str:
+    if seconds is None:
+        return "?"
+    total = max(int(seconds), 0)
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _update_running_backtest_row(db_engine, run_id: str, payload: dict) -> None:
+    with get_session(db_engine) as session:
+        row = session.get(BacktestRun, run_id)
+        if row:
+            row.results_json = json.dumps(payload)
+            session.commit()
+
+
+def _make_cli_backtest_progress_callback(run_id: str, db_engine, json_output: bool):
+    state = {"ok": True, "run_id": run_id, "status": "running"}
+
+    def _emit(message: str) -> None:
+        click.echo(message, err=json_output)
+
+    def _callback(event: dict) -> None:
+        kind = event.get("kind")
+        if kind == "preflight":
+            state["preflight"] = dict(event)
+            parts = [
+                "Backtest starting",
+                f"source={event.get('data_source', '?')}",
+                f"fidelity={event.get('fidelity', '?')}",
+                f"markets={event.get('markets_tested', 0)}",
+            ]
+            if event.get("max_markets_applied") is not None:
+                parts.append(f"max_markets={event['max_markets_applied']}")
+            estimated = event.get("estimated_work_units")
+            if estimated is not None:
+                parts.append(f"estimated_{event.get('work_unit_label', 'events')}={estimated}")
+            _emit(" | ".join(parts))
+            for warning in event.get("warnings", []):
+                _emit(f"Warning: {warning}")
+            if event.get("large_run_warning"):
+                _emit(f"Warning: {event['large_run_warning']}")
+        elif kind == "progress":
+            state["progress"] = dict(event)
+            simulated_at = datetime.fromtimestamp(int(event["current_ts"]), tz=UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+            unit_label = event.get("work_unit_label", "events")
+            _emit(
+                "Backtest progress "
+                f"{event.get('percent_complete', 0.0):5.1f}% | "
+                f"sim={simulated_at} | "
+                f"{event.get('processed_units', 0)} {unit_label} | "
+                f"{event.get('throughput_per_second', 0.0)} {unit_label}/s | "
+                f"elapsed={_format_elapsed(event.get('elapsed_seconds'))} | "
+                f"eta={_format_elapsed(event.get('eta_seconds'))}"
+            )
+        _update_running_backtest_row(db_engine, run_id, state)
+
+    return _callback
+
+
 def _backtest_run(strategy_path: str, args: list[str]) -> None:
     ensure_initialized()
 
@@ -135,6 +198,7 @@ def _backtest_run(strategy_path: str, args: list[str]) -> None:
     now_ts = int(datetime.now(tz=UTC).timestamp())
 
     db_engine = get_engine()
+    progress_callback = _make_cli_backtest_progress_callback(run_id, db_engine, json_output)
     with get_session(db_engine) as session:
         session.add(
             BacktestRun(
@@ -168,6 +232,7 @@ def _backtest_run(strategy_path: str, args: list[str]) -> None:
                 max_markets=max_markets,
                 fidelity=fidelity,
             ),
+            progress_callback=progress_callback,
         )
         if results.get("ok") is False:
             raise AgentTraderError(results.get("error", "BacktestError"), results.get("message", "Backtest failed"), results)
@@ -202,6 +267,8 @@ def _backtest_run(strategy_path: str, args: list[str]) -> None:
                 click.echo("Data source: local sync cache (SQLite) -- run 'agenttrader dataset download' for full history")
             click.echo(f"Final value: {results['final_value']:.2f}")
             click.echo(f"Sharpe: {results['metrics']['sharpe_ratio']}")
+            for warning in results.get("warnings", []):
+                click.echo(f"Warning: {warning}")
     except Exception as exc:
         tb = traceback.format_exc()
         with get_session(db_engine) as session:
@@ -245,9 +312,15 @@ def _backtest_list(args: list[str]) -> None:
 
     cache = DataCache(get_engine())
     rows = cache.list_backtest_runs(limit=200)
-    payload = {
-        "ok": True,
-        "runs": [
+    runs = []
+    for r in rows:
+        progress = None
+        if r.status == "running" and r.results_json:
+            try:
+                progress = json.loads(r.results_json).get("progress")
+            except json.JSONDecodeError:
+                progress = None
+        runs.append(
             {
                 "id": r.id,
                 "strategy_path": r.strategy_path,
@@ -256,9 +329,14 @@ def _backtest_list(args: list[str]) -> None:
                 "status": r.status,
                 "created_at": r.created_at,
                 "completed_at": r.completed_at,
+                "progress_pct": (progress or {}).get("percent_complete"),
+                "processed_units": (progress or {}).get("processed_units"),
+                "work_unit_label": (progress or {}).get("work_unit_label"),
             }
-            for r in rows
-        ],
+        )
+    payload = {
+        "ok": True,
+        "runs": runs,
     }
     if json_output:
         emit_json(payload)
@@ -269,8 +347,20 @@ def _backtest_list(args: list[str]) -> None:
     table.add_column("Strategy")
     table.add_column("Range")
     table.add_column("Status")
+    table.add_column("Progress")
     for row in payload["runs"]:
-        table.add_row(row["id"][:8], Path(row["strategy_path"]).name, f"{row['start_date']} -> {row['end_date']}", row["status"])
+        progress = ""
+        if row.get("progress_pct") is not None:
+            progress = f"{row['progress_pct']:.1f}%"
+            if row.get("processed_units") is not None:
+                progress += f" ({row['processed_units']} {row.get('work_unit_label', 'events')})"
+        table.add_row(
+            row["id"][:8],
+            Path(row["strategy_path"]).name,
+            f"{row['start_date']} -> {row['end_date']}",
+            row["status"],
+            progress,
+        )
     Console().print(table)
 
 
@@ -288,13 +378,14 @@ def _backtest_show(args: list[str]) -> None:
     if not row:
         raise AgentTraderError("NotFound", f"Backtest run not found: {run_id}")
 
-    if row.status == "complete" and row.results_json:
+    if row.results_json:
         data = json.loads(row.results_json)
-        artifact = read_backtest_artifact(run_id)
-        if artifact.get("equity_curve") or "equity_curve" not in data:
-            data["equity_curve"] = artifact.get("equity_curve", [])
-        if artifact.get("trades") or "trades" not in data:
-            data["trades"] = artifact.get("trades", [])
+        if row.status == "complete":
+            artifact = read_backtest_artifact(run_id)
+            if artifact.get("equity_curve") or "equity_curve" not in data:
+                data["equity_curve"] = artifact.get("equity_curve", [])
+            if artifact.get("trades") or "trades" not in data:
+                data["trades"] = artifact.get("trades", [])
     else:
         data = {
             "ok": True,
@@ -314,6 +405,15 @@ def _backtest_show(args: list[str]) -> None:
         if row.status == "complete":
             click.echo(f"Final value: {data.get('final_value', 0):.2f}")
             click.echo(f"Sharpe: {data.get('metrics', {}).get('sharpe_ratio', 0)}")
+            for warning in data.get("warnings", []):
+                click.echo(f"Warning: {warning}")
+        elif row.status == "running" and data.get("progress"):
+            progress = data["progress"]
+            click.echo(
+                f"Progress: {progress.get('percent_complete', 0.0):.1f}% | "
+                f"{progress.get('processed_units', 0)} {progress.get('work_unit_label', 'events')} | "
+                f"ETA { _format_elapsed(progress.get('eta_seconds')) }"
+            )
         elif row.error:
             click.echo(row.error)
 

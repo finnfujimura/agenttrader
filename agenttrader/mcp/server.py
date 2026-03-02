@@ -110,6 +110,41 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _persist_backtest_progress(run_id: str, payload: dict) -> None:
+    with get_session(get_engine()) as session:
+        row = session.get(BacktestRun, run_id)
+        if row:
+            row.results_json = json.dumps(payload)
+            session.commit()
+
+
+def _make_mcp_backtest_progress_callback(run_id: str):
+    state = {"ok": True, "run_id": run_id, "status": "running"}
+
+    def _callback(event: dict) -> None:
+        kind = event.get("kind")
+        if kind == "preflight":
+            state["preflight"] = dict(event)
+        elif kind == "progress":
+            state["progress"] = dict(event)
+        _persist_backtest_progress(run_id, state)
+
+    return _callback
+
+
+def _extract_backtest_progress(results_json: str | None) -> dict | None:
+    if not results_json:
+        return None
+    try:
+        payload = json.loads(results_json)
+    except json.JSONDecodeError:
+        return None
+    progress = payload.get("progress")
+    if not isinstance(progress, dict):
+        return None
+    return progress
+
+
 def _compute_history_analytics(history: list, end_ts: int) -> dict:
     if not history:
         return {
@@ -814,6 +849,8 @@ async def call_tool(name: str, arguments: dict):
                 )
                 session.commit()
 
+            progress_callback = _make_mcp_backtest_progress_callback(run_id)
+
             try:
                 spec = importlib.util.spec_from_file_location("user_strategy", str(strategy_path))
                 if spec is None or spec.loader is None:
@@ -847,6 +884,7 @@ async def call_tool(name: str, arguments: dict):
                         fidelity=str(args.get("fidelity", "exact_trade")),
                         execution_mode=execution_mode,
                     ),
+                    progress_callback=progress_callback,
                 )
                 if result.get("ok") is False:
                     raise RuntimeError(result.get("message", "Backtest failed"))
@@ -1053,8 +1091,21 @@ async def call_tool(name: str, arguments: dict):
             return _respond({"ok": True, "status": row.status})
 
         if name == "list_backtests":
-            rows = cache.list_backtest_runs(limit=100, lightweight=True)
-            return _respond({"ok": True, "runs": [{"id": r.id, "status": r.status, "strategy_path": r.strategy_path} for r in rows]})
+            rows = cache.list_backtest_runs(limit=100)
+            runs = []
+            for row in rows:
+                progress = _extract_backtest_progress(row.results_json)
+                runs.append(
+                    {
+                        "id": row.id,
+                        "status": row.status,
+                        "strategy_path": row.strategy_path,
+                        "progress_pct": (progress or {}).get("percent_complete"),
+                        "processed_units": (progress or {}).get("processed_units"),
+                        "work_unit_label": (progress or {}).get("work_unit_label"),
+                    }
+                )
+            return _respond({"ok": True, "runs": runs})
 
         if name == "start_paper_trade":
             strategy_path = Path(args["strategy_path"]).resolve()

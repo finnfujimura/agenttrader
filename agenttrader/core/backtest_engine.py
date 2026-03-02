@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import math
 import heapq
+import time
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -13,6 +15,12 @@ from agenttrader.core.base_strategy import BaseStrategy
 from agenttrader.core.context import BacktestContext, StreamingBacktestContext
 from agenttrader.core.fill_model import FillModel
 from agenttrader.data.models import ExecutionMode, Market, Platform
+
+
+PROGRESS_INTERVAL_SECONDS = 2.5
+STREAM_BATCH_MARKET_COUNT = 512
+LARGE_RUN_MARKET_WARNING = 5000
+LARGE_RUN_WORK_UNITS_WARNING = 1_000_000
 
 
 @dataclass
@@ -26,6 +34,9 @@ class BacktestConfig:
     max_markets: int | None = None
     fidelity: str = "exact_trade"
     execution_mode: ExecutionMode = ExecutionMode.STRICT_PRICE_ONLY
+
+
+BacktestProgressCallback = Callable[[dict], None]
 
 
 class SubscriptionCollector:
@@ -103,13 +114,18 @@ class BacktestEngine:
         self._ob_store = orderbook_store
         self._fill_model = FillModel()
 
-    def run(self, strategy_class: type, config: BacktestConfig) -> dict:
+    def run(
+        self,
+        strategy_class: type,
+        config: BacktestConfig,
+        progress_callback: BacktestProgressCallback | None = None,
+    ) -> dict:
         from agenttrader.data.index_adapter import BacktestIndexAdapter
 
         index = BacktestIndexAdapter()
         if index.is_available():
             try:
-                result = self._run_streaming(strategy_class, config, index)
+                result = self._run_streaming(strategy_class, config, index, progress_callback=progress_callback)
             finally:
                 index.close()
 
@@ -117,13 +133,13 @@ class BacktestEngine:
             if isinstance(result, dict) and not result.get("ok", True):
                 error = result.get("error", "")
                 if error in ("NoDataInRange", "NoSubscriptions", "DatasetNotFound"):
-                    legacy = self._run_legacy(strategy_class, config)
+                    legacy = self._run_legacy(strategy_class, config, progress_callback=progress_callback)
                     if isinstance(legacy, dict) and legacy.get("ok"):
                         legacy["fallback_from"] = "normalized-index"
                         legacy["fallback_reason"] = result.get("message", error)
                     return legacy
             return result
-        return self._run_legacy(strategy_class, config)
+        return self._run_legacy(strategy_class, config, progress_callback=progress_callback)
 
     def _ensure_legacy_data_source(self) -> None:
         if self._data is not None:
@@ -141,7 +157,122 @@ class BacktestEngine:
         self._data = DataCache(get_engine())
         self._ob_store = OrderBookStore()
 
-    def _run_legacy(self, strategy_class: type, config: BacktestConfig) -> dict:
+    def _emit_progress(
+        self,
+        progress_callback: BacktestProgressCallback | None,
+        payload: dict | None,
+    ) -> None:
+        if progress_callback is None or payload is None:
+            return
+        progress_callback(payload)
+
+    def _build_resampled_warning(self, fidelity: str) -> list[str]:
+        if fidelity not in {"bar_1h", "bar_1d"}:
+            return []
+        return [
+            (
+                "Using resampled bars. Strategies that rely on get_history(lookback_hours=...) "
+                "may see lower-density history and may need recalibration."
+            )
+        ]
+
+    def _build_preflight_payload(
+        self,
+        *,
+        data_source: str,
+        fidelity: str,
+        start_ts: int,
+        end_ts: int,
+        markets_tested: int,
+        max_markets_applied: int | None,
+        requested_max_markets: int | None,
+        estimated_work_units: int | None,
+        work_unit_label: str,
+        warnings: list[str] | None = None,
+    ) -> dict:
+        payload = {
+            "kind": "preflight",
+            "status": "running",
+            "data_source": data_source,
+            "fidelity": fidelity,
+            "range_start_ts": start_ts,
+            "range_end_ts": end_ts,
+            "markets_tested": markets_tested,
+            "max_markets_applied": max_markets_applied,
+            "requested_max_markets": requested_max_markets,
+            "estimated_work_units": estimated_work_units,
+            "work_unit_label": work_unit_label,
+            "warnings": list(warnings or []),
+        }
+        if requested_max_markets is not None and max_markets_applied is not None:
+            payload["max_markets_was_applied"] = True
+        elif requested_max_markets is not None:
+            payload["max_markets_was_applied"] = False
+
+        if requested_max_markets is None and (
+            markets_tested >= LARGE_RUN_MARKET_WARNING
+            or (estimated_work_units is not None and estimated_work_units >= LARGE_RUN_WORK_UNITS_WARNING)
+        ):
+            payload["large_run_warning"] = (
+                "Large backtest detected. Consider --max-markets for faster exploratory runs."
+            )
+        return payload
+
+    def _build_progress_payload(
+        self,
+        *,
+        data_source: str,
+        fidelity: str,
+        start_ts: int,
+        end_ts: int,
+        current_ts: int,
+        markets_tested: int,
+        max_markets_applied: int | None,
+        processed_units: int,
+        work_unit_label: str,
+        wall_start: float,
+    ) -> dict:
+        elapsed = max(time.perf_counter() - wall_start, 1e-9)
+        total_span = max(end_ts - start_ts, 1)
+        percent = min(max((current_ts - start_ts) / total_span, 0.0), 1.0) * 100.0
+        throughput = processed_units / elapsed
+        eta_seconds = None
+        if percent > 0.0:
+            eta_seconds = max((elapsed / (percent / 100.0)) - elapsed, 0.0)
+        return {
+            "kind": "progress",
+            "status": "running",
+            "data_source": data_source,
+            "fidelity": fidelity,
+            "range_start_ts": start_ts,
+            "range_end_ts": end_ts,
+            "current_ts": current_ts,
+            "markets_tested": markets_tested,
+            "max_markets_applied": max_markets_applied,
+            "processed_units": processed_units,
+            "work_unit_label": work_unit_label,
+            "percent_complete": round(percent, 2),
+            "elapsed_seconds": round(elapsed, 3),
+            "throughput_per_second": round(throughput, 2),
+            "eta_seconds": round(eta_seconds, 3) if eta_seconds is not None else None,
+        }
+
+    def _iter_market_chunks(self, markets: list[Market], chunk_size: int = STREAM_BATCH_MARKET_COUNT) -> list[tuple[str, list[str]]]:
+        by_platform: dict[str, list[str]] = defaultdict(list)
+        for market in markets:
+            by_platform[market.platform.value].append(market.id)
+        chunks: list[tuple[str, list[str]]] = []
+        for platform, market_ids in by_platform.items():
+            for start in range(0, len(market_ids), chunk_size):
+                chunks.append((platform, market_ids[start:start + chunk_size]))
+        return chunks
+
+    def _run_legacy(
+        self,
+        strategy_class: type,
+        config: BacktestConfig,
+        progress_callback: BacktestProgressCallback | None = None,
+    ) -> dict:
         self._ensure_legacy_data_source()
 
         start_dt = datetime.strptime(config.start_date, "%Y-%m-%d").replace(tzinfo=UTC)
@@ -233,6 +364,24 @@ class BacktestEngine:
         type_priority = {"price_update": 0, "schedule_tick": 1, "resolution": 2}
         events.sort(key=lambda e: (e["timestamp"], type_priority[e["type"]]))
 
+        self._emit_progress(
+            progress_callback,
+            self._build_preflight_payload(
+                data_source="parquet" if isinstance(self._data, ParquetDataAdapter) else "sqlite",
+                fidelity="exact_trade",
+                start_ts=start_ts,
+                end_ts=end_ts,
+                markets_tested=len(price_data),
+                max_markets_applied=None,
+                requested_max_markets=config.max_markets,
+                estimated_work_units=len(events),
+                work_unit_label="events",
+            ),
+        )
+        wall_start = time.perf_counter()
+        last_progress_emit = wall_start
+        processed_units = 0
+
         for event in events:
             context.advance_time(event["timestamp"])
             market = markets_by_id.get(event["market_id"])
@@ -250,6 +399,25 @@ class BacktestEngine:
                     strategy.on_resolution(market, event["outcome"], pnl)
             context.set_active_market(None)
             context.record_snapshot()
+            processed_units += 1
+            now_perf = time.perf_counter()
+            if now_perf - last_progress_emit >= PROGRESS_INTERVAL_SECONDS:
+                self._emit_progress(
+                    progress_callback,
+                    self._build_progress_payload(
+                        data_source="parquet" if isinstance(self._data, ParquetDataAdapter) else "sqlite",
+                        fidelity="exact_trade",
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        current_ts=int(event["timestamp"]),
+                        markets_tested=len(price_data),
+                        max_markets_applied=None,
+                        processed_units=processed_units,
+                        work_unit_label="events",
+                        wall_start=wall_start,
+                    ),
+                )
+                last_progress_emit = now_perf
 
         strategy.on_stop()
 
@@ -276,7 +444,13 @@ class BacktestEngine:
             "trades": raw["trades"],
         }
 
-    def _run_streaming(self, strategy_class: type, config: BacktestConfig, index) -> dict:
+    def _run_streaming(
+        self,
+        strategy_class: type,
+        config: BacktestConfig,
+        index,
+        progress_callback: BacktestProgressCallback | None = None,
+    ) -> dict:
         from agenttrader.data.parquet_adapter import ParquetDataAdapter
 
         start_dt = datetime.strptime(config.start_date, "%Y-%m-%d").replace(tzinfo=UTC)
@@ -284,8 +458,14 @@ class BacktestEngine:
         start_ts = int(start_dt.timestamp())
         end_ts = int(end_dt.timestamp())
 
-        all_candidate_ids = index.get_market_ids(platform="all", start_ts=start_ts, end_ts=end_ts)
-        if not all_candidate_ids:
+        if hasattr(index, "get_market_ids_with_counts"):
+            candidate_rows = index.get_market_ids_with_counts(platform="all", start_ts=start_ts, end_ts=end_ts)
+        else:
+            candidate_rows = [
+                (market_id, market_platform, 0)
+                for market_id, market_platform in index.get_market_ids(platform="all", start_ts=start_ts, end_ts=end_ts)
+            ]
+        if not candidate_rows:
             return {
                 "ok": False,
                 "error": "NoDataInRange",
@@ -301,7 +481,8 @@ class BacktestEngine:
             }
 
         all_markets = parquet.get_markets(platform="all", limit=50_000)
-        candidate_ids = {market_id for market_id, _platform in all_candidate_ids}
+        candidate_ids = {market_id for market_id, _platform, _count in candidate_rows}
+        counts = {market_id: int(count) for market_id, _platform, count in candidate_rows}
         market_map: dict[str, Market] = {m.id: m for m in all_markets if m.id in candidate_ids}
         if not market_map:
             market_map = {m.id: m for m in all_markets}
@@ -325,10 +506,35 @@ class BacktestEngine:
 
         max_markets_applied = None
         if config.max_markets is not None and len(subscribed_markets) > config.max_markets:
-            counts = {mid: n for mid, _platform, n in index.get_market_ids_with_counts(platform="all", start_ts=start_ts, end_ts=end_ts)}
             subscribed_markets.sort(key=lambda m: counts.get(m.id, 0), reverse=True)
             subscribed_markets = subscribed_markets[: config.max_markets]
             max_markets_applied = int(config.max_markets)
+
+        fidelity = getattr(config, "fidelity", "exact_trade") or "exact_trade"
+        if fidelity not in {"exact_trade", "bar_1h", "bar_1d"}:
+            fidelity = "exact_trade"
+        bar_seconds = 3600 if fidelity == "bar_1h" else 86400 if fidelity == "bar_1d" else None
+        work_unit_label = "bars" if bar_seconds is not None else "events"
+        if bar_seconds is None:
+            estimated_work_units = sum(counts.get(m.id, 0) for m in subscribed_markets)
+        else:
+            estimated_work_units = len(subscribed_markets) * max(1, math.ceil((end_ts - start_ts + 1) / bar_seconds))
+        warnings = self._build_resampled_warning(fidelity)
+        self._emit_progress(
+            progress_callback,
+            self._build_preflight_payload(
+                data_source="normalized-index",
+                fidelity=fidelity,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                markets_tested=len(subscribed_markets),
+                max_markets_applied=max_markets_applied,
+                requested_max_markets=config.max_markets,
+                estimated_work_units=estimated_work_units,
+                work_unit_label=work_unit_label,
+                warnings=warnings,
+            ),
+        )
 
         subscribed_map = {m.id: m for m in subscribed_markets}
         context = StreamingBacktestContext(
@@ -344,46 +550,79 @@ class BacktestEngine:
 
         strategy = strategy_class(context)
         strategy.on_start()
+        batch_enabled = all(
+            [
+                hasattr(index, "stream_market_history_batch"),
+                hasattr(index, "stream_market_history_resampled_batch"),
+                hasattr(index, "get_latest_prices_before_batch"),
+            ]
+        )
 
-        fidelity = getattr(config, "fidelity", "exact_trade") or "exact_trade"
-        if fidelity not in {"exact_trade", "bar_1h", "bar_1d"}:
-            fidelity = "exact_trade"
-        bar_seconds = 3600 if fidelity == "bar_1h" else 86400 if fidelity == "bar_1d" else None
+        chunk_specs = self._iter_market_chunks(subscribed_markets)
+        heap: list[tuple[int, str, str, object]] = []
+        iterators: dict[str, object] = {}
 
-        def _iter_for(market: Market):
-            if bar_seconds is not None:
-                return index.stream_market_history_resampled(
-                    market.id,
-                    market.platform.value,
-                    start_ts,
-                    end_ts,
-                    bar_seconds,
-                )
-            return index.stream_market_history(
-                market.id,
-                market.platform.value,
-                start_ts,
-                end_ts,
-            )
+        if batch_enabled:
+            for chunk_idx, (platform, market_ids) in enumerate(chunk_specs):
+                previous_map = index.get_latest_prices_before_batch(market_ids, platform, start_ts)
+                for market_id, previous in previous_map.items():
+                    context.set_price_cursor(market_id, previous)
 
-        iterators = {m.id: _iter_for(m) for m in subscribed_markets}
-        for market in subscribed_markets:
-            previous = index.get_latest_price_before(market.id, market.platform.value, start_ts)
-            if previous is not None:
-                context.set_price_cursor(market.id, previous)
+                iterator_key = f"chunk-{chunk_idx}"
+                if bar_seconds is not None:
+                    iterators[iterator_key] = index.stream_market_history_resampled_batch(
+                        market_ids,
+                        platform,
+                        start_ts,
+                        end_ts,
+                        bar_seconds,
+                    )
+                else:
+                    iterators[iterator_key] = index.stream_market_history_batch(
+                        market_ids,
+                        platform,
+                        start_ts,
+                        end_ts,
+                    )
+                first = next(iterators[iterator_key], None)
+                if first is not None:
+                    market_id, point = first
+                    heapq.heappush(heap, (int(point.timestamp), market_id, iterator_key, point))
+        else:
+            for market in subscribed_markets:
+                previous = index.get_latest_price_before(market.id, market.platform.value, start_ts)
+                if previous is not None:
+                    context.set_price_cursor(market.id, previous)
 
-        heap: list[tuple[int, str, object]] = []
-        for market in subscribed_markets:
-            first = next(iterators[market.id], None)
-            if first is not None:
-                heapq.heappush(heap, (int(first.timestamp), market.id, first))
+                if bar_seconds is not None:
+                    iterator = index.stream_market_history_resampled(
+                        market.id,
+                        market.platform.value,
+                        start_ts,
+                        end_ts,
+                        bar_seconds,
+                    )
+                else:
+                    iterator = index.stream_market_history(
+                        market.id,
+                        market.platform.value,
+                        start_ts,
+                        end_ts,
+                    )
+                iterators[market.id] = iterator
+                first = next(iterator, None)
+                if first is not None:
+                    heapq.heappush(heap, (int(first.timestamp), market.id, market.id, first))
 
         schedule_interval = max(int(config.schedule_interval_minutes), 1) * 60
         last_scheduled = {m.id: start_ts for m in subscribed_markets}
         last_snapshot_ts = start_ts
+        wall_start = time.perf_counter()
+        last_progress_emit = wall_start
+        processed_units = 0
 
         while heap:
-            ts, market_id, point = heapq.heappop(heap)
+            ts, market_id, iterator_key, point = heapq.heappop(heap)
             if ts < start_ts or ts > end_ts:
                 continue
             market = subscribed_map.get(market_id)
@@ -408,10 +647,33 @@ class BacktestEngine:
                 context.record_snapshot(ts)
                 last_snapshot_ts = ts
 
-            nxt = next(iterators[market_id], None)
+            nxt = next(iterators[iterator_key], None)
             if nxt is not None:
-                heapq.heappush(heap, (int(nxt.timestamp), market_id, nxt))
+                if batch_enabled:
+                    next_market_id, next_point = nxt
+                    heapq.heappush(heap, (int(next_point.timestamp), next_market_id, iterator_key, next_point))
+                else:
+                    heapq.heappush(heap, (int(nxt.timestamp), market_id, iterator_key, nxt))
             context.set_active_market(None)
+            processed_units += 1
+            now_perf = time.perf_counter()
+            if now_perf - last_progress_emit >= PROGRESS_INTERVAL_SECONDS:
+                self._emit_progress(
+                    progress_callback,
+                    self._build_progress_payload(
+                        data_source="normalized-index",
+                        fidelity=fidelity,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        current_ts=int(ts),
+                        markets_tested=len(subscribed_markets),
+                        max_markets_applied=max_markets_applied,
+                        processed_units=processed_units,
+                        work_unit_label=work_unit_label,
+                        wall_start=wall_start,
+                    ),
+                )
+                last_progress_emit = now_perf
 
         for market in subscribed_markets:
             if not market.resolved or not market.resolution:
@@ -451,6 +713,7 @@ class BacktestEngine:
                 "equity_curve": raw["equity_curve"],
                 "trades": raw["trades"],
             },
+            "warnings": warnings,
         }
 
     def _compute_metrics(self, equity_curve: list[dict], trades: list[dict]) -> dict:
