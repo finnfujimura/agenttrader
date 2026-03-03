@@ -148,14 +148,18 @@ def test_fetch_pmxt_candles_uses_market_id_not_condition_id():
 
     mock_client = MagicMock()
     mock_client.get_candlesticks_with_status.return_value = {"points": [], "status": "empty", "error": None}
+    mock_client.get_outcome_side.side_effect = AssertionError("get_outcome_side should not run on the sync hot path")
 
     token_id = "50887272939612765629559172143901565817521391945540156085421963433918821328137"
     real_condition_id = "0xabc123def456"
     market = _make_market(mid=token_id, condition_id=real_condition_id, platform="polymarket")
 
-    _fetch_pmxt_candles(mock_client, market, 1000, 2000, 60)
+    result = _fetch_pmxt_candles(mock_client, market, 1000, 2000, 60)
 
     # Should be called with the token ID (market.id), not the condition_id
     call_args = mock_client.get_candlesticks_with_status.call_args[0]
     assert call_args[0] == token_id
     assert call_args[0] != real_condition_id
+    assert result["outcome_side"] is None
+    assert result["outcome_side_source"] == "unavailable"
+    mock_client.get_outcome_side.assert_not_called()

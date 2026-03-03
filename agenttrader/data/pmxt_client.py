@@ -511,12 +511,13 @@ class PmxtClient:
 
         primary_outcome = self._primary_outcome(item)
         market_id = str(getattr(primary_outcome, "outcome_id", None) or getattr(item, "market_id", ""))
+        outcome_side = self._outcome_side_for_item(item, primary_outcome)
         category = self._canonical_category(raw_category, tags)
         close_time = self._to_unix_seconds(getattr(item, "resolution_date", None))
         resolved = status_hint == "closed"
         resolution = self._infer_resolution(item) if resolved else None
 
-        return Market(
+        market = Market(
             id=market_id,
             condition_id=market_id,
             platform=platform,
@@ -531,6 +532,9 @@ class PmxtClient:
             scalar_low=None,
             scalar_high=None,
         )
+        if outcome_side in {"yes", "no"}:
+            setattr(market, "_pmxt_outcome_side", outcome_side)
+        return market
 
     @staticmethod
     def _primary_outcome(item: Any) -> Any:
@@ -544,6 +548,20 @@ class PmxtClient:
         if outcomes:
             return outcomes[0]
         return item
+
+    @staticmethod
+    def _outcome_side_for_item(item: Any, outcome: Any) -> str | None:
+        outcome_id = str(getattr(outcome, "outcome_id", "") or "")
+        yes = getattr(item, "yes", None)
+        if yes is not None and str(getattr(yes, "outcome_id", "") or "") == outcome_id:
+            return "yes"
+        no = getattr(item, "no", None)
+        if no is not None and str(getattr(no, "outcome_id", "") or "") == outcome_id:
+            return "no"
+        label = PmxtClient._normalize_outcome_label(getattr(outcome, "label", None))
+        if label in {"yes", "no"}:
+            return label
+        return None
 
     @staticmethod
     def _normalize_outcome_label(value: Any) -> str:

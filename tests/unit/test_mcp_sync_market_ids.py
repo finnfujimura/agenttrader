@@ -254,3 +254,199 @@ def test_sync_data_market_ids_preserves_resolved_local_category_metadata(tmp_pat
     assert stored is not None
     assert stored.category == "kxelonmars"
     assert stored.tags == []
+
+
+def test_sync_data_small_market_batch_avoids_side_lookup_and_duplicate_live_snapshot(tmp_path, monkeypatch):
+    market_ids = ["m-1", "m-2", "m-3"]
+    markets = [
+        models.Market(
+            id=market_id,
+            condition_id=market_id,
+            platform=models.Platform.POLYMARKET,
+            title=f"Market {market_id}",
+            category="politics",
+            tags=[],
+            market_type=models.MarketType.BINARY,
+            volume=100.0,
+            close_time=9_999_999_999,
+            resolved=False,
+            resolution=None,
+            scalar_low=None,
+            scalar_high=None,
+        )
+        for market_id in market_ids
+    ]
+
+    class FakeSource:
+        def get_markets_by_ids(self, wanted_ids, platform="all"):
+            assert wanted_ids == market_ids
+            assert platform == "polymarket"
+            return list(markets)
+
+    class FakeClient:
+        def __init__(self):
+            self.candle_calls = []
+            self.orderbook_calls = []
+            self.side_calls = 0
+            self.live_snapshot_calls = 0
+
+        def get_markets(self, **_kwargs):
+            raise AssertionError("PmxtClient.get_markets should not run when local sources resolve the explicit market_ids")
+
+        def get_outcome_side(self, *_args, **_kwargs):
+            self.side_calls += 1
+            raise AssertionError("get_outcome_side should not run on the sync hot path")
+
+        def get_live_snapshot(self, *_args, **_kwargs):
+            self.live_snapshot_calls += 1
+            raise AssertionError("sync_data should reuse the fetched orderbook instead of making a second live snapshot call")
+
+        def get_candlesticks_with_status(self, market_id, *_args, **_kwargs):
+            self.candle_calls.append(market_id)
+            return {
+                "points": [models.PricePoint(timestamp=1_737_392_619, yes_price=0.61, no_price=0.39, volume=10.0)],
+                "status": "ok",
+                "error": None,
+            }
+
+        def get_orderbook_snapshots_with_status(self, market_id, *_args, **_kwargs):
+            self.orderbook_calls.append(market_id)
+            return {
+                "snapshots": [
+                    models.OrderBook(
+                        market_id=market_id,
+                        timestamp=1_737_392_620,
+                        bids=[models.OrderLevel(price=0.60, size=5.0)],
+                        asks=[models.OrderLevel(price=0.62, size=4.0)],
+                    )
+                ],
+                "status": "ok",
+                "error": None,
+            }
+
+    class FakeOrderBookStore:
+        def write(self, *_args, **_kwargs):
+            snapshots = _args[-1]
+            return len(snapshots)
+
+    engine = create_engine(_sqlite_url(tmp_path / "sync-market-batch.sqlite"))
+    Base.metadata.create_all(engine)
+    cache = DataCache(engine)
+    client = FakeClient()
+
+    monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: cache)
+    monkeypatch.setattr(mcp_server, "get_engine", lambda: engine)
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(FakeSource(), "normalized-index")])
+    monkeypatch.setattr(mcp_server, "PmxtClient", lambda: client)
+    monkeypatch.setattr(mcp_server, "OrderBookStore", lambda: FakeOrderBookStore())
+
+    result = _run(
+        mcp_server.call_tool(
+            "sync_data",
+            {"platform": "polymarket", "market_ids": market_ids, "days": 2, "limit": 3},
+        )
+    )
+    payload = importlib.import_module("json").loads(result[0].text)
+
+    assert payload["ok"] is True
+    assert payload["markets_synced"] == 3
+    assert client.candle_calls == market_ids
+    assert client.orderbook_calls == market_ids
+    assert client.side_calls == 0
+    assert client.live_snapshot_calls == 0
+    assert {row["price_reference_source"] for row in payload["market_results"]} == {"orderbook"}
+    assert {row["outcome_side_source"] for row in payload["market_results"]} == {"unavailable"}
+
+
+def test_sync_data_uses_pre_window_cache_reference_when_side_metadata_is_missing(tmp_path, monkeypatch):
+    fixed_now = 1_772_100_000
+    start_ts = fixed_now - 2 * 24 * 3600
+    market = models.Market(
+        id="poly-no-token",
+        condition_id="poly-no-token",
+        platform=models.Platform.POLYMARKET,
+        title="Unknown-side token",
+        category="politics",
+        tags=[],
+        market_type=models.MarketType.BINARY,
+        volume=100.0,
+        close_time=fixed_now + 86_400,
+        resolved=False,
+        resolution=None,
+        scalar_low=None,
+        scalar_high=None,
+    )
+
+    class FakeSource:
+        def get_markets_by_ids(self, wanted_ids, platform="all"):
+            assert wanted_ids == [market.id]
+            assert platform == "polymarket"
+            return [market]
+
+    class FakeClient:
+        def get_candlesticks_with_status(self, *_args, **_kwargs):
+            return {
+                "points": [
+                    models.PricePoint(timestamp=start_ts + 3_600, yes_price=0.058, no_price=0.942, volume=10.0),
+                    models.PricePoint(timestamp=start_ts + 7_200, yes_price=0.061, no_price=0.939, volume=12.0),
+                ],
+                "status": "ok",
+                "error": None,
+            }
+
+        def get_orderbook_snapshots_with_status(self, market_id, *_args, **_kwargs):
+            return {
+                "snapshots": [
+                    models.OrderBook(
+                        market_id=market_id,
+                        timestamp=fixed_now,
+                        bids=[models.OrderLevel(price=0.057, size=5.0)],
+                        asks=[models.OrderLevel(price=0.063, size=4.0)],
+                    )
+                ],
+                "status": "ok",
+                "error": None,
+            }
+
+    class FakeOrderBookStore:
+        def write(self, *_args, **_kwargs):
+            return 0
+
+    engine = create_engine(_sqlite_url(tmp_path / "sync-market-cache-reference.sqlite"))
+    Base.metadata.create_all(engine)
+    cache = DataCache(engine)
+    cache.upsert_market(market)
+    cache.upsert_price_points_batch(
+        market.id,
+        "polymarket",
+        [models.PricePoint(timestamp=start_ts - 3_600, yes_price=0.944, no_price=0.056, volume=3.0)],
+        source="pmxt",
+        granularity="1h",
+    )
+
+    monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: cache)
+    monkeypatch.setattr(mcp_server, "get_engine", lambda: engine)
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(FakeSource(), "normalized-index")])
+    monkeypatch.setattr(mcp_server, "PmxtClient", lambda: FakeClient())
+    monkeypatch.setattr(mcp_server, "OrderBookStore", lambda: FakeOrderBookStore())
+
+    with importlib.import_module("unittest.mock").patch("time.time", return_value=fixed_now):
+        result = _run(
+            mcp_server.call_tool(
+                "sync_data",
+                {"platform": "polymarket", "market_ids": [market.id], "days": 2, "limit": 1},
+            )
+        )
+    payload = importlib.import_module("json").loads(result[0].text)
+
+    stored = cache.get_price_history(market.id, start_ts, fixed_now, platform="polymarket")
+    stored_window = [point for point in stored if point.timestamp >= start_ts]
+
+    assert payload["ok"] is True
+    assert payload["market_results"][0]["price_reference_source"] == "cache_pre_window"
+    assert payload["market_results"][0]["outcome_side_source"] == "unavailable"
+    assert "PriceOrientationNormalized" in payload["market_results"][0]["warning_types"]
+    assert len(stored_window) == 2
+    assert min(point.yes_price for point in stored_window) > 0.9

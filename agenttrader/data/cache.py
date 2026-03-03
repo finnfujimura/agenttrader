@@ -153,6 +153,22 @@ class DataCache:
             return None
         return self._to_price_point(row)
 
+    def get_latest_price_before(self, market_id: str, before_ts: int, platform: str | None = None) -> PricePoint | None:
+        q = select(PriceHistory).where(
+            and_(
+                PriceHistory.market_id == market_id,
+                PriceHistory.timestamp < int(before_ts),
+            )
+        )
+        if platform:
+            q = q.where(PriceHistory.platform == platform)
+        q = q.order_by(PriceHistory.timestamp.desc()).limit(1)
+        with get_session(self._engine) as session:
+            row = session.scalars(q).first()
+        if not row:
+            return None
+        return self._to_price_point(row)
+
     def get_provenance(
         self,
         market_id: str,

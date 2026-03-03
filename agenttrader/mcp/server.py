@@ -485,6 +485,23 @@ def _cache_get_latest_price(cache, market_id: str, platform: str | None = None):
         return None
 
 
+def _cache_get_latest_price_before(cache, market_id: str, before_ts: int, platform: str | None = None):
+    try:
+        if platform is not None:
+            return cache.get_latest_price_before(market_id, before_ts, platform=platform)
+        return cache.get_latest_price_before(market_id, before_ts)
+    except TypeError:
+        return cache.get_latest_price_before(market_id, before_ts)
+    except AttributeError:
+        latest = _cache_get_latest_price(cache, market_id, platform=platform)
+        if latest is None:
+            return None
+        latest_ts = int(getattr(latest, "timestamp", 0) or 0)
+        if latest_ts and latest_ts < int(before_ts):
+            return latest
+        return None
+
+
 def _cache_get_price_history(cache, market_id: str, start_ts: int, end_ts: int, platform: str | None = None):
     try:
         if platform is not None:
@@ -1015,6 +1032,51 @@ def _candlestick_market_id(market) -> str:
     return str(getattr(market, "id"))
 
 
+def _market_outcome_side_hint(market) -> tuple[str | None, str]:
+    side = str(getattr(market, "_pmxt_outcome_side", "") or "").strip().lower()
+    if side in {"yes", "no"}:
+        return side, "market_metadata"
+    return None, "unavailable"
+
+
+def _orderbook_reference_yes_price(snapshots: list) -> float | None:
+    if not snapshots:
+        return None
+    snapshot = snapshots[0]
+    best_bid = getattr(snapshot, "best_bid", None)
+    best_ask = getattr(snapshot, "best_ask", None)
+    if best_bid is not None and best_ask is not None:
+        return max(0.0, min(1.0, (float(best_bid) + float(best_ask)) / 2.0))
+    if best_bid is not None:
+        return max(0.0, min(1.0, float(best_bid)))
+    if best_ask is not None:
+        return max(0.0, min(1.0, float(best_ask)))
+    return None
+
+
+def _select_pmxt_reference_yes_price(
+    cache,
+    market_id: str,
+    platform: str,
+    *,
+    replace_start_ts: int,
+    orderbook_snapshots: list,
+    outcome_side: str | None,
+) -> tuple[float | None, str]:
+    prior_cached = _cache_get_latest_price_before(cache, market_id, replace_start_ts, platform=platform)
+    if prior_cached is not None:
+        return float(getattr(prior_cached, "yes_price", 0.0)), "cache_pre_window"
+
+    live_reference = _orderbook_reference_yes_price(orderbook_snapshots)
+    if live_reference is not None:
+        normalized = float(live_reference)
+        if outcome_side == "no":
+            normalized = max(0.0, min(1.0, 1.0 - normalized))
+        return normalized, "orderbook"
+
+    return None, "none"
+
+
 def _load_latest_price_from_source(source, source_name: str, market_id: str, platform: str):
     if source_name == "sqlite-cache":
         return _cache_get_latest_price(source, market_id, platform=platform)
@@ -1149,12 +1211,10 @@ def _select_freshest_history(market_id: str, platform: str, start_ts: int, end_t
 
 def _fetch_pmxt_candles(client, market, start_ts: int, end_ts: int, interval_minutes: int) -> dict:
     condition_id = _candlestick_market_id(market)
-    outcome_side = None
-    if hasattr(client, "get_outcome_side"):
-        try:
-            outcome_side = client.get_outcome_side(condition_id, market.platform)
-        except Exception:
-            outcome_side = None
+    # Avoid an extra fetch_market(outcome_id=...) lookup on the sync hot path.
+    # PMXT-fetched markets already carry a side hint; when they do not, we rely on
+    # best-effort reference-price normalization after the candle fetch.
+    outcome_side, outcome_side_source = _market_outcome_side_hint(market)
     if hasattr(client, "get_candlesticks_with_status"):
         result = client.get_candlesticks_with_status(condition_id, market.platform, start_ts, end_ts, interval_minutes)
         return {
@@ -1162,6 +1222,7 @@ def _fetch_pmxt_candles(client, market, start_ts: int, end_ts: int, interval_min
             "status": str(result.get("status", "empty")),
             "error": result.get("error"),
             "outcome_side": outcome_side,
+            "outcome_side_source": outcome_side_source,
         }
 
     points = client.get_candlesticks(condition_id, market.platform, start_ts, end_ts, interval_minutes)
@@ -1170,6 +1231,7 @@ def _fetch_pmxt_candles(client, market, start_ts: int, end_ts: int, interval_min
         "status": "ok" if points else "empty",
         "error": None,
         "outcome_side": outcome_side,
+        "outcome_side_source": outcome_side_source,
     }
 
 
@@ -2347,22 +2409,23 @@ async def call_tool(name: str, arguments: dict):
                     gran_label = {"minute": "1m", "hourly": "1h", "daily": "1d"}.get(granularity, "1h")
                     market_platform = _market_platform_value(m)
                     outcome_side = str(candles_result.get("outcome_side") or "").strip().lower() or None
+                    outcome_side_source = str(candles_result.get("outcome_side_source") or "unavailable")
                     orientation_warning = None
                     batch_repaired = False
                     batch_inverted = False
                     repair_count = 0
+                    reference_price_source = "none"
+                    orderbook_result = _fetch_pmxt_orderbooks(client, m, start_ts, end_ts, 100)
+                    ob = orderbook_result["snapshots"]
                     if raw_candles:
-                        live_snapshot = client.get_live_snapshot(m.id, m.platform) if hasattr(client, "get_live_snapshot") else None
-                        reference_price = None
-                        live_point = live_snapshot.get("price") if isinstance(live_snapshot, dict) else None
-                        if live_point is not None:
-                            reference_price = float(getattr(live_point, "yes_price", 0.0))
-                            if outcome_side == "no":
-                                reference_price = max(0.0, min(1.0, 1.0 - reference_price))
-                        else:
-                            latest_cached = _cache_get_latest_price(cache, m.id, platform=market_platform)
-                            if latest_cached is not None:
-                                reference_price = float(latest_cached.yes_price)
+                        reference_price, reference_price_source = _select_pmxt_reference_yes_price(
+                            cache,
+                            m.id,
+                            market_platform,
+                            replace_start_ts=replace_start_ts,
+                            orderbook_snapshots=ob,
+                            outcome_side=outcome_side,
+                        )
                         normalized_candles = _normalize_pmxt_candles_to_yes_space(
                             raw_candles,
                             outcome_side=outcome_side,
@@ -2392,6 +2455,8 @@ async def call_tool(name: str, arguments: dict):
                                     "message": f"Normalized PMXT candles for {m.id} into YES-price space before writing.",
                                     "detail": {
                                         "outcome_side": outcome_side,
+                                        "outcome_side_source": outcome_side_source,
+                                        "reference_price_source": reference_price_source,
                                         "inversion_reason": normalized_candles["inversion_reason"],
                                         "batch_mismatch": normalized_candles["batch_mismatch"],
                                     },
@@ -2410,6 +2475,8 @@ async def call_tool(name: str, arguments: dict):
                             candles = []
                             orientation_warning = {
                                 "outcome_side": outcome_side,
+                                "outcome_side_source": outcome_side_source,
+                                "reference_price_source": reference_price_source,
                                 "inversion_reason": normalized_candles["inversion_reason"],
                                 "batch_mismatch": normalized_candles["batch_mismatch"],
                                 "repairs": normalized_candles["repairs"],
@@ -2426,8 +2493,6 @@ async def call_tool(name: str, arguments: dict):
                             "detail": orientation_warning,
                         })
 
-                    orderbook_result = _fetch_pmxt_orderbooks(client, m, start_ts, end_ts, 100)
-                    ob = orderbook_result["snapshots"]
                     written_files = ob_store.write(market_platform, m.id, ob)
                     ob_files += written_files
                     if written_files > 0:
@@ -2491,6 +2556,9 @@ async def call_tool(name: str, arguments: dict):
                         "has_live_data": has_live_data,
                         "candles_status": candles_result["status"],
                         "orderbook_status": orderbook_result["status"],
+                        "outcome_side": outcome_side,
+                        "outcome_side_source": outcome_side_source,
+                        "price_reference_source": reference_price_source,
                         "price_orientation_mismatch": orientation_warning is not None,
                         "price_orientation_repaired": batch_inverted or batch_repaired,
                         "price_orientation_repair_count": repair_count,
