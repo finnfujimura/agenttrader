@@ -21,6 +21,30 @@ agenttrader init
 
 That's it. `init` sets up your local database and walks you through the optional dataset download.
 
+### Downloading the historical dataset (recommended)
+
+Backtesting works best with the full dataset — thousands of resolved Polymarket and Kalshi markets going back to 2021.
+
+```bash
+# Optional but highly recommended:
+
+# aria2 → faster + more reliable large downloads
+# zstd  → required to validate/extract .tar.zst archives using system tools
+
+# macOS
+brew install aria2 zstd
+
+# Windows (Chocolatey)
+choco install aria2 zstandard
+
+# Linux (Debian/Ubuntu)
+sudo apt install aria2 zstd
+
+agenttrader dataset download      # ~36GB, one-time
+agenttrader dataset build-index   # ~5-10 min, one-time
+```
+
+> **Don't want to download 36GB?** Backtesting still works using live-synced data. Run `agenttrader sync` before backtesting and it'll use whatever is cached locally.
 ---
 
 ## Quickstart
@@ -40,21 +64,7 @@ Add to your MCP config (e.g. `.claude/mcp.json`):
 }
 ```
 
-### 2. Download the historical dataset (recommended)
-
-Backtesting works best with the full dataset — thousands of resolved Polymarket and Kalshi markets going back to 2021.
-
-```bash
-# Optional: install aria2 for faster downloads
-# macOS: brew install aria2 | Windows: choco install aria2 | Linux: sudo apt install aria2
-
-agenttrader dataset download      # ~36GB, one-time
-agenttrader dataset build-index   # ~5-10 min, one-time
-```
-
-> **Don't want to download 36GB?** Backtesting still works using live-synced data. Run `agenttrader sync` before backtesting and it'll use whatever is cached locally.
-
-### 3. Give your agent a prompt
+### 2. Give your agent a prompt
 
 ```
 Use agenttrader to find liquid Polymarket politics markets,
