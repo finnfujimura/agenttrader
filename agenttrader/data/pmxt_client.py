@@ -502,10 +502,15 @@ class PmxtClient:
                 results.append(market)
 
     def _to_market(self, item: Any, platform: Platform, status_hint: str) -> Market:
+        raw_category = str(getattr(item, "category", "") or "")
+        tags = [str(t) for t in (getattr(item, "tags", None) or [])]
+        normalized_tags = {str(tag).strip().lower() for tag in tags if str(tag).strip()}
+        clean_raw_category = raw_category.strip()
+        if clean_raw_category and clean_raw_category.lower() not in normalized_tags:
+            tags.append(clean_raw_category)
+
         primary_outcome = self._primary_outcome(item)
         market_id = str(getattr(primary_outcome, "outcome_id", None) or getattr(item, "market_id", ""))
-        tags = [str(t) for t in (getattr(item, "tags", None) or [])]
-        raw_category = str(getattr(item, "category", "") or "")
         category = self._canonical_category(raw_category, tags)
         close_time = self._to_unix_seconds(getattr(item, "resolution_date", None))
         resolved = status_hint == "closed"

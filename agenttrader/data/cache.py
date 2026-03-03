@@ -92,22 +92,22 @@ class DataCache:
         query = select(MarketRow)
         if platform and platform != "all":
             query = query.where(MarketRow.platform == platform)
-        if category:
-            query = query.where(MarketRow.category == category)
         if active_only:
             query = query.where(MarketRow.resolved == 0)
         if min_volume is not None:
             query = query.where(MarketRow.volume >= min_volume)
-        query = query.order_by(desc(MarketRow.volume)).limit(limit)
+        query = query.order_by(desc(MarketRow.volume))
 
         with get_session(self._engine) as session:
             rows = list(session.scalars(query).all())
 
         markets = [self._to_market(r) for r in rows]
+        if category:
+            markets = [m for m in markets if self._matches_category(m, category)]
         if tags:
             wanted = {t.lower() for t in tags}
             markets = [m for m in markets if wanted.issubset({t.lower() for t in m.tags})]
-        return markets
+        return markets[:limit]
 
     def search_markets(self, query: str, platform: str = "all", limit: int = 100) -> list[Market]:
         q = select(MarketRow).where(MarketRow.title.ilike(f"%{query}%"))
@@ -289,6 +289,15 @@ class DataCache:
             scalar_low=row.scalar_low,
             scalar_high=row.scalar_high,
         )
+
+    @staticmethod
+    def _matches_category(market: Market, category: str) -> bool:
+        wanted = str(category or "").strip().lower()
+        if not wanted:
+            return True
+        if str(market.category or "").strip().lower() == wanted:
+            return True
+        return wanted in {str(tag or "").strip().lower() for tag in (market.tags or [])}
 
     @staticmethod
     def _to_price_point(row: PriceHistory) -> PricePoint:

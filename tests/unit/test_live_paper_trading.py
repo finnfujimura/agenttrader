@@ -7,10 +7,12 @@ from types import SimpleNamespace
 
 from sqlalchemy import create_engine
 
+from agenttrader.data.cache import DataCache
 from agenttrader.db import get_session
 from agenttrader.db.schema import Base, PaperPortfolio, Trade
 
 
+context_mod = importlib.import_module("agenttrader.core.context")
 paper_daemon_mod = importlib.import_module("agenttrader.core.paper_daemon")
 mcp_server = importlib.import_module("agenttrader.mcp.server")
 pmxt_client_mod = importlib.import_module("agenttrader.data.pmxt_client")
@@ -19,6 +21,13 @@ models = importlib.import_module("agenttrader.data.models")
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def _sqlite_url(path: Path) -> str:
+    raw = str(path)
+    if raw.startswith("\\\\?\\"):
+        raw = raw[4:]
+    return f"sqlite:///{raw.replace('\\', '/')}"
 
 
 def test_pmxt_live_snapshot_derives_mid_price():
@@ -39,6 +48,70 @@ def test_pmxt_live_snapshot_derives_mid_price():
     assert snapshot["orderbook"] is not None
     assert snapshot["orderbook"].best_bid == 0.40
     assert snapshot["orderbook"].best_ask == 0.60
+
+
+def test_live_context_refresh_uses_cached_price_when_snapshot_errors(tmp_path):
+    engine = create_engine(_sqlite_url(tmp_path / "live-cache.sqlite"), echo=False)
+    Base.metadata.create_all(engine)
+    cache = DataCache(engine)
+
+    market = models.Market(
+        id="KXELONMARS-99",
+        condition_id="KXELONMARS-99",
+        platform=models.Platform.KALSHI,
+        title="Will Elon visit Mars?",
+        category="world",
+        tags=["World", "International", "kxelonmars"],
+        market_type=models.MarketType.BINARY,
+        volume=1000.0,
+        close_time=0,
+        resolved=False,
+        resolution=None,
+        scalar_low=None,
+        scalar_high=None,
+    )
+    cache.upsert_market(market)
+    cached_point = models.PricePoint(
+        timestamp=1_700_000_000,
+        yes_price=0.61,
+        no_price=0.39,
+        volume=25.0,
+    )
+    cache.upsert_price_points_batch(market.id, "kalshi", [cached_point], source="pmxt", granularity="1h")
+
+    class BrokenPmxt:
+        def get_live_snapshot(self, *_args, **_kwargs):
+            return {
+                "status": "error",
+                "error": "orderbook unavailable",
+                "timestamp": 1_700_000_100,
+                "price": None,
+                "orderbook": None,
+            }
+
+    class DummyOrderBookStore:
+        def write(self, *_args, **_kwargs):
+            return 0
+
+    context = context_mod.LiveContext(
+        portfolio_id="p-live-fallback",
+        initial_cash=1000.0,
+        cache=cache,
+        ob_store=DummyOrderBookStore(),
+        pmxt_client=BrokenPmxt(),
+    )
+    result = context.refresh_market_live(market, force_persist=True)
+    live_status = context.get_live_status()[market.id]
+
+    assert result["status"] == "degraded"
+    assert result["persisted"] is False
+    assert result["price"] is not None
+    assert result["price"].timestamp == cached_point.timestamp
+    assert result["price"].yes_price == cached_point.yes_price
+    assert live_status["degraded"] is True
+    assert live_status["has_live_price"] is True
+    assert live_status["has_live_orderbook"] is False
+    assert "cached price history fallback" in str(live_status["last_error"]).lower()
 
 
 def test_get_portfolio_prefers_runtime_live_price(monkeypatch):
@@ -123,7 +196,7 @@ def test_paper_daemon_live_loop_executes_churn_strategy(monkeypatch):
     )
 
     db_path = tmp_path / "paper.db"
-    engine = create_engine(f"sqlite:///{db_path}", echo=False)
+    engine = create_engine(_sqlite_url(db_path), echo=False)
     Base.metadata.create_all(engine)
 
     portfolio_id = "p-churn"

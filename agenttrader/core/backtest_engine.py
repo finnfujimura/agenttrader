@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 import numpy as np
 
 from agenttrader.core.base_strategy import BaseStrategy
-from agenttrader.core.context import BacktestContext, StreamingBacktestContext
+from agenttrader.core.context import BacktestContext, StreamingBacktestContext, _market_matches_category
 from agenttrader.core.fill_model import FillModel
 from agenttrader.data.models import ExecutionMode, Market, Platform
 
@@ -62,7 +62,7 @@ class SubscriptionCollector:
         for market_id, market in self._market_map.items():
             if platform != "all" and market.platform.value != platform:
                 continue
-            if category and market.category != category:
+            if not _market_matches_category(market, category):
                 continue
             if tags and not any(tag in market.tags for tag in tags):
                 continue
@@ -267,6 +267,27 @@ class BacktestEngine:
                 chunks.append((platform, market_ids[start:start + chunk_size]))
         return chunks
 
+    @staticmethod
+    def _hydrate_market_map_for_ids(data_source, market_map: dict[str, Market], market_ids) -> dict[str, Market]:
+        missing_ids = [str(mid) for mid in market_ids if str(mid) and str(mid) not in market_map]
+        if not missing_ids or not hasattr(data_source, "get_markets_by_ids"):
+            return market_map
+
+        try:
+            loaded = data_source.get_markets_by_ids(missing_ids, platform="all")
+        except TypeError:
+            loaded = data_source.get_markets_by_ids(missing_ids)
+        except Exception:
+            loaded = []
+
+        if not loaded:
+            return market_map
+
+        hydrated = dict(market_map)
+        for market in loaded:
+            hydrated[market.id] = market
+        return hydrated
+
     def _run_legacy(
         self,
         strategy_class: type,
@@ -288,6 +309,7 @@ class BacktestEngine:
         strategy_probe.on_start()
 
         subscribed_ids = subscription_collector.get_subscribed_ids()
+        market_map = self._hydrate_market_map_for_ids(self._data, market_map, subscribed_ids)
         subscribed_markets = [market_map[mid] for mid in subscribed_ids if mid in market_map]
         if not subscribed_markets:
             raise ValueError(
@@ -493,6 +515,7 @@ class BacktestEngine:
         subscribed_ids = set(collector.get_subscribed_ids())
 
         final_ids = subscribed_ids & candidate_ids
+        market_map = self._hydrate_market_map_for_ids(parquet, market_map, final_ids)
         subscribed_markets = [market_map[mid] for mid in final_ids if mid in market_map]
         if not subscribed_markets:
             return {

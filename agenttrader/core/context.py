@@ -32,6 +32,26 @@ def _validate_buy_params(contracts, order_type, limit_price):
         raise AgentTraderError("InvalidOrder", "limit_price is required when order_type='limit'")
 
 
+def _market_matches_category(market: Market, category: str | None) -> bool:
+    wanted = str(category or "").strip().lower()
+    if not wanted:
+        return True
+    if str(market.category or "").strip().lower() == wanted:
+        return True
+    return wanted in {str(tag or "").strip().lower() for tag in (market.tags or [])}
+
+
+def _cache_get_latest_price(cache: DataCache, market_id: str, platform: str | None = None) -> PricePoint | None:
+    try:
+        if platform is not None:
+            return cache.get_latest_price(market_id, platform=platform)
+        return cache.get_latest_price(market_id)
+    except TypeError:
+        return cache.get_latest_price(market_id)
+    except AttributeError:
+        return None
+
+
 class ExecutionContext(ABC):
     @abstractmethod
     def subscribe(self, platform, category, tags, market_ids) -> None: ...
@@ -123,7 +143,7 @@ class BacktestContext(ExecutionContext):
         for market_id, market in self._markets.items():
             if platform != "all" and market.platform.value != platform:
                 continue
-            if category and market.category != category:
+            if not _market_matches_category(market, category):
                 continue
             if tags and not set(tags).issubset(set(market.tags)):
                 continue
@@ -787,7 +807,7 @@ class LiveContext(ExecutionContext):
                     continue
                 if platform != "all" and market.platform.value != platform:
                     continue
-                if category and market.category != category:
+                if not _market_matches_category(market, category):
                     continue
                 if tags and not set(tags).issubset(set(market.tags)):
                     continue
@@ -816,7 +836,9 @@ class LiveContext(ExecutionContext):
     def get_price(self, market_id: str) -> float:
         if market_id in self._current_prices:
             return self._current_prices[market_id]
-        latest = self._cache.get_latest_price(market_id)
+        market = self._subscriptions.get(market_id) or self._cache.get_market(market_id)
+        platform = market.platform.value if market is not None else None
+        latest = _cache_get_latest_price(self._cache, market_id, platform=platform)
         if not latest:
             raise MarketNotCachedError(market_id)
         return latest.yes_price
@@ -877,14 +899,31 @@ class LiveContext(ExecutionContext):
 
         self._cache.upsert_market(market)
         snapshot = self._pmxt_client.get_live_snapshot(market.id, market.platform)
-        if snapshot["status"] == "error":
-            return self._mark_live_failure(market.id, str(snapshot.get("error") or "Live snapshot failed."))
-
+        snapshot_status = str(snapshot.get("status") or "error")
+        fallback_error = str(snapshot.get("error") or "Live snapshot failed.")
         orderbook = snapshot.get("orderbook")
         if orderbook is not None:
             self._live_orderbooks[market.id] = orderbook
 
         point = snapshot.get("price")
+        used_cached_price = False
+        if point is None:
+            point = _cache_get_latest_price(self._cache, market.id, platform=market.platform.value)
+            if point is not None:
+                used_cached_price = True
+                snapshot_status = "degraded"
+                if snapshot.get("error"):
+                    fallback_error = f"{fallback_error} Using cached price history fallback."
+                else:
+                    fallback_error = "Live snapshot returned no price. Using cached price history fallback."
+            else:
+                if snapshot_status == "error":
+                    return self._mark_live_failure(market.id, fallback_error)
+                return self._mark_live_failure(
+                    market.id,
+                    "Live snapshot returned no price and no cached price history is available.",
+                )
+
         updated = False
         if point is not None:
             previous_price = self._current_prices.get(market.id)
@@ -892,12 +931,16 @@ class LiveContext(ExecutionContext):
             history = self._history[market.id]
             if history and history[-1].timestamp == point.timestamp:
                 history[-1] = point
-            else:
+            elif not history or history[-1].timestamp < point.timestamp:
                 history.append(point)
             updated = previous_price is None or abs(previous_price - point.yes_price) > 1e-12
 
         persisted = False
-        if point is not None and (force_persist or self._should_persist_point(market.id, point.timestamp, persist_interval_seconds)):
+        if (
+            point is not None
+            and not used_cached_price
+            and (force_persist or self._should_persist_point(market.id, point.timestamp, persist_interval_seconds))
+        ):
             self._cache.upsert_price_point(market.id, market.platform.value, point)
             if orderbook is not None:
                 self._ob_store.write(market.platform.value, market.id, [orderbook])
@@ -907,28 +950,31 @@ class LiveContext(ExecutionContext):
 
         previous = self._live_status.get(market.id, {})
         prev_failures = int(previous.get("consecutive_failures", 0))
-        # Decrement toward 0 on success so recovery requires sustained stability
-        new_failures = max(prev_failures - 1, 0)
+        if used_cached_price:
+            new_failures = prev_failures + 1
+        else:
+            # Decrement toward 0 on success so recovery requires sustained stability
+            new_failures = max(prev_failures - 1, 0)
         self._live_status[market.id] = {
             "market_id": market.id,
-            "status": snapshot["status"],
+            "status": snapshot_status,
             "last_live_update_ts": point.timestamp if point is not None else None,
             "last_orderbook_ts": orderbook.timestamp if orderbook is not None else None,
-            "last_error": None,
+            "last_error": fallback_error if used_cached_price else None,
             "consecutive_failures": new_failures,
-            "degraded": snapshot["status"] != "ok" or new_failures > 0,
+            "degraded": snapshot_status != "ok" or new_failures > 0,
             "has_live_price": point is not None,
             "has_live_orderbook": orderbook is not None,
             "current_price": point.yes_price if point is not None else self._current_prices.get(market.id),
         }
         return {
             "market_id": market.id,
-            "status": snapshot["status"],
+            "status": snapshot_status,
             "price": point,
             "orderbook": orderbook,
             "updated": updated,
             "persisted": persisted,
-            "error": None,
+            "error": fallback_error if used_cached_price else None,
         }
 
     def get_live_status(self) -> dict[str, dict[str, Any]]:

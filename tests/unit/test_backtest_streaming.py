@@ -99,6 +99,98 @@ def test_streaming_backtest_returns_summary_and_artifact_payload(monkeypatch):
     assert len(result["_artifact_payload"]["equity_curve"]) > 0
 
 
+def test_streaming_backtest_hydrates_missing_exact_id_metadata(monkeypatch):
+    now_ts = int(datetime(2024, 1, 1, tzinfo=UTC).timestamp())
+    low_volume_market = Market(
+        id="KXELONMARS-99",
+        condition_id="KXELONMARS-99",
+        platform=Platform.KALSHI,
+        title="Will Elon visit Mars?",
+        category="world",
+        tags=["World", "International", "kxelonmars"],
+        market_type=MarketType.BINARY,
+        volume=5.0,
+        close_time=now_ts + 86400,
+        resolved=False,
+        resolution=None,
+        scalar_low=None,
+        scalar_high=None,
+    )
+    high_volume_market = Market(
+        id="KXTRUMPOUT-26-TRUMP",
+        condition_id="KXTRUMPOUT-26-TRUMP",
+        platform=Platform.KALSHI,
+        title="Will Trump drop out?",
+        category="politics",
+        tags=["Politics"],
+        market_type=MarketType.BINARY,
+        volume=10_000.0,
+        close_time=now_ts + 86400,
+        resolved=False,
+        resolution=None,
+        scalar_low=None,
+        scalar_high=None,
+    )
+    calls = {"get_markets_by_ids": 0}
+
+    class FakeParquet:
+        def __init__(self, *args, **kwargs):
+            return
+
+        def is_available(self):
+            return True
+
+        def get_markets(self, platform="all", limit=50000):  # noqa: ARG002
+            return [high_volume_market]
+
+        def get_markets_by_ids(self, market_ids, platform="all"):  # noqa: ARG002
+            calls["get_markets_by_ids"] += 1
+            if "KXELONMARS-99" in set(market_ids):
+                return [low_volume_market]
+            return []
+
+    class FakeIndex:
+        def get_market_ids(self, platform="all", start_ts=None, end_ts=None):  # noqa: ARG002
+            return [("KXELONMARS-99", "kalshi")]
+
+        def get_market_ids_with_counts(self, platform="all", start_ts=None, end_ts=None):  # noqa: ARG002
+            return [("KXELONMARS-99", "kalshi", 1)]
+
+        def stream_market_history(self, market_id, platform, start_ts, end_ts):  # noqa: ARG002
+            yield PricePoint(timestamp=now_ts + 60, yes_price=0.55, no_price=0.45, volume=10.0)
+
+        def stream_market_history_resampled(self, market_id, platform, start_ts, end_ts, bar_seconds):  # noqa: ARG002
+            yield from self.stream_market_history(market_id, platform, start_ts, end_ts)
+
+        def get_latest_price_before(self, market_id, platform, ts):  # noqa: ARG002
+            return 0.50
+
+    class Strategy(BaseStrategy):
+        def on_start(self):
+            self.subscribe(platform="kalshi", market_ids=["KXELONMARS-99"])
+
+        def on_market_data(self, market, price, orderbook):  # noqa: ARG002
+            return
+
+    monkeypatch.setattr("agenttrader.data.parquet_adapter.ParquetDataAdapter", FakeParquet)
+    engine = BacktestEngine(data_source=None)
+    result = engine._run_streaming(
+        Strategy,
+        BacktestConfig(
+            strategy_path="test",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            initial_cash=1000.0,
+            execution_mode=ExecutionMode.SYNTHETIC_EXECUTION_MODEL,
+        ),
+        FakeIndex(),
+    )
+
+    assert result["ok"] is True
+    assert result["markets_tested"] == 1
+    assert calls["get_markets_by_ids"] == 1
+
+
 def test_streaming_backtest_applies_guardrails(monkeypatch):
     now_ts = int(datetime(2024, 1, 1, tzinfo=UTC).timestamp())
     markets = [

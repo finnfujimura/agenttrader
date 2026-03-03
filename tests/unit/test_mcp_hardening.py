@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -23,6 +24,13 @@ def _payload(result):
     return json.loads(result[0].text)
 
 
+def _sqlite_url(path: Path) -> str:
+    raw = str(path)
+    if raw.startswith("\\\\?\\"):
+        raw = raw[4:]
+    return f"sqlite:///{raw.replace('\\', '/')}"
+
+
 @pytest.fixture(autouse=True)
 def _set_perf_log_path(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTTRADER_PERF_LOG_PATH", str(tmp_path / "performance.jsonl"))
@@ -40,8 +48,55 @@ def test_pmxt_primary_outcome_prefers_yes_labeled_outcome():
     assert primary.outcome_id == "outcome-yes"
 
 
+def test_pmxt_market_keeps_raw_category_as_tag_alias():
+    from agenttrader.data.pmxt_client import PmxtClient
+
+    client = object.__new__(PmxtClient)
+    item = SimpleNamespace(
+        yes=SimpleNamespace(outcome_id="KXELONMARS-99", label="Yes"),
+        outcomes=[],
+        tags=["World", "International"],
+        category="kxelonmars",
+        title="Will Elon visit Mars?",
+        volume=1000.0,
+        resolution_date=None,
+    )
+
+    market = client._to_market(item, Platform.KALSHI, status_hint="open")
+
+    assert market.category == "world"
+    assert "kxelonmars" in {tag.lower() for tag in market.tags}
+
+
+def test_cache_get_markets_matches_category_against_tags(tmp_path):
+    engine = create_engine(_sqlite_url(tmp_path / "category-cache.sqlite"))
+    Base.metadata.create_all(engine)
+    cache = DataCache(engine)
+    cache.upsert_market(
+        Market(
+            id="KXELONMARS-99",
+            condition_id="KXELONMARS-99",
+            platform=Platform.KALSHI,
+            title="Will Elon visit Mars?",
+            category="world",
+            tags=["World", "International", "kxelonmars"],
+            market_type=MarketType.BINARY,
+            volume=1000.0,
+            close_time=0,
+            resolved=False,
+            resolution=None,
+            scalar_low=None,
+            scalar_high=None,
+        )
+    )
+
+    markets = cache.get_markets(platform="kalshi", category="kxelonmars", limit=10)
+
+    assert [market.id for market in markets] == ["KXELONMARS-99"]
+
+
 def test_cache_upsert_price_points_batch_updates_existing_row(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'cache.sqlite'}")
+    engine = create_engine(_sqlite_url(tmp_path / "cache.sqlite"))
     Base.metadata.create_all(engine)
     cache = DataCache(engine)
 
@@ -82,7 +137,7 @@ def test_normalize_pmxt_candles_repairs_isolated_complement_bar():
 
 
 def test_sync_data_repairs_localized_inversion_and_replaces_stale_pmxt_rows(tmp_path, monkeypatch):
-    engine = create_engine(f"sqlite:///{tmp_path / 'cache.sqlite'}")
+    engine = create_engine(_sqlite_url(tmp_path / "cache.sqlite"))
     Base.metadata.create_all(engine)
     cache = DataCache(engine)
 
