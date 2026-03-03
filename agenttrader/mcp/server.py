@@ -6,8 +6,10 @@ import importlib.util
 import inspect
 import json
 import os
+import shutil
 import signal
 import statistics
+import subprocess
 import sys
 import time
 import traceback
@@ -42,6 +44,8 @@ from agenttrader.perf_logging import log_performance_event
 
 server = Server("agenttrader")
 MCP_SESSION_ID = f"mcp-{uuid.uuid4().hex[:12]}"
+PMXT_SIDECAR_PATH_FRAGMENT = "pmxt/_server/server/bundled.js"
+PMXT_GUARDED_TOOLS = {"match_markets", "start_paper_trade", "sync_data"}
 
 
 def _text(obj) -> list[types.TextContent]:
@@ -85,6 +89,7 @@ DEFAULT_FIXES = {
     "BadRequest": "Check required tool arguments and retry.",
     "MarketNotCached": "Call sync_data with market_ids=['<market_id>'] (or sync the platform), then retry.",
     "NotFound": "Verify the id exists first (list_backtests or list_paper_portfolios), then retry.",
+    "PmxtSidecarConflict": "Stop duplicate PMXT sidecar processes so only zero or one is running, then retry.",
     "InternalError": "This is a server bug, not a strategy issue. Report it or retry.",
 }
 
@@ -109,6 +114,143 @@ def _pid_alive(pid: int) -> bool:
         return True
     except (ProcessLookupError, OSError):
         return False
+
+
+def _normalize_process_command_line(command_line: str | None) -> str:
+    return str(command_line or "").replace("\\", "/").lower()
+
+
+def _is_pmxt_sidecar_process(command_line: str | None) -> bool:
+    return PMXT_SIDECAR_PATH_FRAGMENT in _normalize_process_command_line(command_line)
+
+
+def _list_process_command_lines() -> list[dict[str, str | int]]:
+    if os.name == "nt":
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not powershell:
+            return []
+        script = (
+            "$ErrorActionPreference='Stop'; "
+            "Get-CimInstance Win32_Process | "
+            "Select-Object ProcessId, CommandLine | "
+            "ForEach-Object { "
+            "if ($null -ne $_.CommandLine) { "
+            "[pscustomobject]@{ pid = [int]$_.ProcessId; command_line = [string]$_.CommandLine } "
+            "} "
+            "} | ConvertTo-Json -Compress"
+        )
+        try:
+            proc = subprocess.run(
+                [powershell, "-NoProfile", "-Command", script],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return []
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return []
+        rows = payload if isinstance(payload, list) else [payload]
+        return [
+            {"pid": int(row.get("pid")), "command_line": str(row.get("command_line", ""))}
+            for row in rows
+            if row and row.get("pid") is not None
+        ]
+
+    try:
+        proc = subprocess.run(
+            ["ps", "-ax", "-o", "pid=,command="],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+
+    rows: list[dict[str, str | int]] = []
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid_text, command_line = parts
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        rows.append({"pid": pid, "command_line": command_line})
+    return rows
+
+
+def _detect_pmxt_sidecars() -> list[dict[str, str | int]]:
+    return [
+        {
+            "pid": int(row["pid"]),
+            "command_line": str(row.get("command_line", "")),
+        }
+        for row in _list_process_command_lines()
+        if _is_pmxt_sidecar_process(row.get("command_line"))
+    ]
+
+
+def _build_pmxt_sidecar_conflict_payload(sidecars: list[dict[str, str | int]]) -> dict | None:
+    if len(sidecars) <= 1:
+        return None
+
+    ordered = sorted(
+        (
+            {
+                "pid": int(sidecar.get("pid", 0)),
+                "command_line": str(sidecar.get("command_line", "")),
+            }
+            for sidecar in sidecars
+        ),
+        key=lambda item: item["pid"],
+    )
+    return _error_payload(
+        "PmxtSidecarConflict",
+        (
+            "Multiple PMXT sidecar processes are running. This is unsupported because the PMXT Python SDK can "
+            "attach to the wrong healthy sidecar and produce incorrect port + access-token pairing."
+        ),
+        fix="Stop duplicate PMXT sidecar processes (node ... pmxt/_server/server/bundled.js) so only zero or one remains, then retry.",
+        sidecars=ordered,
+        sidecar_count=len(ordered),
+    )
+
+
+def _pmxt_sidecar_conflict_payload() -> dict | None:
+    return _build_pmxt_sidecar_conflict_payload(_detect_pmxt_sidecars())
+
+
+def _ensure_pmxt_sidecar_safe() -> None:
+    conflict = _pmxt_sidecar_conflict_payload()
+    if conflict is None:
+        return
+
+    print(f"ERROR: {conflict['message']}", file=sys.stderr)
+    print(
+        "Multiple PMXT sidecars can cause PMXT to bind the wrong port/access-token pair, which surfaces "
+        "misleading auth failures like 'Unauthorized: Invalid or missing access token'.",
+        file=sys.stderr,
+    )
+    for sidecar in conflict.get("sidecars", []):
+        print(
+            f"PMXT sidecar pid={sidecar['pid']}: {sidecar['command_line']}",
+            file=sys.stderr,
+        )
+    print(f"Fix: {conflict['fix']}", file=sys.stderr)
+    raise SystemExit(1)
 
 
 def _persist_backtest_progress(run_id: str, payload: dict) -> None:
@@ -1273,6 +1415,11 @@ async def call_tool(name: str, arguments: dict):
 
     cache = DataCache(get_engine())
     try:
+        if name in PMXT_GUARDED_TOOLS:
+            conflict = _pmxt_sidecar_conflict_payload()
+            if conflict is not None:
+                return _respond(conflict)
+
         if name == "get_markets":
             source, source_name = get_best_data_source()
             platform = args.get("platform", "all")
@@ -2524,6 +2671,8 @@ async def main():
                 print(f"Missing: {', '.join(health['missing_columns'])}", file=sys.stderr)
             print(f"Fix: {health['fix']}", file=sys.stderr)
             sys.exit(1)
+
+    _ensure_pmxt_sidecar_safe()
 
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())

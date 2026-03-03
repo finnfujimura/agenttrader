@@ -1,3 +1,4 @@
+import importlib
 import itertools
 from pathlib import Path
 import shutil
@@ -8,6 +9,7 @@ import pytest
 
 _TEMP_ROOT = Path.cwd() / "codex_tmp_test_runtime"
 _COUNTER = itertools.count()
+mcp_server = importlib.import_module("agenttrader.mcp.server")
 
 
 def _make_temp_dir(prefix: str = "tmp", suffix: str = "", dir: str | None = None) -> str:
@@ -53,3 +55,8 @@ def tmp_path() -> Path:
         yield path
     finally:
         shutil.rmtree(path, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _stub_pmxt_sidecar_scan(monkeypatch):
+    monkeypatch.setattr(mcp_server, "_list_process_command_lines", lambda: [])
