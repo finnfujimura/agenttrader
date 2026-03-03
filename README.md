@@ -142,6 +142,12 @@ I want to trade Polymarket politics markets using a contrarian strategy.
 
 This prompt will trigger ~10-15 tool calls across research, validation, backtesting (with iteration), and paper trading deployment.
 
+**Quick Disclaimer**
+
+You most likely aren't going to find an actual good strategy by saying "Claude, use the agenttrader MCP to develop a strategy to make me a billion dollars". Agenttrader exists to help making the process of testing strategies easier, not necessarily developing them from complete scratch. I would highly recommend to do research on quantitative trading strategies, and how they can be applied to prediction markets. Then, work with your agent to implement this strategy.
+
+As of now, the BaseStrategy class does not support external APIs (e.g. chainlink for 5min crypto markets). You can override this by creating a new script to ingest API data, then import it to your strategy.py file.
+
 ---
 
 ## Data Architecture
