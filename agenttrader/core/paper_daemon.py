@@ -22,7 +22,7 @@ from watchdog.observers import Observer
 
 LOGGER = logging.getLogger(__name__)
 
-from agenttrader.config import RUNTIME_DIR, load_config
+from agenttrader.config import LOG_DIR, RUNTIME_DIR, load_config
 from agenttrader.core.base_strategy import BaseStrategy
 from agenttrader.core.context import LiveContext
 from agenttrader.data.cache import DataCache
@@ -77,7 +77,7 @@ class PaperDaemon:
     def start_as_daemon(self) -> int:
         stderr_path: Path | None = None
         try:
-            log_dir = Path.home() / ".agenttrader" / "logs"
+            log_dir = LOG_DIR
             log_dir.mkdir(parents=True, exist_ok=True)
             stderr_path = log_dir / f"daemon-{self.portfolio_id}.log"
             stderr_file = open(stderr_path, "w", encoding="utf-8")  # noqa: SIM115

@@ -7,9 +7,10 @@ from pathlib import Path
 import click
 import duckdb
 
+from agenttrader.config import BACKTEST_INDEX_PATH, SHARED_DATA_DIR, ensure_data_root
 
-INDEX_PATH = Path.home() / ".agenttrader" / "backtest_index.duckdb"
-DATA_DIR = Path.home() / ".agenttrader" / "data"
+INDEX_PATH = BACKTEST_INDEX_PATH
+DATA_DIR = SHARED_DATA_DIR
 
 
 def _safe_parquet_list(directory: Path) -> list[str]:
@@ -25,7 +26,7 @@ def _resolve_data_dir(data_dir: Path | None) -> Path:
     Preference order:
       1) explicit data_dir argument (if provided)
       2) local ./data (if exists)
-      3) ~/.agenttrader/data
+      3) configured shared data root
     """
     if data_dir is not None:
         return data_dir
@@ -255,6 +256,7 @@ def build_index(force: bool = False, data_dir: Path | None = None, index_path: P
             "parquet_files_found": file_count,
         }
 
+    ensure_data_root()
     index_path.parent.mkdir(parents=True, exist_ok=True)
     index_path.unlink(missing_ok=True)
 

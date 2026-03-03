@@ -309,6 +309,7 @@ def test_daemon_run_marks_portfolio_failed_on_crash():
          patch("agenttrader.core.paper_daemon.get_session", return_value=fake_session), \
          patch("agenttrader.core.paper_daemon.DataCache"), \
          patch("agenttrader.core.paper_daemon.OrderBookStore"), \
+         patch("agenttrader.core.paper_daemon.PmxtClient"), \
          patch("agenttrader.core.paper_daemon.LiveContext"), \
          patch.object(daemon, "_load_strategy"), \
          patch.object(daemon, "_setup_file_watcher"), \

@@ -1,6 +1,7 @@
 # DO NOT import pmxt here. Use agenttrader.data.pmxt_client only.
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -9,20 +10,76 @@ from alembic.config import Config
 import click
 import yaml
 
-from agenttrader.cli.dataset import download_dataset
-from agenttrader.config import APP_DIR, CONFIG_PATH, DB_PATH, ensure_app_dir, load_config, save_config, write_default_config
+from agenttrader.cli import dataset as dataset_cli
+import agenttrader.config as config_mod
 from agenttrader.cli.utils import ensure_initialized, json_errors
 
 
 @click.command("init")
+@click.option(
+    "--local-state",
+    is_flag=True,
+    default=False,
+    help="Write a project-local path file (same as the default first-run behavior).",
+)
+@click.option(
+    "--state-dir",
+    type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
+    help="Write a project-local path file that uses this state directory.",
+)
+@click.option(
+    "--data-root",
+    type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
+    help="Write a project-local path file that uses this shared data root.",
+)
+@click.option(
+    "--global-state",
+    is_flag=True,
+    default=False,
+    help="Use the legacy global state location instead of creating project-local ./.agenttrader state.",
+)
 @json_errors
-def init_cmd() -> None:
-    """Initialize ~/.agenttrader/ directory and database."""
-    ensure_app_dir()
-    if not CONFIG_PATH.exists():
-        write_default_config()
-    elif not CONFIG_PATH.read_text(encoding="utf-8").strip():
-        write_default_config()
+def init_cmd(local_state: bool, state_dir: Path | None, data_root: Path | None, global_state: bool) -> None:
+    """Initialize the configured agenttrader state directory and database."""
+    if global_state and (local_state or state_dir is not None or data_root is not None):
+        raise click.ClickException("--global-state cannot be combined with project-local path options.")
+
+    should_write_project_paths = False
+    chosen_state_dir = state_dir
+    chosen_data_root = data_root
+
+    if not global_state:
+        if local_state or state_dir is not None or data_root is not None:
+            should_write_project_paths = True
+        elif (
+            config_mod.PROJECT_PATHS_FILE is None
+            and "AGENTTRADER_STATE_DIR" not in os.environ
+            and "AGENTTRADER_DATA_ROOT" not in os.environ
+        ):
+            should_write_project_paths = True
+            chosen_state_dir = Path.cwd()
+            chosen_data_root = config_mod.DEFAULT_SHARED_DATA_ROOT
+
+    if should_write_project_paths:
+        if chosen_state_dir is None:
+            chosen_state_dir = Path.cwd()
+        if chosen_data_root is None:
+            chosen_data_root = config_mod.DATA_ROOT
+        project_file = config_mod.write_project_paths_file(
+            base_dir=Path.cwd(),
+            state_dir=chosen_state_dir,
+            data_root=chosen_data_root,
+        )
+        config_mod.reload_paths()
+        dataset_cli.DATA_DIR = config_mod.SHARED_DATA_DIR
+        dataset_cli.BACKTEST_INDEX_PATH = config_mod.BACKTEST_INDEX_PATH
+        click.echo(f"Project path config: {project_file}")
+
+    config_mod.ensure_app_dir()
+    if not config_mod.CONFIG_PATH.exists():
+        config_mod.write_default_config()
+    elif not config_mod.CONFIG_PATH.read_text(encoding="utf-8").strip():
+        config_mod.write_default_config()
 
     # Run Alembic migrations programmatically from package-local alembic.ini.
     package_dir = Path(__file__).resolve().parent.parent
@@ -30,15 +87,17 @@ def init_cmd() -> None:
     if not alembic_ini.exists():
         raise click.ClickException(f"Packaged alembic.ini not found at: {alembic_ini}")
 
-    db_path = APP_DIR / "db.sqlite"
+    db_path = config_mod.DB_PATH
     alembic_cfg = Config(str(alembic_ini))
     alembic_cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
     alembic_command.upgrade(alembic_cfg, "head")
 
     # Ensure db file exists even if alembic wasn't available.
-    DB_PATH.touch(exist_ok=True)
-    click.echo(f"Initialized {APP_DIR}/")
+    config_mod.DB_PATH.touch(exist_ok=True)
+    click.echo(f"Initialized {config_mod.APP_DIR}/")
     click.echo(f"Database: {db_path}")
+    if config_mod.DATA_ROOT != config_mod.APP_DIR:
+        click.echo(f"Shared data root: {config_mod.DATA_ROOT}")
 
     click.echo("\nHistorical dataset for backtesting")
     click.echo("-" * 40)
@@ -57,7 +116,7 @@ def init_cmd() -> None:
         click.echo("Non-interactive shell detected. Skipping dataset prompt (default: 2).")
 
     if str(choice).strip() == "1":
-        download_ok = download_dataset()
+        download_ok = dataset_cli.download_dataset()
         if download_ok:
             click.echo()
             if sys.stdin.isatty():
@@ -100,7 +159,7 @@ def config_group() -> None:
 @json_errors
 def config_set(key: str, value: str) -> None:
     ensure_initialized()
-    cfg = load_config()
+    cfg = config_mod.load_config()
 
     # Preserve simple scalar types.
     if value.lower() in {"true", "false"}:
@@ -115,7 +174,7 @@ def config_set(key: str, value: str) -> None:
                 parsed = value
 
     cfg[key] = parsed
-    save_config(cfg)
+    config_mod.save_config(cfg)
     _SENSITIVE_KEYS = {"pmxt_api_key", "api_key", "dome_api_key", "secret", "password", "token"}
     if key.lower() in _SENSITIVE_KEYS:
         click.echo(f"Set {key} = [redacted]")
@@ -128,7 +187,7 @@ def config_set(key: str, value: str) -> None:
 @json_errors
 def config_get(key: str) -> None:
     ensure_initialized()
-    cfg = load_config()
+    cfg = config_mod.load_config()
     click.echo(str(cfg.get(key, "")))
 
 
@@ -136,5 +195,5 @@ def config_get(key: str) -> None:
 @json_errors
 def config_show() -> None:
     ensure_initialized()
-    cfg = load_config()
+    cfg = config_mod.load_config()
     click.echo(yaml.safe_dump(cfg, sort_keys=False).strip())

@@ -4,13 +4,15 @@ from pathlib import Path
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
+from agenttrader.config import DB_PATH
+
 _engine_cache: dict[str, object] = {}
 _sessionmaker_cache: dict[int, sessionmaker] = {}
 
 
 def get_engine(db_path: Path = None):
     if db_path is None:
-        db_path = Path.home() / ".agenttrader" / "db.sqlite"
+        db_path = DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
     key = str(db_path)
     if key not in _engine_cache:

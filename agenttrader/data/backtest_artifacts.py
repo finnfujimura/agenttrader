@@ -2,12 +2,10 @@
 from __future__ import annotations
 
 import gzip
-from pathlib import Path
 
 import msgpack
 
-
-ARTIFACTS_DIR = Path.home() / ".agenttrader" / "backtest_artifacts"
+from agenttrader.config import ARTIFACTS_DIR
 
 
 def write_backtest_artifact(run_id: str, equity_curve: list, trades: list) -> str:

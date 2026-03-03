@@ -5,10 +5,10 @@ from pathlib import Path
 
 import duckdb
 
+from agenttrader.config import BACKTEST_INDEX_PATH
 from agenttrader.data.models import PricePoint
 
-
-INDEX_PATH = Path.home() / ".agenttrader" / "backtest_index.duckdb"
+INDEX_PATH = BACKTEST_INDEX_PATH
 
 
 class BacktestIndexAdapter:

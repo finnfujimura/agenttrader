@@ -21,7 +21,7 @@ from mcp.server.stdio import stdio_server
 from sqlalchemy.exc import OperationalError
 
 from agenttrader.cli.validate import validate_strategy_file
-from agenttrader.config import is_initialized, load_config
+from agenttrader.config import BACKTEST_INDEX_PATH, DB_PATH, SHARED_DATA_DIR, is_initialized, load_config
 from agenttrader.core.backtest_engine import BacktestConfig, BacktestEngine
 from agenttrader.core.base_strategy import BaseStrategy
 from agenttrader.core.context import LiveContext
@@ -2393,11 +2393,10 @@ async def call_tool(name: str, arguments: dict):
             return _respond(result)
 
         if name == "debug_data_sources":
-            base = Path.home() / ".agenttrader"
             diag = {"ok": True, "sources": {}}
 
             # 1. DuckDB normalized index
-            index_path = base / "backtest_index.duckdb"
+            index_path = BACKTEST_INDEX_PATH
             if index_path.exists():
                 try:
                     from agenttrader.data.index_adapter import BacktestIndexAdapter
@@ -2426,7 +2425,7 @@ async def call_tool(name: str, arguments: dict):
                 }
 
             # 2. Raw parquet files
-            data_dir = base / "data"
+            data_dir = SHARED_DATA_DIR
             parquet_status = {}
             for plat in ["polymarket", "kalshi"]:
                 for subdir in ["markets", "trades"]:
@@ -2445,7 +2444,7 @@ async def call_tool(name: str, arguments: dict):
                 diag["sources"]["raw_parquet"]["fix"] = "Run: agenttrader dataset download"
 
             # 3. SQLite cache
-            db_path = base / "db.sqlite"
+            db_path = DB_PATH
             schema_health = check_schema(db_path)
             if db_path.exists():
                 try:

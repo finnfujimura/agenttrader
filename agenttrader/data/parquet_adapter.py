@@ -11,11 +11,12 @@ try:  # pragma: no cover - import availability depends on runtime environment
 except ImportError:  # pragma: no cover
     duckdb = None
 
+from agenttrader.config import SHARED_DATA_DIR
 from agenttrader.data.models import DataProvenance, Market, MarketType, Platform, PricePoint
 
 
 LOGGER = logging.getLogger(__name__)
-DATA_DIR = Path.home() / ".agenttrader" / "data"
+DATA_DIR = SHARED_DATA_DIR
 
 
 _POLY_SLUG_CATEGORY = {

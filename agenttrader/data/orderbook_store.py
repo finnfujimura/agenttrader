@@ -8,13 +8,14 @@ from pathlib import Path
 
 import msgpack
 
+from agenttrader.config import ORDERBOOK_DIR
 from agenttrader.data.models import OrderBook, OrderLevel
 
 
 class OrderBookStore:
     def __init__(self, base_path: Path | None = None):
         if base_path is None:
-            base_path = Path.home() / ".agenttrader" / "orderbooks"
+            base_path = ORDERBOOK_DIR
         self.base_path = base_path
 
     def write(self, platform: str, market_id: str, snapshots: list[OrderBook]) -> int:

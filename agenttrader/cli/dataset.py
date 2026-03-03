@@ -11,11 +11,11 @@ from pathlib import Path
 
 import click
 
-from agenttrader.config import APP_DIR, ensure_app_dir
+from agenttrader.config import BACKTEST_INDEX_PATH, SHARED_DATA_DIR, ensure_app_dir, ensure_data_root
 from agenttrader.cli.utils import json_errors
 
 
-DATA_DIR = APP_DIR / "data"
+DATA_DIR = SHARED_DATA_DIR
 DOWNLOAD_URL = "https://s3.jbecker.dev/data.tar.zst"
 DOWNLOAD_USER_AGENT = "agenttrader/0.3.4 (+https://github.com/finnfujimura/agenttrader)"
 
@@ -167,6 +167,7 @@ def _download_archive(url: str, dest: Path) -> None:
 def download_dataset() -> bool:
     """Download and extract the Jon Becker prediction market parquet dataset."""
     ensure_app_dir()
+    ensure_data_root()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     archive_path = DATA_DIR / "data.tar.zst"
 
@@ -251,7 +252,7 @@ def build_index_cmd(force: bool, json_output: bool) -> None:
     """
     One-time normalization of raw parquet files into a fast DuckDB index.
     Run once after 'agenttrader dataset download'.
-    Stored at ~/.agenttrader/backtest_index.duckdb
+    Stored at the configured shared data root.
     """
     from agenttrader.data.index_builder import build_index
 
@@ -268,6 +269,7 @@ def build_index_cmd(force: bool, json_output: bool) -> None:
     if result.get("ok"):
         stats = result.get("stats", {})
         click.echo("Index built successfully.")
+        click.echo(f"  Index path:         {BACKTEST_INDEX_PATH}")
         click.echo(f"  Polymarket trades: {int(stats.get('polymarket_trades', 0)):,}")
         click.echo(f"  Kalshi trades:     {int(stats.get('kalshi_trades', 0)):,}")
         click.echo(f"  Markets indexed:   {int(stats.get('markets_indexed', 0)):,}")

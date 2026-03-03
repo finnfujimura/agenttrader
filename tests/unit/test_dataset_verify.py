@@ -137,6 +137,7 @@ def test_download_with_aria2_prefers_binary_and_promotes_partial(tmp_path, monke
 def test_download_dataset_falls_back_to_python_when_aria2_unavailable(tmp_path, monkeypatch):
     monkeypatch.setattr(dataset_cli, "DATA_DIR", tmp_path)
     monkeypatch.setattr(dataset_cli, "ensure_app_dir", lambda: None)
+    monkeypatch.setattr(dataset_cli, "ensure_data_root", lambda: None)
     monkeypatch.setattr(dataset_cli, "_download_with_aria2", lambda url, dest: False)
 
     seen: dict[str, object] = {}
