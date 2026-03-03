@@ -28,7 +28,6 @@ class Market(Base):
 class PriceHistory(Base):
     __tablename__ = "price_history"
     __table_args__ = (
-        UniqueConstraint("market_id", "timestamp", name="uq_price_market_ts"),
         UniqueConstraint("market_id", "platform", "timestamp", name="uq_price_market_platform_ts"),
     )
 

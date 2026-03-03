@@ -35,13 +35,13 @@ class CacheProvider:
         return out
 
     def get_price_history(self, market_id, platform, start_ts, end_ts) -> list[PricePoint]:
-        return self._cache.get_price_history(market_id, start_ts, end_ts)
+        return self._cache.get_price_history(market_id, start_ts, end_ts, platform=platform)
 
     def get_latest_price(self, market_id, platform) -> PricePoint | None:
-        return self._cache.get_latest_price(market_id)
+        return self._cache.get_latest_price(market_id, platform=platform)
 
     def get_orderbook(self, market_id, platform, timestamp) -> OrderBook | None:
         return self._ob_store.get_nearest(platform, market_id, timestamp)
 
     def get_provenance(self, market_id, platform) -> DataProvenance:
-        return DataProvenance(source="pmxt", observed=True, granularity="1h")
+        return self._cache.get_provenance(market_id, platform)

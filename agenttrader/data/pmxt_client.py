@@ -503,9 +503,25 @@ class PmxtClient:
         if yes is not None and getattr(yes, "outcome_id", None):
             return yes
         outcomes = getattr(item, "outcomes", None) or []
+        labeled_yes = PmxtClient._find_outcome_by_label(outcomes, "yes")
+        if labeled_yes is not None:
+            return labeled_yes
         if outcomes:
             return outcomes[0]
         return item
+
+    @staticmethod
+    def _normalize_outcome_label(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    @staticmethod
+    def _find_outcome_by_label(outcomes: list[Any], wanted_label: str) -> Any | None:
+        wanted = PmxtClient._normalize_outcome_label(wanted_label)
+        for outcome in outcomes or []:
+            label = PmxtClient._normalize_outcome_label(getattr(outcome, "label", None))
+            if label == wanted and getattr(outcome, "outcome_id", None):
+                return outcome
+        return None
 
     @staticmethod
     def _infer_resolution(item: Any) -> str | None:
@@ -517,7 +533,7 @@ class PmxtClient:
             if yes_price is not None and no_price is not None:
                 winner = yes if yes_price >= no_price else no
                 label = getattr(winner, "label", None)
-                return str(label).lower() if label is not None else None
+                return PmxtClient._normalize_outcome_label(label) or None
 
         outcomes = getattr(item, "outcomes", None) or []
         best_label = None
@@ -529,7 +545,8 @@ class PmxtClient:
             if best_price is None or price > best_price:
                 best_price = price
                 best_label = getattr(outcome, "label", None)
-        return str(best_label).lower() if best_label is not None else None
+        normalized = PmxtClient._normalize_outcome_label(best_label)
+        return normalized or None
 
     @staticmethod
     def _canonical_category(raw_category: str, tags: list[str]) -> str:

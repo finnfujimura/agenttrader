@@ -381,14 +381,35 @@ def test_get_portfolio_no_correction_for_stopped(monkeypatch):
         def get_open_positions(self, _pid):
             return []
 
+    class FakeRow:
+        pid = 99999
+
+    fake_row = FakeRow()
+
+    class FakeSession:
+        def get(self, _cls, _pk):
+            return fake_row
+
+        def commit(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
     monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
     monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: FakeCache())
     monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
+    monkeypatch.setattr(mcp_server, "get_session", lambda _engine: FakeSession())
 
     result = _run(mcp_server.call_tool("get_portfolio", {"portfolio_id": "p-stopped"}))
     payload = _payload(result)
     assert payload["ok"] is True
     assert payload["status"] == "stopped"
+    assert payload["pid"] is None
+    assert fake_row.pid is None
 
 
 def test_get_portfolio_normalizes_stale_runtime_status_for_stopped(monkeypatch):
@@ -411,9 +432,28 @@ def test_get_portfolio_normalizes_stale_runtime_status_for_stopped(monkeypatch):
         def get_open_positions(self, _pid):
             return []
 
+    class FakeRow:
+        pid = 99999
+
+    fake_row = FakeRow()
+
+    class FakeSession:
+        def get(self, _cls, _pk):
+            return fake_row
+
+        def commit(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
     monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
     monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: FakeCache())
     monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
+    monkeypatch.setattr(mcp_server, "get_session", lambda _engine: FakeSession())
     monkeypatch.setattr(
         mcp_server,
         "read_runtime_status",
@@ -436,6 +476,8 @@ def test_get_portfolio_normalizes_stale_runtime_status_for_stopped(monkeypatch):
     assert payload["markets_degraded"] == 0
     assert payload["live_status"]["state"] == "stopped"
     assert payload["live_status"]["markets"] == []
+    assert payload["pid"] is None
+    assert fake_row.pid is None
 
 
 # ---------------------------------------------------------------------------

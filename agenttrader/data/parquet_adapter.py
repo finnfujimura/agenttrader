@@ -11,7 +11,7 @@ try:  # pragma: no cover - import availability depends on runtime environment
 except ImportError:  # pragma: no cover
     duckdb = None
 
-from agenttrader.data.models import Market, MarketType, Platform, PricePoint
+from agenttrader.data.models import DataProvenance, Market, MarketType, Platform, PricePoint
 
 
 LOGGER = logging.getLogger(__name__)
@@ -236,6 +236,10 @@ class ParquetDataAdapter:
         if platform == Platform.POLYMARKET:
             return self._get_polymarket_price_history(market_id, start_ts, end_ts)
         return self._get_kalshi_price_history(market_id, start_ts, end_ts)
+
+    def get_provenance(self, market_id, platform) -> DataProvenance:
+        _ = (market_id, platform)
+        return DataProvenance(source="parquet", observed=True, granularity="trade")
 
     def _get_polymarket_markets(
         self,

@@ -17,9 +17,9 @@ def test_get_orderbook_returns_stored_snapshot():
     class FakeCache:
         def get_markets(self, **kwargs):
             return []
-        def get_price_history(self, market_id, start_ts, end_ts):
+        def get_price_history(self, market_id, start_ts, end_ts, platform=None):
             return []
-        def get_latest_price(self, market_id):
+        def get_latest_price(self, market_id, platform=None):
             return PricePoint(timestamp=100, yes_price=0.50, no_price=0.50, volume=10)
 
     class FakeObStore:
@@ -39,7 +39,7 @@ def test_get_orderbook_returns_none_when_no_stored():
     class FakeCache:
         def get_markets(self, **kwargs):
             return []
-        def get_latest_price(self, market_id):
+        def get_latest_price(self, market_id, platform=None):
             return PricePoint(timestamp=100, yes_price=0.50, no_price=0.50, volume=10)
 
     class FakeObStore:
@@ -54,8 +54,13 @@ def test_get_orderbook_returns_none_when_no_stored():
 
 
 def test_provenance_reports_pmxt_observed():
+    class FakeCache:
+        def get_provenance(self, market_id, platform):
+            _ = (market_id, platform)
+            return DataProvenance(source="pmxt", observed=True, granularity="1h")
+
     provider = CacheProvider.__new__(CacheProvider)
-    provider._cache = None
+    provider._cache = FakeCache()
     provider._ob_store = None
     prov = provider.get_provenance("m1", "polymarket")
     assert prov.source == "pmxt"

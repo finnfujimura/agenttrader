@@ -150,6 +150,7 @@ def paper_stop(portfolio_id: str | None, stop_all: bool, json_output: bool) -> N
                     pass
             row.status = "stopped"
             row.stopped_at = int(datetime.now(tz=UTC).timestamp())
+            row.pid = None
             stopped.append(row.id)
         session.commit()
 

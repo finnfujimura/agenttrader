@@ -24,6 +24,7 @@ from agenttrader.cli.validate import validate_strategy_file
 from agenttrader.config import is_initialized, load_config
 from agenttrader.core.backtest_engine import BacktestConfig, BacktestEngine
 from agenttrader.core.base_strategy import BaseStrategy
+from agenttrader.core.context import LiveContext
 from agenttrader.core.paper_daemon import PaperDaemon, read_runtime_status, runtime_status_path
 from agenttrader.data.backtest_artifacts import read_backtest_artifact, write_backtest_artifact
 from agenttrader.data.cache import DataCache
@@ -83,7 +84,7 @@ DEFAULT_FIXES = {
     "UnknownTool": "Call list_tools to see supported tool names, then retry.",
     "BadRequest": "Check required tool arguments and retry.",
     "MarketNotCached": "Call sync_data with market_ids=['<market_id>'] (or sync the platform), then retry.",
-    "NotFound": "Verify the id exists first (list_backtests or list_paper_trades), then retry.",
+    "NotFound": "Verify the id exists first (list_backtests or list_paper_portfolios), then retry.",
     "InternalError": "This is a server bug, not a strategy issue. Report it or retry.",
 }
 
@@ -292,6 +293,279 @@ def _normalize_runtime_status_for_portfolio(portfolio, runtime_status: dict | No
     return normalized
 
 
+def _status_is_active(status: str | None) -> bool:
+    return str(status or "").lower() in {"running", "starting"}
+
+
+def _iso_or_none(timestamp: int | None) -> str | None:
+    if timestamp is None:
+        return None
+    return datetime.fromtimestamp(int(timestamp), tz=UTC).isoformat()
+
+
+def _normalized_portfolio_pid(portfolio) -> int | None:
+    status = str(getattr(portfolio, "status", "") or "").lower()
+    if status in {"stopped", "dead", "failed"}:
+        return None
+    pid = getattr(portfolio, "pid", None)
+    return int(pid) if pid is not None else None
+
+
+def _load_source_provenance(source, source_name: str, market_id: str, platform: str, start_ts: int | None = None, end_ts: int | None = None) -> dict:
+    if hasattr(source, "get_provenance"):
+        try:
+            provenance = source.get_provenance(market_id, platform, start_ts=start_ts, end_ts=end_ts)
+        except TypeError:
+            provenance = source.get_provenance(market_id, platform)
+        return {
+            "source": str(getattr(provenance, "source", source_name)),
+            "observed": bool(getattr(provenance, "observed", True)),
+            "granularity": str(getattr(provenance, "granularity", "unknown")),
+        }
+
+    if source_name == "normalized-index":
+        return {"source": "index", "observed": True, "granularity": "trade"}
+    if source_name == "raw-parquet":
+        return {"source": "parquet", "observed": True, "granularity": "trade"}
+    if source_name == "sqlite-cache":
+        return {"source": "pmxt", "observed": True, "granularity": "1h"}
+    return {"source": source_name, "observed": True, "granularity": "unknown"}
+
+
+def _cache_get_latest_price(cache, market_id: str, platform: str | None = None):
+    try:
+        if platform is not None:
+            return cache.get_latest_price(market_id, platform=platform)
+        return cache.get_latest_price(market_id)
+    except TypeError:
+        return cache.get_latest_price(market_id)
+    except AttributeError:
+        return None
+
+
+def _cache_get_price_history(cache, market_id: str, start_ts: int, end_ts: int, platform: str | None = None):
+    try:
+        if platform is not None:
+            return cache.get_price_history(market_id, start_ts, end_ts, platform=platform)
+        return cache.get_price_history(market_id, start_ts, end_ts)
+    except TypeError:
+        return cache.get_price_history(market_id, start_ts, end_ts)
+    except AttributeError:
+        return []
+
+
+def _build_candidate_source(
+    source,
+    source_name: str,
+    market_id: str,
+    platform: str,
+    *,
+    latest_ts: int | None,
+    had_data: bool,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+    error: str | None = None,
+) -> tuple[dict, dict]:
+    provenance = _load_source_provenance(source, source_name, market_id, platform, start_ts=start_ts, end_ts=end_ts)
+    entry = {
+        "source_name": source_name,
+        "source": provenance["source"],
+        "observed": provenance["observed"],
+        "granularity": provenance["granularity"],
+        "had_data": had_data,
+        "latest_timestamp": latest_ts,
+        "latest_timestamp_iso": _iso_or_none(latest_ts),
+        "selected": False,
+    }
+    if error:
+        entry["error"] = error
+    return entry, provenance
+
+
+def _selection_provenance_payload(
+    *,
+    selected_source: str,
+    provenance: dict,
+    candidate_sources: list[dict],
+    selection_reason: str,
+    window_start_ts: int | None = None,
+    window_end_ts: int | None = None,
+    selected_point_timestamp: int | None = None,
+) -> dict:
+    now_ts = int(time.time())
+    payload = {
+        "selected_source": selected_source,
+        "source": provenance["source"],
+        "observed": provenance["observed"],
+        "granularity": provenance["granularity"],
+        "selection_reason": selection_reason,
+        "generated_at_ts": now_ts,
+        "generated_at_iso": _iso_or_none(now_ts),
+        "candidate_sources": candidate_sources,
+    }
+    if window_start_ts is not None:
+        payload["window_start_ts"] = int(window_start_ts)
+    if window_end_ts is not None:
+        payload["window_end_ts"] = int(window_end_ts)
+    if selected_point_timestamp is not None:
+        payload["selected_point_timestamp"] = int(selected_point_timestamp)
+        payload["selected_point_timestamp_iso"] = _iso_or_none(int(selected_point_timestamp))
+    return payload
+
+
+def _select_position_mark_price(side: str, yes_price: float | None, no_price: float | None = None) -> float | None:
+    if yes_price is None and no_price is None:
+        return None
+    normalized_side = str(side or "yes").strip().lower()
+    if normalized_side == "no":
+        if no_price is not None:
+            return float(no_price)
+        if yes_price is not None:
+            return max(0.0, min(1.0, 1.0 - float(yes_price)))
+    if yes_price is not None:
+        return float(yes_price)
+    return max(0.0, min(1.0, 1.0 - float(no_price)))
+
+
+def _build_portfolio_live_price_map(portfolio, runtime_status: dict | None) -> dict[str, float]:
+    normalized = _normalize_runtime_status_for_portfolio(portfolio, runtime_status) or {}
+    live_price_map = {}
+    for item in normalized.get("markets", []):
+        market_id = item.get("market_id")
+        current_price = item.get("current_price")
+        if market_id and current_price is not None:
+            live_price_map[str(market_id)] = float(current_price)
+    return live_price_map
+
+
+def _build_flatten_context(portfolio, cache: DataCache) -> tuple[LiveContext, dict[str, float]]:
+    runtime_status = read_runtime_status(portfolio.id)
+    live_price_map = _build_portfolio_live_price_map(portfolio, runtime_status)
+    context = LiveContext(
+        portfolio.id,
+        float(portfolio.initial_cash),
+        cache,
+        OrderBookStore(),
+        pmxt_client=None,
+    )
+    context._cash = float(portfolio.cash_balance)
+    context.load_positions_from_db()
+
+    for pos in context._positions.values():
+        live_yes_price = live_price_map.get(pos.market_id)
+        if live_yes_price is not None:
+            seeded_price = _select_position_mark_price(pos.side, live_yes_price)
+        else:
+            latest = _cache_get_latest_price(cache, pos.market_id, platform=pos.platform.value)
+            seeded_price = None if latest is None else _select_position_mark_price(
+                pos.side,
+                getattr(latest, "yes_price", None),
+                getattr(latest, "no_price", None),
+            )
+        if seeded_price is not None:
+            context.set_live_price(pos.market_id, seeded_price)
+
+    return context, live_price_map
+
+
+def _compute_portfolio_value(portfolio, positions: list, cache: DataCache, live_price_map: dict[str, float] | None = None) -> float:
+    live_yes_prices = live_price_map or {}
+    total_value = float(getattr(portfolio, "cash_balance", 0.0) or 0.0)
+    for pos in positions:
+        live_yes_price = live_yes_prices.get(pos.market_id)
+        latest = _cache_get_latest_price(cache, pos.market_id, platform=pos.platform)
+        current = _select_position_mark_price(pos.side, live_yes_price) if live_yes_price is not None else None
+        if current is None and latest is not None:
+            current = _select_position_mark_price(
+                pos.side,
+                getattr(latest, "yes_price", None),
+                getattr(latest, "no_price", None),
+            )
+        if current is None:
+            current = float(pos.avg_cost)
+        total_value += float(pos.contracts) * float(current)
+    return total_value
+
+
+def _flatten_portfolio_positions(portfolio, cache: DataCache, *, best_effort: bool) -> dict:
+    context, live_price_map = _build_flatten_context(portfolio, cache)
+    starting_positions = list(cache.get_open_positions(portfolio.id))
+    results = []
+    positions_failed = 0
+    positions_closed = 0
+    realized_pnl = 0.0
+
+    for pos in starting_positions:
+        contracts_before = float(pos.contracts)
+        try:
+            trade_id = context.sell(pos.market_id)
+            positions_closed += 1
+            trade_row = next((trade for trade in cache.get_trades(portfolio.id, limit=10) if trade.id == trade_id), None)
+            pnl = float(trade_row.pnl or 0.0) if trade_row is not None and trade_row.pnl is not None else None
+            if pnl is not None:
+                realized_pnl += pnl
+            results.append(
+                {
+                    "market_id": pos.market_id,
+                    "side": pos.side,
+                    "contracts": contracts_before,
+                    "trade_id": trade_id,
+                    "status": "closed",
+                    "realized_pnl": pnl,
+                }
+            )
+        except Exception as exc:
+            positions_failed += 1
+            results.append(
+                {
+                    "market_id": pos.market_id,
+                    "side": pos.side,
+                    "contracts": contracts_before,
+                    "status": "failed",
+                    "error": str(exc),
+                }
+            )
+            if not best_effort:
+                break
+
+    portfolio_row = cache.get_portfolio(portfolio.id)
+    remaining_positions = cache.get_open_positions(portfolio.id)
+    return {
+        "ok": positions_failed == 0,
+        "results": results,
+        "positions_attempted": len(results),
+        "positions_closed": positions_closed,
+        "positions_failed": positions_failed,
+        "realized_pnl": round(realized_pnl, 6),
+        "cash_balance": float(getattr(portfolio_row, "cash_balance", portfolio.cash_balance)),
+        "portfolio_value_after_flatten": _compute_portfolio_value(
+            portfolio_row or portfolio,
+            remaining_positions,
+            cache,
+            live_price_map=live_price_map,
+        ),
+        "remaining_positions": len(remaining_positions),
+    }
+
+
+def _detect_orientation_mismatch(points: list, reference_yes_price: float | None) -> dict | None:
+    if not points or reference_yes_price is None:
+        return None
+    latest_yes = float(getattr(points[-1], "yes_price", 0.0))
+    reference_yes = float(reference_yes_price)
+    direct_delta = abs(latest_yes - reference_yes)
+    complement_yes = 1.0 - latest_yes
+    complement_delta = abs(complement_yes - reference_yes)
+    if direct_delta - complement_delta < 0.35 or complement_delta > 0.15:
+        return None
+    return {
+        "latest_yes_price": round(latest_yes, 6),
+        "reference_yes_price": round(reference_yes, 6),
+        "direct_delta": round(direct_delta, 6),
+        "complement_delta": round(complement_delta, 6),
+    }
+
+
 def _get_research_markets(source, source_name: str, *, platform: str, category: str | None, tags: list[str] | None, limit: int, market_ids: list[str] | None, active_only: bool):
     if market_ids and hasattr(source, "get_markets_by_ids"):
         return source.get_markets_by_ids(market_ids, platform=platform)
@@ -426,52 +700,134 @@ def _candlestick_market_id(market) -> str:
 
 def _load_latest_price_from_source(source, source_name: str, market_id: str, platform: str):
     if source_name == "sqlite-cache":
-        return source.get_latest_price(market_id)
+        return _cache_get_latest_price(source, market_id, platform=platform)
     return source.get_latest_price(market_id, platform)
 
 
-def _select_freshest_price(market_id: str, platform: str):
+def _select_freshest_price_result(market_id: str, platform: str, sources=None):
     freshest = None
     freshest_ts = None
-    for source, source_name in get_all_sources():
+    candidate_sources = []
+    for source, source_name in (sources or get_all_sources()):
         try:
             latest = _load_latest_price_from_source(source, source_name, market_id, platform)
-        except Exception:
-            continue
-        if latest is None:
-            continue
+            error = None
+        except Exception as exc:
+            latest = None
+            error = str(exc)
 
-        latest_ts = int(getattr(latest, "timestamp", 0) or 0)
-        if freshest is None or latest_ts > freshest_ts:
-            freshest = (source_name, latest)
+        latest_ts = int(getattr(latest, "timestamp", 0) or 0) if latest is not None else None
+        candidate, provenance = _build_candidate_source(
+            source,
+            source_name,
+            market_id,
+            platform,
+            latest_ts=latest_ts,
+            had_data=latest is not None,
+            start_ts=latest_ts,
+            end_ts=latest_ts,
+            error=error,
+        )
+        candidate_sources.append(candidate)
+
+        if latest is not None and (freshest is None or latest_ts > freshest_ts):
+            freshest = (source_name, latest, provenance)
             freshest_ts = latest_ts
-    return freshest
+
+    if freshest is None:
+        return None
+
+    selected_source, latest, provenance = freshest
+    for candidate in candidate_sources:
+        if candidate["source_name"] == selected_source:
+            candidate["selected"] = True
+
+    return {
+        "source_name": selected_source,
+        "price": latest,
+        "provenance": _selection_provenance_payload(
+            selected_source=selected_source,
+            provenance=provenance,
+            candidate_sources=candidate_sources,
+            selection_reason="freshest_latest_timestamp",
+            selected_point_timestamp=int(getattr(latest, "timestamp", 0) or 0),
+        ),
+    }
+
+
+def _select_freshest_price(market_id: str, platform: str):
+    freshest = _select_freshest_price_result(market_id, platform)
+    if freshest is None:
+        return None
+    return freshest["source_name"], freshest["price"]
 
 
 def _load_history_from_source(source, source_name: str, market_id: str, platform: str, start_ts: int, end_ts: int):
     if source_name == "sqlite-cache":
         if not source.get_market(market_id):
             return []
-        return source.get_price_history(market_id, start_ts, end_ts)
+        return _cache_get_price_history(source, market_id, start_ts, end_ts, platform=platform)
     return source.get_price_history(market_id, platform, start_ts, end_ts)
 
 
-def _select_freshest_history(market_id: str, platform: str, start_ts: int, end_ts: int, sources=None):
+def _select_freshest_history_result(market_id: str, platform: str, start_ts: int, end_ts: int, sources=None):
     freshest = None
     freshest_ts = None
+    candidate_sources = []
     for source, source_name in (sources or get_all_sources()):
         try:
             history = _load_history_from_source(source, source_name, market_id, platform, start_ts, end_ts)
-        except Exception:
-            continue
-        if not history:
-            continue
+            error = None
+        except Exception as exc:
+            history = []
+            error = str(exc)
 
-        latest_ts = int(getattr(history[-1], "timestamp", 0) or 0)
-        if freshest is None or latest_ts > freshest_ts:
-            freshest = (source_name, history)
+        latest_ts = int(getattr(history[-1], "timestamp", 0) or 0) if history else None
+        candidate, provenance = _build_candidate_source(
+            source,
+            source_name,
+            market_id,
+            platform,
+            latest_ts=latest_ts,
+            had_data=bool(history),
+            start_ts=start_ts,
+            end_ts=end_ts,
+            error=error,
+        )
+        candidate_sources.append(candidate)
+
+        if history and (freshest is None or latest_ts > freshest_ts):
+            freshest = (source_name, history, provenance)
             freshest_ts = latest_ts
-    return freshest
+
+    if freshest is None:
+        return None
+
+    selected_source, history, provenance = freshest
+    for candidate in candidate_sources:
+        if candidate["source_name"] == selected_source:
+            candidate["selected"] = True
+
+    return {
+        "source_name": selected_source,
+        "history": history,
+        "provenance": _selection_provenance_payload(
+            selected_source=selected_source,
+            provenance=provenance,
+            candidate_sources=candidate_sources,
+            selection_reason="freshest_latest_timestamp",
+            window_start_ts=start_ts,
+            window_end_ts=end_ts,
+            selected_point_timestamp=int(getattr(history[-1], "timestamp", 0) or 0),
+        ),
+    }
+
+
+def _select_freshest_history(market_id: str, platform: str, start_ts: int, end_ts: int, sources=None):
+    freshest = _select_freshest_history_result(market_id, platform, start_ts, end_ts, sources=sources)
+    if freshest is None:
+        return None
+    return freshest["source_name"], freshest["history"]
 
 
 def _fetch_pmxt_candles(client, market, start_ts: int, end_ts: int, interval_minutes: int) -> dict:
@@ -678,8 +1034,10 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(name="validate_strategy", description="Validate strategy file", inputSchema={"type": "object", "properties": {"strategy_path": {"type": "string"}}, "required": ["strategy_path"]}),
         types.Tool(name="start_paper_trade", description="Start paper trading daemon", inputSchema={"type": "object", "properties": {"strategy_path": {"type": "string"}, "initial_cash": {"type": "number", "default": 10000}, "wait_for_ready": {"type": "boolean", "default": False, "description": "If true, poll until daemon is running (up to 30s) and return initial positions."}}, "required": ["strategy_path"]}),
         types.Tool(name="get_portfolio", description="Get paper portfolio status", inputSchema={"type": "object", "properties": {"portfolio_id": {"type": "string"}}, "required": ["portfolio_id"]}),
+        types.Tool(name="flatten_portfolio", description="Flatten all open paper positions for a portfolio without stopping the daemon.", inputSchema={"type": "object", "properties": {"portfolio_id": {"type": "string"}, "best_effort": {"type": "boolean", "default": False, "description": "If true, continue flattening other positions after an individual close fails."}}, "required": ["portfolio_id"]}),
         types.Tool(name="stop_paper_trade", description="Stop paper trading daemon", inputSchema={"type": "object", "properties": {"portfolio_id": {"type": "string"}}, "required": ["portfolio_id"]}),
-        types.Tool(name="list_paper_trades", description="List paper portfolios", inputSchema={"type": "object", "properties": {}}),
+        types.Tool(name="list_paper_portfolios", description="List paper portfolios with optional filtering. This is the canonical portfolio listing tool.", inputSchema={"type": "object", "properties": {"status": {"type": "string", "enum": ["starting", "running", "stopped", "failed", "dead"]}, "active_only": {"type": "boolean", "default": False}, "limit": {"type": "integer", "default": 100}}}),
+        types.Tool(name="list_paper_trades", description="Deprecated alias for list_paper_portfolios. Returns portfolio rows, not trade rows.", inputSchema={"type": "object", "properties": {"status": {"type": "string", "enum": ["starting", "running", "stopped", "failed", "dead"]}, "active_only": {"type": "boolean", "default": False}, "limit": {"type": "integer", "default": 100}}}),
         types.Tool(
             name="sync_data",
             description=(
@@ -784,10 +1142,18 @@ async def call_tool(name: str, arguments: dict):
         if name == "get_price":
             market_id = args["market_id"]
             platform = args.get("platform", "polymarket")
-            freshest = _select_freshest_price(market_id, platform)
+            freshest = _select_freshest_price_result(market_id, platform)
             if freshest is not None:
-                source_name, latest = freshest
-                return _respond({"ok": True, "data_source": source_name, "market_id": market_id, "price": latest.__dict__})
+                return _respond(
+                    {
+                        "ok": True,
+                        "data_source": freshest["source_name"],
+                        "market_id": market_id,
+                        "price": freshest["price"].__dict__,
+                        "provenance": freshest["provenance"],
+                        "timestamp_format": "unix_seconds",
+                    }
+                )
             return _respond(
                 _error_payload(
                     "MarketNotFound",
@@ -803,19 +1169,26 @@ async def call_tool(name: str, arguments: dict):
             start_ts = end_ts - days * 24 * 3600
             platform = args.get("platform", "polymarket")
 
-            freshest = _select_freshest_history(market_id, platform, start_ts, end_ts)
+            freshest = _select_freshest_history_result(market_id, platform, start_ts, end_ts)
             if freshest is None:
                 # Distinguish "market exists but no data in window" from "market unknown"
-                known_price = _select_freshest_price(market_id, platform)
+                known_price = _select_freshest_price_result(market_id, platform)
                 if known_price is not None:
                     # Market exists — just no data in the requested lookback
-                    price_source, latest = known_price
+                    latest = known_price["price"]
                     payload = {
                         "ok": True,
-                        "data_source": price_source,
+                        "data_source": known_price["source_name"],
                         "market_id": market_id,
                         "days": days,
                         "analytics": _compute_history_analytics([], end_ts),
+                        "provenance": {
+                            **known_price["provenance"],
+                            "selection_reason": "known_market_no_points_in_window",
+                            "window_start_ts": start_ts,
+                            "window_end_ts": end_ts,
+                        },
+                        "timestamp_format": "unix_seconds",
                         "warning": (
                             f"No history points found in the requested {days}-day lookback window. "
                             f"The market has data outside this range (last point: "
@@ -830,18 +1203,21 @@ async def call_tool(name: str, arguments: dict):
                         fix=f"Call sync_data(market_ids=['{market_id}']) and retry.",
                     )
                 )
-            used_source, history = freshest
+            history = freshest["history"]
 
             include_raw = bool(args.get("include_raw", False))
             payload = {
                 "ok": True,
-                "data_source": used_source,
+                "data_source": freshest["source_name"],
                 "market_id": market_id,
                 "days": days,
                 "analytics": _compute_history_analytics(history, end_ts),
+                "provenance": freshest["provenance"],
+                "timestamp_format": "unix_seconds",
             }
             if include_raw:
                 payload["history"] = [h.__dict__ for h in history]
+                payload["history_timestamp_format"] = "unix_seconds"
             return _respond(payload)
 
         if name == "match_markets":
@@ -1050,15 +1426,55 @@ async def call_tool(name: str, arguments: dict):
                     mid = market.id if hasattr(market, "id") else market["id"]
                     plat = market.platform.value if hasattr(market.platform, "value") else str(market.platform)
                     freshest = _select_freshest_history(mid, plat, start_ts, end_ts, sources=all_sources)
-                    pts = freshest[1] if freshest is not None else []
+                    selected_history_source = None
+                    pts = []
+                    if freshest is not None:
+                        selected_history_source, pts = freshest
                     analytics = _compute_history_analytics(pts, end_ts)
                     if analytics["points"] < min_history_points:
                         continue
-                    entry = {"ok": True, "market_id": mid, "days": days, "analytics": analytics}
+                    entry = {
+                        "ok": True,
+                        "market_id": mid,
+                        "days": days,
+                        "analytics": analytics,
+                        "timestamp_format": "unix_seconds",
+                    }
+                    if selected_history_source is not None:
+                        entry["data_source"] = selected_history_source
+                        source_obj = next(
+                            (candidate_source for candidate_source, candidate_name in all_sources if candidate_name == selected_history_source),
+                            None,
+                        )
+                        if source_obj is not None:
+                            candidate_sources = []
+                            for candidate_source, candidate_name in all_sources:
+                                candidate_entry, _ = _build_candidate_source(
+                                    candidate_source,
+                                    candidate_name,
+                                    mid,
+                                    plat,
+                                    latest_ts=int(getattr(pts[-1], "timestamp", 0) or 0) if pts and candidate_name == selected_history_source else None,
+                                    had_data=candidate_name == selected_history_source and bool(pts),
+                                    start_ts=start_ts,
+                                    end_ts=end_ts,
+                                )
+                                candidate_entry["selected"] = candidate_name == selected_history_source
+                                candidate_sources.append(candidate_entry)
+                            entry["provenance"] = _selection_provenance_payload(
+                                selected_source=selected_history_source,
+                                provenance=_load_source_provenance(source_obj, selected_history_source, mid, plat, start_ts=start_ts, end_ts=end_ts),
+                                candidate_sources=candidate_sources,
+                                selection_reason="freshest_latest_timestamp",
+                                window_start_ts=start_ts,
+                                window_end_ts=end_ts,
+                                selected_point_timestamp=int(getattr(pts[-1], "timestamp", 0) or 0) if pts else None,
+                            )
                     if analytics["points"] == 0:
                         entry["warning"] = "No price data found in the requested lookback window."
                     if include_raw:
                         entry["history"] = [h.__dict__ for h in pts]
+                        entry["history_timestamp_format"] = "unix_seconds"
                     selected_markets.append(market)
                     history.append(entry)
                     if len(selected_markets) >= target_count:
@@ -1071,9 +1487,24 @@ async def call_tool(name: str, arguments: dict):
             analytics_by_id = {h["market_id"]: h.get("analytics", {}) for h in history}
 
             caps = _compute_capabilities(markets, cache)
+            candidate_sources = [
+                _build_candidate_source(candidate_source, candidate_name, "*", platform, latest_ts=None, had_data=True)[0]
+                for candidate_source, candidate_name in all_sources
+            ]
+            for candidate in candidate_sources:
+                if candidate["source_name"] == source_name:
+                    candidate["selected"] = True
             payload = {
                 "ok": len(history_errors) == 0,
                 "data_source": source_name,
+                "provenance": _selection_provenance_payload(
+                    selected_source=source_name,
+                    provenance=_load_source_provenance(source, source_name, "*", platform),
+                    candidate_sources=candidate_sources,
+                    selection_reason="best_available_source_priority",
+                    window_start_ts=start_ts,
+                    window_end_ts=end_ts,
+                ),
                 "markets": [
                     m.__dict__ | {"platform": m.platform.value, "market_type": m.market_type.value, "capabilities": caps.get(m.id, {}), "analytics": analytics_by_id.get(m.id, {})}
                     for m in markets
@@ -1081,6 +1512,7 @@ async def call_tool(name: str, arguments: dict):
                 "history": history,
                 "history_errors": history_errors,
                 "count": len(markets),
+                "timestamp_format": "unix_seconds",
             }
             if sync_payload is not None:
                 payload["sync"] = sync_payload
@@ -1301,7 +1733,7 @@ async def call_tool(name: str, arguments: dict):
                     _error_payload(
                         "NotFound",
                         "portfolio not found",
-                        fix=f"Call list_paper_trades then retry with a valid portfolio_id (missing: {portfolio_id}).",
+                        fix=f"Call list_paper_portfolios then retry with a valid portfolio_id (missing: {portfolio_id}).",
                     )
                 )
             # Auto-correct stale "running" status when daemon PID is dead
@@ -1312,20 +1744,33 @@ async def call_tool(name: str, arguments: dict):
                         row.status = "dead"
                         session.commit()
                 p = cache.get_portfolio(portfolio_id)
+            elif str(p.status or "").lower() == "stopped" and p.pid is not None:
+                with get_session(get_engine()) as session:
+                    row = session.get(PaperPortfolio, p.id)
+                    if row:
+                        row.pid = None
+                        session.commit()
+                p = cache.get_portfolio(portfolio_id)
             runtime_status = read_runtime_status(p.id)
             runtime_status = _normalize_runtime_status_for_portfolio(p, runtime_status)
-            live_price_map = {
-                item["market_id"]: item.get("current_price")
-                for item in (runtime_status or {}).get("markets", [])
-                if item.get("market_id")
-            }
+            live_price_map = _build_portfolio_live_price_map(p, runtime_status)
             positions = cache.get_open_positions(p.id)
             out = []
             unrealized = 0.0
             for pos in positions:
-                latest = cache.get_latest_price(pos.market_id)
-                live_price = live_price_map.get(pos.market_id)
-                current = live_price if live_price is not None else (latest.yes_price if latest else pos.avg_cost)
+                latest = _cache_get_latest_price(cache, pos.market_id, platform=pos.platform)
+                live_yes_price = live_price_map.get(pos.market_id)
+                if live_yes_price is not None:
+                    current = _select_position_mark_price(pos.side, live_yes_price)
+                elif latest is not None:
+                    current = _select_position_mark_price(
+                        pos.side,
+                        getattr(latest, "yes_price", None),
+                        getattr(latest, "no_price", None),
+                    )
+                else:
+                    current = float(pos.avg_cost)
+                current = float(current if current is not None else pos.avg_cost)
                 pnl = (current - pos.avg_cost) * pos.contracts
                 unrealized += pnl
                 out.append(
@@ -1344,7 +1789,7 @@ async def call_tool(name: str, arguments: dict):
                     "ok": True,
                     "portfolio_id": p.id,
                     "status": p.status,
-                    "pid": p.pid,
+                    "pid": _normalized_portfolio_pid(p),
                     "initial_cash": p.initial_cash,
                     "cash_balance": p.cash_balance,
                     "portfolio_value": p.cash_balance + sum(i["contracts"] * i["current_price"] for i in out),
@@ -1353,10 +1798,50 @@ async def call_tool(name: str, arguments: dict):
                     "last_reload": p.last_reload,
                     "reload_count": p.reload_count or 0,
                     "last_live_update": runtime_status.get("last_live_update") if runtime_status else None,
+                    "last_live_update_iso": _iso_or_none(runtime_status.get("last_live_update")) if runtime_status else None,
                     "markets_live": runtime_status.get("markets_with_live_price") if runtime_status else None,
                     "markets_degraded": runtime_status.get("markets_degraded") if runtime_status else None,
                     "live_status": runtime_status,
+                    "timestamp_format": "unix_seconds",
                 }
+            )
+
+        if name == "flatten_portfolio":
+            portfolio_id = args["portfolio_id"]
+            p = cache.get_portfolio(portfolio_id)
+            if not p:
+                return _respond(
+                    _error_payload(
+                        "NotFound",
+                        "portfolio not found",
+                        fix=f"Call list_paper_portfolios then retry with a valid portfolio_id (missing: {portfolio_id}).",
+                    )
+                )
+            best_effort = bool(args.get("best_effort", False))
+            flatten_result = _flatten_portfolio_positions(p, cache, best_effort=best_effort)
+            payload = {
+                "portfolio_id": p.id,
+                "best_effort": best_effort,
+                "results": flatten_result["results"],
+                "positions_attempted": flatten_result["positions_attempted"],
+                "positions_closed": flatten_result["positions_closed"],
+                "positions_failed": flatten_result["positions_failed"],
+                "remaining_positions": flatten_result["remaining_positions"],
+                "realized_pnl": flatten_result["realized_pnl"],
+                "cash_balance": flatten_result["cash_balance"],
+                "portfolio_value_after_flatten": flatten_result["portfolio_value_after_flatten"],
+                "timestamp_format": "unix_seconds",
+            }
+            if flatten_result["ok"]:
+                payload["ok"] = True
+                return _respond(payload)
+            return _respond(
+                _error_payload(
+                    "PartialFlattenFailure" if best_effort else "FlattenFailed",
+                    "One or more positions could not be flattened.",
+                    fix="Inspect the per-position errors, refresh prices, and retry flatten_portfolio.",
+                    **payload,
+                )
             )
 
         if name == "stop_paper_trade":
@@ -1367,7 +1852,7 @@ async def call_tool(name: str, arguments: dict):
                     _error_payload(
                         "NotFound",
                         "portfolio not found",
-                        fix=f"Call list_paper_trades then retry with a valid portfolio_id (missing: {portfolio_id}).",
+                        fix=f"Call list_paper_portfolios then retry with a valid portfolio_id (missing: {portfolio_id}).",
                     )
                 )
             if p.pid:
@@ -1385,11 +1870,13 @@ async def call_tool(name: str, arguments: dict):
                         os.kill(int(p.pid), signal.SIGTERM)
                 except (ProcessLookupError, OSError):
                     pass  # Process already dead
+            stopped_at = int(datetime.now(tz=UTC).timestamp())
             with get_session(get_engine()) as session:
                 row = session.get(PaperPortfolio, p.id)
                 if row:
                     row.status = "stopped"
-                    row.stopped_at = int(datetime.now(tz=UTC).timestamp())
+                    row.stopped_at = stopped_at
+                    row.pid = None
                     session.commit()
             try:
                 status_path = runtime_status_path(p.id)
@@ -1397,9 +1884,9 @@ async def call_tool(name: str, arguments: dict):
                     status_path.unlink()
             except OSError:
                 pass
-            return _respond({"ok": True, "portfolio_id": p.id, "stopped": True})
+            return _respond({"ok": True, "portfolio_id": p.id, "stopped": True, "pid": None, "stopped_at": stopped_at, "stopped_at_iso": _iso_or_none(stopped_at), "timestamp_format": "unix_seconds"})
 
-        if name == "list_paper_trades":
+        if name in {"list_paper_trades", "list_paper_portfolios"}:
             rows = cache.list_paper_portfolios()
             # Auto-correct stale "running" rows where the daemon PID is dead
             for p in rows:
@@ -1410,18 +1897,53 @@ async def call_tool(name: str, arguments: dict):
                             row.status = "dead"
                             session.commit()
                     p.status = "dead"
+                elif str(p.status or "").lower() == "stopped" and p.pid is not None:
+                    with get_session(get_engine()) as session:
+                        row = session.get(PaperPortfolio, p.id)
+                        if row:
+                            row.pid = None
+                            session.commit()
+                    p.pid = None
+
+            wanted_status = args.get("status")
+            active_only = bool(args.get("active_only", False))
+            if wanted_status:
+                rows = [p for p in rows if str(p.status or "").lower() == str(wanted_status).lower()]
+            if active_only:
+                rows = [p for p in rows if _status_is_active(p.status)]
+
+            status_priority = {"running": 0, "starting": 1, "failed": 2, "dead": 3, "stopped": 4}
+            rows.sort(key=lambda p: (status_priority.get(str(p.status or "").lower(), 9), -int(getattr(p, "started_at", 0) or 0)))
+            rows = rows[:_bounded_int(args, "limit", 100, 1, 1000)]
             portfolios = []
             for p in rows:
                 rs = _normalize_runtime_status_for_portfolio(p, read_runtime_status(p.id)) or {}
                 portfolios.append({
                     "id": p.id,
                     "status": p.status,
-                    "pid": p.pid,
+                    "pid": _normalized_portfolio_pid(p),
+                    "started_at": getattr(p, "started_at", None),
+                    "started_at_iso": _iso_or_none(getattr(p, "started_at", None)),
+                    "stopped_at": getattr(p, "stopped_at", None),
+                    "stopped_at_iso": _iso_or_none(getattr(p, "stopped_at", None)),
                     "last_live_update": rs.get("last_live_update"),
+                    "last_live_update_iso": _iso_or_none(rs.get("last_live_update")),
                     "markets_live": rs.get("markets_with_live_price"),
                     "markets_degraded": rs.get("markets_degraded"),
                 })
-            return _respond({"ok": True, "portfolios": portfolios})
+            active_portfolios = [portfolio for portfolio in portfolios if _status_is_active(portfolio.get("status"))]
+            payload = {
+                "ok": True,
+                "portfolios": portfolios,
+                "active_portfolios": active_portfolios,
+                "active_count": len(active_portfolios),
+                "inactive_count": max(len(portfolios) - len(active_portfolios), 0),
+                "timestamp_format": "unix_seconds",
+            }
+            if name == "list_paper_trades":
+                payload["deprecated"] = True
+                payload["canonical_tool"] = "list_paper_portfolios"
+            return _respond(payload)
 
         if name == "sync_data":
             client = PmxtClient()
@@ -1491,14 +2013,36 @@ async def call_tool(name: str, arguments: dict):
                     candles_result = _fetch_pmxt_candles(client, m, start_ts, end_ts, interval_minutes)
                     candles = candles_result["points"]
                     gran_label = {"minute": "1m", "hourly": "1h", "daily": "1d"}.get(granularity, "1h")
-                    cache.upsert_price_points_batch(m.id, _market_platform_value(m), candles, source="pmxt", granularity=gran_label)
-                    pp += len(candles)
+                    market_platform = _market_platform_value(m)
+                    orientation_warning = None
                     if candles:
-                        markets_with_price_points += 1
+                        live_snapshot = client.get_live_snapshot(m.id, m.platform) if hasattr(client, "get_live_snapshot") else None
+                        reference_price = None
+                        live_point = live_snapshot.get("price") if isinstance(live_snapshot, dict) else None
+                        if live_point is not None:
+                            reference_price = float(getattr(live_point, "yes_price", 0.0))
+                        else:
+                            latest_cached = _cache_get_latest_price(cache, m.id, platform=market_platform)
+                            if latest_cached is not None:
+                                reference_price = float(latest_cached.yes_price)
+                        orientation_warning = _detect_orientation_mismatch(candles, reference_price)
+                    if orientation_warning is None:
+                        cache.upsert_price_points_batch(m.id, market_platform, candles, source="pmxt", granularity=gran_label)
+                        pp += len(candles)
+                        if candles:
+                            markets_with_price_points += 1
+                    else:
+                        warnings.append({
+                            "market_id": m.id,
+                            "type": "PriceOrientationMismatch",
+                            "message": f"Rejected PMXT candles for {m.id} because the series appears inverted against the current YES price.",
+                            "detail": orientation_warning,
+                        })
+                        candles = []
 
                     orderbook_result = _fetch_pmxt_orderbooks(client, m, start_ts, end_ts, 100)
                     ob = orderbook_result["snapshots"]
-                    written_files = ob_store.write(_market_platform_value(m), m.id, ob)
+                    written_files = ob_store.write(market_platform, m.id, ob)
                     ob_files += written_files
                     if written_files > 0:
                         markets_with_orderbooks += 1
@@ -1516,6 +2060,8 @@ async def call_tool(name: str, arguments: dict):
                             "detail": candles_result["error"],
                         })
                         market_warning_types.append("CandlesFetchError")
+                    elif orientation_warning is not None:
+                        market_warning_types.append("PriceOrientationMismatch")
                     elif not candles:
                         market_warning_types.append("NoPricePoints")
 
@@ -1542,12 +2088,13 @@ async def call_tool(name: str, arguments: dict):
                     synced += 1
                     market_results.append({
                         "market_id": m.id,
-                        "platform": _market_platform_value(m),
+                        "platform": market_platform,
                         "price_points_fetched": len(candles),
                         "orderbook_files_written": written_files,
                         "has_live_data": has_live_data,
                         "candles_status": candles_result["status"],
                         "orderbook_status": orderbook_result["status"],
+                        "price_orientation_mismatch": orientation_warning is not None,
                         "warning_types": market_warning_types,
                     })
                 except Exception as exc:

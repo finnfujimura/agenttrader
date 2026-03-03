@@ -6,7 +6,7 @@ import json
 from sqlalchemy import and_, delete, desc, func, select
 from sqlalchemy.dialects.sqlite import insert
 
-from agenttrader.data.models import Market, MarketType, Platform, PricePoint
+from agenttrader.data.models import DataProvenance, Market, MarketType, Platform, PricePoint
 from agenttrader.db import get_session
 from agenttrader.db.schema import BacktestRun, Market as MarketRow, PaperPortfolio, Position, PriceHistory, StrategyLog, Trade
 
@@ -65,7 +65,16 @@ class DataCache:
         with self._engine.begin() as conn:
             for row in rows:
                 stmt = insert(PriceHistory).values(**row)
-                stmt = stmt.on_conflict_do_nothing(index_elements=[PriceHistory.market_id, PriceHistory.timestamp])
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=[PriceHistory.market_id, PriceHistory.platform, PriceHistory.timestamp],
+                    set_={
+                        "yes_price": row["yes_price"],
+                        "no_price": row["no_price"],
+                        "volume": row["volume"],
+                        "source": row["source"],
+                        "granularity": row["granularity"],
+                    },
+                )
                 conn.execute(stmt)
 
     def get_markets(
@@ -116,34 +125,57 @@ class DataCache:
         market_id: str,
         start_ts: int,
         end_ts: int,
+        platform: str | None = None,
     ) -> list[PricePoint]:
-        q = (
-            select(PriceHistory)
-            .where(
-                and_(
-                    PriceHistory.market_id == market_id,
-                    PriceHistory.timestamp >= start_ts,
-                    PriceHistory.timestamp <= end_ts,
-                )
-            )
-            .order_by(PriceHistory.timestamp.asc())
-        )
+        filters = [
+            PriceHistory.market_id == market_id,
+            PriceHistory.timestamp >= start_ts,
+            PriceHistory.timestamp <= end_ts,
+        ]
+        if platform:
+            filters.append(PriceHistory.platform == platform)
+        q = select(PriceHistory).where(and_(*filters)).order_by(PriceHistory.timestamp.asc())
         with get_session(self._engine) as session:
             rows = list(session.scalars(q).all())
         return [self._to_price_point(r) for r in rows]
 
-    def get_latest_price(self, market_id: str) -> PricePoint | None:
-        q = (
-            select(PriceHistory)
-            .where(PriceHistory.market_id == market_id)
-            .order_by(PriceHistory.timestamp.desc())
-            .limit(1)
-        )
+    def get_latest_price(self, market_id: str, platform: str | None = None) -> PricePoint | None:
+        q = select(PriceHistory).where(PriceHistory.market_id == market_id)
+        if platform:
+            q = q.where(PriceHistory.platform == platform)
+        q = q.order_by(PriceHistory.timestamp.desc()).limit(1)
         with get_session(self._engine) as session:
             row = session.scalars(q).first()
         if not row:
             return None
         return self._to_price_point(row)
+
+    def get_provenance(
+        self,
+        market_id: str,
+        platform: str,
+        start_ts: int | None = None,
+        end_ts: int | None = None,
+    ) -> DataProvenance:
+        q = select(PriceHistory.source, PriceHistory.granularity).where(PriceHistory.market_id == market_id)
+        if platform and platform != "all":
+            q = q.where(PriceHistory.platform == platform)
+        if start_ts is not None:
+            q = q.where(PriceHistory.timestamp >= int(start_ts))
+        if end_ts is not None:
+            q = q.where(PriceHistory.timestamp <= int(end_ts))
+
+        with get_session(self._engine) as session:
+            rows = session.execute(q).all()
+
+        if not rows:
+            return DataProvenance(source="pmxt", observed=True, granularity="1h")
+
+        sources = {str(row.source or "pmxt") for row in rows}
+        granularities = {str(row.granularity or "1h") for row in rows}
+        source = next(iter(sources)) if len(sources) == 1 else "mixed"
+        granularity = next(iter(granularities)) if len(granularities) == 1 else "mixed"
+        return DataProvenance(source=source, observed=True, granularity=granularity)
 
     def list_backtest_runs(self, limit: int = 100, lightweight: bool = False) -> list[BacktestRun]:
         if lightweight:

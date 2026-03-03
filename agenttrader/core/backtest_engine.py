@@ -724,10 +724,12 @@ class BacktestEngine:
                 "sharpe_ratio": 0.0,
                 "sortino_ratio": 0.0,
                 "max_drawdown_pct": 0.0,
-                "win_rate": 0.0,
-                "profit_factor": 0.0,
+                "win_rate": None,
+                "profit_factor": None,
                 "calmar_ratio": 0.0,
                 "total_trades": len(trades),
+                "closed_trades": 0,
+                "open_positions_at_end": sum(1 for t in trades if t.get("action") == "buy"),
                 "avg_slippage": 0.0,
             }
 
@@ -759,13 +761,22 @@ class BacktestEngine:
         closed = [t for t in trades if t.get("action") in {"sell", "resolution"} and t.get("pnl") is not None]
         wins = [t for t in closed if float(t["pnl"]) > 0]
         losses = [t for t in closed if float(t["pnl"]) < 0]
-        win_rate = (len(wins) / len(closed)) if closed else 0.0
+        win_rate = (len(wins) / len(closed)) if closed else None
         gross_profit = sum(float(t["pnl"]) for t in wins)
         gross_loss = abs(sum(float(t["pnl"]) for t in losses))
-        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+        if not closed:
+            profit_factor = None
+        elif gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        elif gross_profit > 0:
+            profit_factor = float("inf")
+        else:
+            profit_factor = 0.0
         calmar = (annualized_return / abs(max_drawdown_pct)) if max_drawdown_pct < 0 else 0.0
 
         slippage = [abs(float(t.get("slippage", 0.0))) for t in trades if t.get("action") in {"buy", "sell"}]
+        buys = sum(1 for t in trades if t.get("action") == "buy")
+        sells = sum(1 for t in trades if t.get("action") in {"sell", "resolution"})
 
         return {
             "total_return_pct": round(total_return, 4),
@@ -773,10 +784,16 @@ class BacktestEngine:
             "sharpe_ratio": round(sharpe, 4),
             "sortino_ratio": round(sortino, 4),
             "max_drawdown_pct": round(max_drawdown_pct, 4),
-            "win_rate": round(win_rate, 4),
-            "profit_factor": round(profit_factor, 4) if math.isfinite(profit_factor) else float("inf"),
+            "win_rate": round(win_rate, 4) if win_rate is not None else None,
+            "profit_factor": (
+                round(profit_factor, 4)
+                if profit_factor is not None and math.isfinite(profit_factor)
+                else profit_factor
+            ),
             "calmar_ratio": round(calmar, 4),
             "total_trades": len(trades),
+            "closed_trades": len(closed),
+            "open_positions_at_end": max(buys - sells, 0),
             "avg_slippage": round(float(np.mean(slippage)) if slippage else 0.0, 6),
         }
 

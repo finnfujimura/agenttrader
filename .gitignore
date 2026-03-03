@@ -28,6 +28,7 @@ codex_tmp_bench/
 pytest_tmp_*/
 .pytest_tmp*/
 .codex_pytest_tmp*/
+test_results.txt
 
 # Dataset (large parquet files)
 /data/
