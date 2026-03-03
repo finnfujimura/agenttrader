@@ -207,6 +207,36 @@ class PmxtClient:
         )
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
+    def get_outcome_side(
+        self,
+        outcome_id: str,
+        platform: Platform,
+    ) -> str | None:
+        """Return the canonical side label ('yes'/'no') for an outcome when PMXT exposes it."""
+        client = self._poly if platform == Platform.POLYMARKET else self._kalshi
+        if not hasattr(client, "fetch_market"):
+            return None
+
+        market = client.fetch_market(outcome_id=outcome_id)
+        yes = getattr(market, "yes", None)
+        if yes is not None and str(getattr(yes, "outcome_id", "")) == str(outcome_id):
+            return "yes"
+        no = getattr(market, "no", None)
+        if no is not None and str(getattr(no, "outcome_id", "")) == str(outcome_id):
+            return "no"
+
+        outcomes = getattr(market, "outcomes", None) or []
+        for outcome in outcomes:
+            if str(getattr(outcome, "outcome_id", "")) != str(outcome_id):
+                continue
+            label = self._normalize_outcome_label(getattr(outcome, "label", None))
+            if label in {"yes", "no"}:
+                return label
+            return None
+
+        return None
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
     def get_candlesticks(
         self,
         condition_id: str,

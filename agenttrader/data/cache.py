@@ -49,33 +49,36 @@ class DataCache:
     def upsert_price_points_batch(self, market_id: str, platform: str, points: list[PricePoint], source: str = "pmxt", granularity: str = "1h") -> None:
         if not points:
             return
-        rows = [
-            {
-                "market_id": market_id,
-                "platform": platform,
-                "timestamp": p.timestamp,
-                "yes_price": p.yes_price,
-                "no_price": p.no_price,
-                "volume": p.volume,
-                "source": source,
-                "granularity": granularity,
-            }
-            for p in points
-        ]
+        rows = self._price_history_rows(market_id, platform, points, source=source, granularity=granularity)
         with self._engine.begin() as conn:
-            for row in rows:
-                stmt = insert(PriceHistory).values(**row)
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=[PriceHistory.market_id, PriceHistory.platform, PriceHistory.timestamp],
-                    set_={
-                        "yes_price": row["yes_price"],
-                        "no_price": row["no_price"],
-                        "volume": row["volume"],
-                        "source": row["source"],
-                        "granularity": row["granularity"],
-                    },
+            self._upsert_price_history_rows(conn, rows)
+
+    def replace_price_points_window(
+        self,
+        market_id: str,
+        platform: str,
+        start_ts: int,
+        end_ts: int,
+        points: list[PricePoint],
+        *,
+        source: str = "pmxt",
+        granularity: str = "1h",
+    ) -> None:
+        rows = self._price_history_rows(market_id, platform, points, source=source, granularity=granularity)
+        with self._engine.begin() as conn:
+            conn.execute(
+                delete(PriceHistory).where(
+                    and_(
+                        PriceHistory.market_id == market_id,
+                        PriceHistory.platform == platform,
+                        PriceHistory.timestamp >= int(start_ts),
+                        PriceHistory.timestamp <= int(end_ts),
+                        PriceHistory.source == source,
+                        PriceHistory.granularity == granularity,
+                    )
                 )
-                conn.execute(stmt)
+            )
+            self._upsert_price_history_rows(conn, rows)
 
     def get_markets(
         self,
@@ -295,3 +298,42 @@ class DataCache:
             no_price=float(row.no_price) if row.no_price is not None else None,
             volume=float(row.volume or 0),
         )
+
+    @staticmethod
+    def _price_history_rows(
+        market_id: str,
+        platform: str,
+        points: list[PricePoint],
+        *,
+        source: str,
+        granularity: str,
+    ) -> list[dict]:
+        return [
+            {
+                "market_id": market_id,
+                "platform": platform,
+                "timestamp": int(p.timestamp),
+                "yes_price": float(p.yes_price),
+                "no_price": float(p.no_price) if p.no_price is not None else None,
+                "volume": float(p.volume or 0.0),
+                "source": source,
+                "granularity": granularity,
+            }
+            for p in points
+        ]
+
+    @staticmethod
+    def _upsert_price_history_rows(conn, rows: list[dict]) -> None:
+        for row in rows:
+            stmt = insert(PriceHistory).values(**row)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[PriceHistory.market_id, PriceHistory.platform, PriceHistory.timestamp],
+                set_={
+                    "yes_price": row["yes_price"],
+                    "no_price": row["no_price"],
+                    "volume": row["volume"],
+                    "source": row["source"],
+                    "granularity": row["granularity"],
+                },
+            )
+            conn.execute(stmt)

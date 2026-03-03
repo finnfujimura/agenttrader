@@ -28,7 +28,7 @@ from agenttrader.core.context import LiveContext
 from agenttrader.core.paper_daemon import PaperDaemon, read_runtime_status, runtime_status_path
 from agenttrader.data.backtest_artifacts import read_backtest_artifact, write_backtest_artifact
 from agenttrader.data.cache import DataCache
-from agenttrader.data.models import ExecutionMode
+from agenttrader.data.models import ExecutionMode, PricePoint
 from agenttrader.data.index_adapter import BacktestIndexAdapter
 from agenttrader.data.source_selector import get_best_data_source, get_all_sources, invalidate_source_cache
 from agenttrader.db.health import check_schema
@@ -551,19 +551,194 @@ def _flatten_portfolio_positions(portfolio, cache: DataCache, *, best_effort: bo
 def _detect_orientation_mismatch(points: list, reference_yes_price: float | None) -> dict | None:
     if not points or reference_yes_price is None:
         return None
-    latest_yes = float(getattr(points[-1], "yes_price", 0.0))
+    recent_prices = [float(getattr(point, "yes_price", 0.0)) for point in points[-min(len(points), 3):]]
+    latest_yes = statistics.median(recent_prices)
     reference_yes = float(reference_yes_price)
     direct_delta = abs(latest_yes - reference_yes)
     complement_yes = 1.0 - latest_yes
     complement_delta = abs(complement_yes - reference_yes)
-    if direct_delta - complement_delta < 0.35 or complement_delta > 0.15:
+    if direct_delta - complement_delta < 0.2 or complement_delta > 0.12:
         return None
     return {
-        "latest_yes_price": round(latest_yes, 6),
+        "latest_yes_price": round(float(getattr(points[-1], "yes_price", 0.0)), 6),
+        "recent_median_yes_price": round(latest_yes, 6),
         "reference_yes_price": round(reference_yes, 6),
         "direct_delta": round(direct_delta, 6),
         "complement_delta": round(complement_delta, 6),
     }
+
+
+def _invert_price_point(point) -> PricePoint:
+    inverted_yes = max(0.0, min(1.0, 1.0 - float(getattr(point, "yes_price", 0.0))))
+    return PricePoint(
+        timestamp=int(getattr(point, "timestamp", 0) or 0),
+        yes_price=inverted_yes,
+        no_price=max(0.0, min(1.0, 1.0 - inverted_yes)),
+        volume=float(getattr(point, "volume", 0.0) or 0.0),
+    )
+
+
+def _copy_price_point(point) -> PricePoint:
+    return PricePoint(
+        timestamp=int(getattr(point, "timestamp", 0) or 0),
+        yes_price=float(getattr(point, "yes_price", 0.0)),
+        no_price=(
+            float(getattr(point, "no_price", None))
+            if getattr(point, "no_price", None) is not None
+            else max(0.0, min(1.0, 1.0 - float(getattr(point, "yes_price", 0.0))))
+        ),
+        volume=float(getattr(point, "volume", 0.0) or 0.0),
+    )
+
+
+def _local_repair_baseline(points: list[PricePoint], index: int, reference_yes_price: float | None) -> float | None:
+    anchors = []
+    for offset in (1, 2):
+        prev_idx = index - offset
+        next_idx = index + offset
+        if prev_idx >= 0:
+            anchors.append(float(points[prev_idx].yes_price))
+        if next_idx < len(points):
+            anchors.append(float(points[next_idx].yes_price))
+    if reference_yes_price is not None:
+        anchors.append(float(reference_yes_price))
+    if len(anchors) < 2:
+        return None
+    if max(anchors) - min(anchors) > 0.18:
+        return None
+    return float(statistics.median(anchors))
+
+
+def _find_localized_inverted_candles(points: list[PricePoint], reference_yes_price: float | None) -> list[dict]:
+    issues = []
+    for index, point in enumerate(points):
+        baseline = _local_repair_baseline(points, index, reference_yes_price)
+        if baseline is None:
+            continue
+        current_yes = float(point.yes_price)
+        inverted_yes = 1.0 - current_yes
+        direct_delta = abs(current_yes - baseline)
+        complement_delta = abs(inverted_yes - baseline)
+        if direct_delta < 0.25:
+            continue
+        if complement_delta > 0.12:
+            continue
+        if direct_delta - complement_delta < 0.18:
+            continue
+        issues.append(
+            {
+                "index": index,
+                "timestamp": int(point.timestamp),
+                "baseline_yes_price": round(baseline, 6),
+                "current_yes_price": round(current_yes, 6),
+                "repaired_yes_price": round(inverted_yes, 6),
+                "direct_delta": round(direct_delta, 6),
+                "complement_delta": round(complement_delta, 6),
+            }
+        )
+    return issues
+
+
+def _normalize_pmxt_candles_to_yes_space(
+    points: list,
+    *,
+    outcome_side: str | None,
+    reference_yes_price: float | None,
+) -> dict:
+    normalized = [_copy_price_point(point) for point in points]
+    normalized_outcome_side = str(outcome_side or "").strip().lower() or None
+    batch_inverted = False
+    inversion_reason = None
+
+    if normalized_outcome_side == "no":
+        normalized = [_invert_price_point(point) for point in normalized]
+        batch_inverted = True
+        inversion_reason = "outcome_side=no"
+    elif normalized_outcome_side not in {None, "yes"}:
+        inversion_reason = f"outcome_side={normalized_outcome_side}"
+
+    batch_mismatch = None
+    if not batch_inverted:
+        batch_mismatch = _detect_orientation_mismatch(normalized, reference_yes_price)
+        if batch_mismatch is not None:
+            normalized = [_invert_price_point(point) for point in normalized]
+            batch_inverted = True
+            inversion_reason = "reference_complement"
+
+    repairs = []
+    for _ in range(2):
+        issues = _find_localized_inverted_candles(normalized, reference_yes_price)
+        if not issues:
+            break
+        for issue in issues:
+            normalized[issue["index"]] = _invert_price_point(normalized[issue["index"]])
+        repairs.extend(issues)
+
+    residual_issues = _find_localized_inverted_candles(normalized, reference_yes_price)
+    repair_count = len({issue["timestamp"] for issue in repairs})
+    if residual_issues:
+        return {
+            "ok": False,
+            "points": normalized,
+            "batch_inverted": batch_inverted,
+            "inversion_reason": inversion_reason,
+            "batch_mismatch": batch_mismatch,
+            "repairs": repairs,
+            "residual_issues": residual_issues,
+            "message": "Detected localized inverted candles that could not be repaired safely.",
+        }
+    if repair_count > max(5, max(len(normalized) // 10, 1)):
+        return {
+            "ok": False,
+            "points": normalized,
+            "batch_inverted": batch_inverted,
+            "inversion_reason": inversion_reason,
+            "batch_mismatch": batch_mismatch,
+            "repairs": repairs,
+            "residual_issues": [],
+            "message": "Too many localized inverted candles were detected to repair safely.",
+        }
+
+    return {
+        "ok": True,
+        "points": normalized,
+        "batch_inverted": batch_inverted,
+        "inversion_reason": inversion_reason,
+        "batch_mismatch": batch_mismatch,
+        "repairs": repairs,
+        "residual_issues": [],
+    }
+
+
+def _replace_pmxt_history_window(
+    cache,
+    market_id: str,
+    platform: str,
+    start_ts: int,
+    end_ts: int,
+    points: list[PricePoint],
+    *,
+    granularity: str,
+) -> None:
+    if hasattr(cache, "replace_price_points_window"):
+        cache.replace_price_points_window(
+            market_id,
+            platform,
+            start_ts,
+            end_ts,
+            points,
+            source="pmxt",
+            granularity=granularity,
+        )
+        return
+    cache.upsert_price_points_batch(market_id, platform, points, source="pmxt", granularity=granularity)
+
+
+def _pmxt_window_bounds(start_ts: int, end_ts: int, interval_minutes: int) -> tuple[int, int]:
+    step_seconds = max(60, int(interval_minutes) * 60)
+    aligned_start = (int(start_ts) // step_seconds) * step_seconds
+    aligned_end = ((int(end_ts) + step_seconds - 1) // step_seconds) * step_seconds
+    return aligned_start, aligned_end
 
 
 def _get_research_markets(source, source_name: str, *, platform: str, category: str | None, tags: list[str] | None, limit: int, market_ids: list[str] | None, active_only: bool):
@@ -832,12 +1007,19 @@ def _select_freshest_history(market_id: str, platform: str, start_ts: int, end_t
 
 def _fetch_pmxt_candles(client, market, start_ts: int, end_ts: int, interval_minutes: int) -> dict:
     condition_id = _candlestick_market_id(market)
+    outcome_side = None
+    if hasattr(client, "get_outcome_side"):
+        try:
+            outcome_side = client.get_outcome_side(condition_id, market.platform)
+        except Exception:
+            outcome_side = None
     if hasattr(client, "get_candlesticks_with_status"):
         result = client.get_candlesticks_with_status(condition_id, market.platform, start_ts, end_ts, interval_minutes)
         return {
             "points": list(result.get("points", [])),
             "status": str(result.get("status", "empty")),
             "error": result.get("error"),
+            "outcome_side": outcome_side,
         }
 
     points = client.get_candlesticks(condition_id, market.platform, start_ts, end_ts, interval_minutes)
@@ -845,6 +1027,7 @@ def _fetch_pmxt_candles(client, market, start_ts: int, end_ts: int, interval_min
         "points": list(points),
         "status": "ok" if points else "empty",
         "error": None,
+        "outcome_side": outcome_side,
     }
 
 
@@ -1997,6 +2180,7 @@ async def call_tool(name: str, arguments: dict):
 
             start_ts = int(time.time()) - days * 24 * 3600
             end_ts = int(time.time())
+            replace_start_ts, replace_end_ts = _pmxt_window_bounds(start_ts, end_ts, interval_minutes)
             ob_store = OrderBookStore()
             pp = 0
             ob_files = 0
@@ -2011,34 +2195,89 @@ async def call_tool(name: str, arguments: dict):
                 try:
                     cache.upsert_market(m)
                     candles_result = _fetch_pmxt_candles(client, m, start_ts, end_ts, interval_minutes)
-                    candles = candles_result["points"]
+                    raw_candles = list(candles_result["points"])
+                    candles = raw_candles
                     gran_label = {"minute": "1m", "hourly": "1h", "daily": "1d"}.get(granularity, "1h")
                     market_platform = _market_platform_value(m)
+                    outcome_side = str(candles_result.get("outcome_side") or "").strip().lower() or None
                     orientation_warning = None
-                    if candles:
+                    batch_repaired = False
+                    batch_inverted = False
+                    repair_count = 0
+                    if raw_candles:
                         live_snapshot = client.get_live_snapshot(m.id, m.platform) if hasattr(client, "get_live_snapshot") else None
                         reference_price = None
                         live_point = live_snapshot.get("price") if isinstance(live_snapshot, dict) else None
                         if live_point is not None:
                             reference_price = float(getattr(live_point, "yes_price", 0.0))
+                            if outcome_side == "no":
+                                reference_price = max(0.0, min(1.0, 1.0 - reference_price))
                         else:
                             latest_cached = _cache_get_latest_price(cache, m.id, platform=market_platform)
                             if latest_cached is not None:
                                 reference_price = float(latest_cached.yes_price)
-                        orientation_warning = _detect_orientation_mismatch(candles, reference_price)
-                    if orientation_warning is None:
-                        cache.upsert_price_points_batch(m.id, market_platform, candles, source="pmxt", granularity=gran_label)
-                        pp += len(candles)
-                        if candles:
-                            markets_with_price_points += 1
-                    else:
+                        normalized_candles = _normalize_pmxt_candles_to_yes_space(
+                            raw_candles,
+                            outcome_side=outcome_side,
+                            reference_yes_price=reference_price,
+                        )
+                        if normalized_candles["ok"]:
+                            candles = list(normalized_candles["points"])
+                            batch_inverted = bool(normalized_candles["batch_inverted"])
+                            repair_count = len({issue["timestamp"] for issue in normalized_candles["repairs"]})
+                            batch_repaired = repair_count > 0
+                            _replace_pmxt_history_window(
+                                cache,
+                                m.id,
+                                market_platform,
+                                replace_start_ts,
+                                replace_end_ts,
+                                candles,
+                                granularity=gran_label,
+                            )
+                            pp += len(candles)
+                            if candles:
+                                markets_with_price_points += 1
+                            if batch_inverted:
+                                warnings.append({
+                                    "market_id": m.id,
+                                    "type": "PriceOrientationNormalized",
+                                    "message": f"Normalized PMXT candles for {m.id} into YES-price space before writing.",
+                                    "detail": {
+                                        "outcome_side": outcome_side,
+                                        "inversion_reason": normalized_candles["inversion_reason"],
+                                        "batch_mismatch": normalized_candles["batch_mismatch"],
+                                    },
+                                })
+                            if batch_repaired:
+                                warnings.append({
+                                    "market_id": m.id,
+                                    "type": "LocalizedPriceRepair",
+                                    "message": f"Repaired {repair_count} localized inverted PMXT candle(s) for {m.id} before writing.",
+                                    "detail": {
+                                        "repair_count": repair_count,
+                                        "repairs": normalized_candles["repairs"],
+                                    },
+                                })
+                        else:
+                            candles = []
+                            orientation_warning = {
+                                "outcome_side": outcome_side,
+                                "inversion_reason": normalized_candles["inversion_reason"],
+                                "batch_mismatch": normalized_candles["batch_mismatch"],
+                                "repairs": normalized_candles["repairs"],
+                                "residual_issues": normalized_candles["residual_issues"],
+                            }
+                    if orientation_warning is not None:
                         warnings.append({
                             "market_id": m.id,
                             "type": "PriceOrientationMismatch",
-                            "message": f"Rejected PMXT candles for {m.id} because the series appears inverted against the current YES price.",
+                            "message": (
+                                f"Rejected PMXT candles for {m.id} because the series could not be "
+                                f"normalized into a coherent YES-price history."
+                            ),
                             "detail": orientation_warning,
                         })
-                        candles = []
 
                     orderbook_result = _fetch_pmxt_orderbooks(client, m, start_ts, end_ts, 100)
                     ob = orderbook_result["snapshots"]
@@ -2062,7 +2301,18 @@ async def call_tool(name: str, arguments: dict):
                         market_warning_types.append("CandlesFetchError")
                     elif orientation_warning is not None:
                         market_warning_types.append("PriceOrientationMismatch")
-                    elif not candles:
+                    else:
+                        if batch_inverted:
+                            market_warning_types.append("PriceOrientationNormalized")
+                        if batch_repaired:
+                            market_warning_types.append("LocalizedPriceRepair")
+                    if (
+                        candles_result["status"] != "error"
+                        and not candles
+                        and orientation_warning is None
+                        and not batch_inverted
+                        and not batch_repaired
+                    ):
                         market_warning_types.append("NoPricePoints")
 
                     if orderbook_result["status"] == "error":
@@ -2095,6 +2345,8 @@ async def call_tool(name: str, arguments: dict):
                         "candles_status": candles_result["status"],
                         "orderbook_status": orderbook_result["status"],
                         "price_orientation_mismatch": orientation_warning is not None,
+                        "price_orientation_repaired": batch_inverted or batch_repaired,
+                        "price_orientation_repair_count": repair_count,
                         "warning_types": market_warning_types,
                     })
                 except Exception as exc:

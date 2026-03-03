@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy import create_engine
 
 from agenttrader.data.cache import DataCache
-from agenttrader.data.models import PricePoint
+from agenttrader.data.models import Market, MarketType, Platform, PricePoint
 from agenttrader.db.schema import Base
 
 
@@ -59,6 +59,124 @@ def test_cache_upsert_price_points_batch_updates_existing_row(tmp_path):
     assert latest.volume == 50.0
     assert prov.source == "pmxt"
     assert prov.granularity == "1m"
+
+
+def test_normalize_pmxt_candles_repairs_isolated_complement_bar():
+    points = [
+        PricePoint(timestamp=100, yes_price=0.94, no_price=0.06, volume=10.0),
+        PricePoint(timestamp=200, yes_price=0.058, no_price=0.942, volume=11.0),
+        PricePoint(timestamp=300, yes_price=0.945, no_price=0.055, volume=12.0),
+    ]
+
+    normalized = mcp_server._normalize_pmxt_candles_to_yes_space(
+        points,
+        outcome_side="yes",
+        reference_yes_price=0.944,
+    )
+
+    assert normalized["ok"] is True
+    assert normalized["batch_inverted"] is False
+    assert len(normalized["repairs"]) == 1
+    repaired = next(point for point in normalized["points"] if point.timestamp == 200)
+    assert repaired.yes_price == pytest.approx(0.942, abs=1e-9)
+
+
+def test_sync_data_repairs_localized_inversion_and_replaces_stale_pmxt_rows(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'cache.sqlite'}")
+    Base.metadata.create_all(engine)
+    cache = DataCache(engine)
+
+    fixed_now = 1_772_100_000
+    start_ts = fixed_now - 24 * 3600
+    market = Market(
+        id="51338236787729560681434534660841415073585974762690814047670810862722808070955",
+        condition_id="51338236787729560681434534660841415073585974762690814047670810862722808070955",
+        platform=Platform.POLYMARKET,
+        title="Kevin Warsh market",
+        category="politics",
+        tags=[],
+        market_type=MarketType.BINARY,
+        volume=1000.0,
+        close_time=fixed_now + 86400,
+        resolved=False,
+        resolution=None,
+        scalar_low=None,
+        scalar_high=None,
+    )
+    cache.upsert_market(market)
+
+    stale_only = PricePoint(timestamp=start_ts + 1800, yes_price=0.051, no_price=0.949, volume=1.0)
+    stale_bad = PricePoint(timestamp=start_ts + 3600, yes_price=0.058, no_price=0.942, volume=2.0)
+    cache.upsert_price_points_batch(market.id, "polymarket", [stale_only, stale_bad], source="pmxt", granularity="1h")
+
+    fetched_points = [
+        PricePoint(timestamp=start_ts + 900, yes_price=0.941, no_price=0.059, volume=10.0),
+        PricePoint(timestamp=start_ts + 3600, yes_price=0.058, no_price=0.942, volume=11.0),
+        PricePoint(timestamp=start_ts + 7200, yes_price=0.944, no_price=0.056, volume=12.0),
+    ]
+
+    class FakeClient:
+        def get_outcome_side(self, *_args, **_kwargs):
+            return "yes"
+
+        def get_candlesticks_with_status(self, *_args, **_kwargs):
+            return {"points": list(fetched_points), "status": "ok", "error": None}
+
+        def get_live_snapshot(self, *_args, **_kwargs):
+            return {
+                "status": "ok",
+                "price": PricePoint(timestamp=fixed_now, yes_price=0.943, no_price=0.057, volume=0.0),
+                "orderbook": None,
+                "error": None,
+                "timestamp": fixed_now,
+            }
+
+        def get_orderbook_snapshots_with_status(self, *_args, **_kwargs):
+            return {"snapshots": [], "status": "empty", "error": None}
+
+    class FakeOrderBookStore:
+        def write(self, *_args, **_kwargs):
+            return 0
+
+    monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
+    monkeypatch.setattr(mcp_server, "get_engine", lambda: engine)
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(cache, "sqlite-cache")])
+    monkeypatch.setattr(mcp_server, "PmxtClient", lambda: FakeClient())
+    monkeypatch.setattr(mcp_server, "OrderBookStore", lambda: FakeOrderBookStore())
+
+    with patch("time.time", return_value=fixed_now):
+        sync_payload = _payload(_run(mcp_server.call_tool("sync_data", {
+            "platform": "polymarket",
+            "market_ids": [market.id],
+            "days": 1,
+        })))
+        history_payload = _payload(_run(mcp_server.call_tool("get_history", {
+            "market_id": market.id,
+            "platform": "polymarket",
+            "days": 1,
+            "include_raw": True,
+        })))
+
+    stored = cache.get_price_history(market.id, start_ts, fixed_now, platform="polymarket")
+    stored_timestamps = [point.timestamp for point in stored]
+    repaired_point = next(point for point in stored if point.timestamp == fetched_points[1].timestamp)
+    warning_types = {warning["type"] for warning in sync_payload.get("warnings", [])}
+    raw_prices = [point["yes_price"] for point in history_payload["history"]]
+
+    assert sync_payload["ok"] is True
+    assert sync_payload["market_results"][0]["price_orientation_mismatch"] is False
+    assert sync_payload["market_results"][0]["price_orientation_repaired"] is True
+    assert sync_payload["market_results"][0]["price_orientation_repair_count"] == 1
+    assert "LocalizedPriceRepair" in warning_types
+    assert stored_timestamps == [point.timestamp for point in fetched_points]
+    assert stale_only.timestamp not in stored_timestamps
+    assert repaired_point.yes_price == pytest.approx(0.942, abs=1e-9)
+    assert history_payload["ok"] is True
+    assert history_payload["timestamp_format"] == "unix_seconds"
+    assert history_payload["history_timestamp_format"] == "unix_seconds"
+    assert history_payload["provenance"]["selected_source"] == "sqlite-cache"
+    assert min(raw_prices) > 0.9
+    assert next(point for point in history_payload["history"] if point["timestamp"] == fetched_points[1].timestamp)["yes_price"] == pytest.approx(0.942, abs=1e-9)
 
 
 def test_get_history_includes_provenance_and_timestamp_format(monkeypatch):
