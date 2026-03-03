@@ -191,6 +191,84 @@ def test_streaming_backtest_hydrates_missing_exact_id_metadata(monkeypatch):
     assert calls["get_markets_by_ids"] == 1
 
 
+def test_legacy_backtest_hydrates_missing_exact_id_metadata(monkeypatch):
+    now_ts = int(datetime(2024, 1, 1, tzinfo=UTC).timestamp())
+    low_volume_market = Market(
+        id="KXELONMARS-99",
+        condition_id="KXELONMARS-99",
+        platform=Platform.KALSHI,
+        title="Will Elon visit Mars?",
+        category="world",
+        tags=["World", "International", "kxelonmars"],
+        market_type=MarketType.BINARY,
+        volume=5.0,
+        close_time=now_ts + 86400,
+        resolved=False,
+        resolution=None,
+        scalar_low=None,
+        scalar_high=None,
+    )
+    high_volume_market = Market(
+        id="KXTRUMPOUT-26-TRUMP",
+        condition_id="KXTRUMPOUT-26-TRUMP",
+        platform=Platform.KALSHI,
+        title="Will Trump drop out?",
+        category="politics",
+        tags=["Politics"],
+        market_type=MarketType.BINARY,
+        volume=10_000.0,
+        close_time=now_ts + 86400,
+        resolved=False,
+        resolution=None,
+        scalar_low=None,
+        scalar_high=None,
+    )
+
+    class FakeData:
+        def __init__(self):
+            self.get_markets_by_ids_calls = 0
+
+        def get_markets(self, platform="all", limit=10000):  # noqa: ARG002
+            return [high_volume_market]
+
+        def get_markets_by_ids(self, market_ids, platform="all"):  # noqa: ARG002
+            self.get_markets_by_ids_calls += 1
+            if "KXELONMARS-99" in set(market_ids):
+                return [low_volume_market]
+            return []
+
+        def get_price_history(self, market_id, start_ts, end_ts):  # noqa: ARG002
+            if market_id != "KXELONMARS-99":
+                return []
+            return [PricePoint(timestamp=now_ts + 60, yes_price=0.55, no_price=0.45, volume=10.0)]
+
+    class Strategy(BaseStrategy):
+        def on_start(self):
+            self.subscribe(platform="kalshi", market_ids=["KXELONMARS-99"])
+
+        def on_market_data(self, market, price, orderbook):  # noqa: ARG002
+            return
+
+    monkeypatch.setattr("agenttrader.core.context.BacktestContext.get_orderbook", lambda self, market_id: None)
+
+    data = FakeData()
+    engine = BacktestEngine(data_source=data, orderbook_store=None)
+    result = engine._run_legacy(
+        Strategy,
+        BacktestConfig(
+            strategy_path="test",
+            start_date="2024-01-01",
+            end_date="2024-01-01",
+            initial_cash=1000.0,
+            schedule_interval_minutes=1440,
+        ),
+    )
+
+    assert result["ok"] is True
+    assert result["markets_tested"] == 1
+    assert data.get_markets_by_ids_calls == 1
+
+
 def test_streaming_backtest_applies_guardrails(monkeypatch):
     now_ts = int(datetime(2024, 1, 1, tzinfo=UTC).timestamp())
     markets = [

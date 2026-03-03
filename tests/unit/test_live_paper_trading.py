@@ -114,6 +114,124 @@ def test_live_context_refresh_uses_cached_price_when_snapshot_errors(tmp_path):
     assert "cached price history fallback" in str(live_status["last_error"]).lower()
 
 
+def test_paper_daemon_starts_running_with_cached_price_fallback(tmp_path, monkeypatch):
+    strategy_path = tmp_path / "startup_strategy.py"
+    strategy_path.write_text(
+        "from agenttrader import BaseStrategy\n"
+        "\n"
+        "class StartupStrategy(BaseStrategy):\n"
+        "    def on_start(self):\n"
+        "        self.subscribe(platform='kalshi', market_ids=['KXELONMARS-99'])\n"
+        "\n"
+        "    def on_market_data(self, market, price, orderbook):\n"
+        "        return\n"
+    )
+
+    db_path = tmp_path / "paper-startup.db"
+    engine = create_engine(_sqlite_url(db_path), echo=False)
+    Base.metadata.create_all(engine)
+    portfolio_id = "p-startup-fallback"
+
+    with get_session(engine) as session:
+        session.add(
+            PaperPortfolio(
+                id=portfolio_id,
+                strategy_path=str(strategy_path),
+                strategy_hash="hash",
+                initial_cash=1000.0,
+                cash_balance=1000.0,
+                status="running",
+                started_at=1,
+                reload_count=0,
+            )
+        )
+        session.commit()
+
+    cache = DataCache(engine)
+    market = models.Market(
+        id="KXELONMARS-99",
+        condition_id="KXELONMARS-99",
+        platform=models.Platform.KALSHI,
+        title="Will Elon visit Mars?",
+        category="world",
+        tags=["World", "International", "kxelonmars"],
+        market_type=models.MarketType.BINARY,
+        volume=1000.0,
+        close_time=0,
+        resolved=False,
+        resolution=None,
+        scalar_low=None,
+        scalar_high=None,
+    )
+    cache.upsert_market(market)
+    cache.upsert_price_points_batch(
+        market.id,
+        "kalshi",
+        [models.PricePoint(timestamp=1_700_000_000, yes_price=0.62, no_price=0.38, volume=20.0)],
+        source="pmxt",
+        granularity="1h",
+    )
+
+    class FailingLivePmxt:
+        def get_markets(self, **_kwargs):
+            return [market]
+
+        def get_live_snapshot(self, *_args, **_kwargs):
+            return {
+                "status": "error",
+                "error": "orderbook unavailable",
+                "timestamp": 1_700_000_100,
+                "price": None,
+                "orderbook": None,
+            }
+
+    writes: list[tuple[str, dict | None]] = []
+
+    async def fake_sleep(_seconds):
+        daemon._runtime.shutdown = True
+
+    monkeypatch.setattr(paper_daemon_mod, "get_engine", lambda: engine)
+    monkeypatch.setattr(paper_daemon_mod, "PmxtClient", lambda: FailingLivePmxt())
+    monkeypatch.setattr(
+        paper_daemon_mod,
+        "OrderBookStore",
+        lambda: importlib.import_module("agenttrader.data.orderbook_store").OrderBookStore(tmp_path / "orderbooks"),
+    )
+    monkeypatch.setattr(
+        paper_daemon_mod,
+        "load_config",
+        lambda: {
+            "schedule_interval_minutes": 60,
+            "paper_poll_interval_seconds": 1,
+            "paper_persist_interval_seconds": 60,
+            "paper_max_concurrent_requests": 1,
+            "paper_history_buffer_hours": 24,
+        },
+    )
+    monkeypatch.setattr(paper_daemon_mod.signal, "signal", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(paper_daemon_mod.PaperDaemon, "_setup_file_watcher", lambda self: None)
+    monkeypatch.setattr(
+        paper_daemon_mod.PaperDaemon,
+        "_write_runtime_status",
+        lambda self, state, summary=None: writes.append((state, summary)),
+    )
+    monkeypatch.setattr(paper_daemon_mod.asyncio, "sleep", fake_sleep)
+
+    try:
+        daemon = paper_daemon_mod.PaperDaemon(portfolio_id, str(strategy_path), 1000.0)
+        daemon._emit_stdout = False
+        daemon._run()
+    finally:
+        engine.dispose()
+
+    assert writes
+    running_state, running_summary = next((state, summary) for state, summary in writes if state == "running")
+    assert running_state == "running"
+    assert running_summary is not None
+    assert running_summary["markets_with_live_price"] == 1
+    assert running_summary["markets_degraded"] >= 1
+
+
 def test_get_portfolio_prefers_runtime_live_price(monkeypatch):
     class FakePortfolio:
         id = "p-live"

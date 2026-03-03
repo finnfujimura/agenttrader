@@ -269,6 +269,96 @@ def test_start_paper_trade_succeeds_when_daemon_alive(monkeypatch, tmp_path):
     assert payload["pid"] == 12345
 
 
+def test_start_paper_trade_wait_for_ready_returns_running_state(monkeypatch, tmp_path):
+    """wait_for_ready should surface running runtime status and positions through the MCP path."""
+    strategy = tmp_path / "strat.py"
+    strategy.write_text(
+        "from agenttrader.core.base_strategy import BaseStrategy\n"
+        "class TestStrat(BaseStrategy):\n"
+        "    def on_start(self): pass\n"
+        "    def on_market_data(self, market, price, orderbook): pass\n"
+        "    def on_stop(self): pass\n"
+    )
+
+    db_row = SimpleNamespace(
+        id=None, status="running", pid=None, stopped_at=None,
+        strategy_path=str(strategy), strategy_hash="abc", initial_cash=1000,
+        cash_balance=950.0, started_at=0, last_reload=None, reload_count=0,
+    )
+
+    class FakeSession:
+        def add(self, obj):
+            db_row.id = obj.id
+
+        def commit(self):
+            pass
+
+        def get(self, _cls, _pk):
+            return db_row
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+    fake_proc = MagicMock()
+    fake_proc.pid = 12345
+    fake_proc.poll.return_value = None
+
+    class FakeDaemon:
+        _stderr_file = MagicMock()
+
+        def __init__(self, *_args):
+            pass
+
+        def start_as_daemon(self):
+            return fake_proc
+
+    class FakeCache:
+        def get_open_positions(self, _portfolio_id):
+            return [
+                SimpleNamespace(
+                    market_id="m1",
+                    platform="polymarket",
+                    side="yes",
+                    contracts=1.0,
+                    avg_cost=0.45,
+                )
+            ]
+
+    runtime_status = {
+        "state": "running",
+        "markets_with_live_price": 1,
+        "markets_degraded": 1,
+        "markets": [{"market_id": "m1", "current_price": 0.46}],
+    }
+
+    monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
+    monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
+    monkeypatch.setattr(mcp_server, "get_session", lambda _engine: FakeSession())
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: FakeCache())
+    monkeypatch.setattr(mcp_server, "PaperDaemon", FakeDaemon)
+    monkeypatch.setattr(mcp_server, "read_runtime_status", lambda _portfolio_id: dict(runtime_status))
+    monkeypatch.setattr(mcp_server, "validate_strategy_file", lambda _p: {"ok": True, "valid": True, "errors": [], "warnings": []})
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+
+    result = _run(mcp_server.call_tool("start_paper_trade", {
+        "strategy_path": str(strategy),
+        "initial_cash": 1000,
+        "wait_for_ready": True,
+    }))
+    payload = _payload(result)
+
+    assert payload["ok"] is True
+    assert payload["pid"] == 12345
+    assert payload["live_status"]["state"] == "running"
+    assert payload["live_status"]["markets_with_live_price"] == 1
+    assert payload["positions"][0]["market_id"] == "m1"
+    assert payload["cash_balance"] == 950.0
+    assert "warning" not in payload
+
+
 # ---------------------------------------------------------------------------
 # Fix 3: get_portfolio auto-corrects dead PIDs
 # ---------------------------------------------------------------------------

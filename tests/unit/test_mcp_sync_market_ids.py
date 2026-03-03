@@ -4,6 +4,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from sqlalchemy import create_engine
+
+from agenttrader.data.cache import DataCache
+from agenttrader.db.schema import Base
 
 mcp_server = importlib.import_module("agenttrader.mcp.server")
 pmxt_client_mod = importlib.import_module("agenttrader.data.pmxt_client")
@@ -12,6 +16,13 @@ models = importlib.import_module("agenttrader.data.models")
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def _sqlite_url(path: Path) -> str:
+    raw = str(path)
+    if raw.startswith("\\\\?\\"):
+        raw = raw[4:]
+    return f"sqlite:///{raw.replace('\\', '/')}"
 
 
 def test_sync_data_market_ids_uses_exact_lookup(monkeypatch):
@@ -175,3 +186,71 @@ def test_sync_data_market_ids_prefers_local_metadata(monkeypatch):
     assert client.orderbook_args[0] == "poly-yes-token"
     assert shared_cache.points[0][0] == "poly-yes-token"
     assert shared_cache.points[0][1] == "polymarket"
+
+
+def test_sync_data_market_ids_preserves_resolved_local_category_metadata(tmp_path, monkeypatch):
+    local_market = models.Market(
+        id="KXELONMARS-99",
+        condition_id="KXELONMARS-99",
+        platform=models.Platform.KALSHI,
+        title="Will Elon visit Mars?",
+        category="kxelonmars",
+        tags=[],
+        market_type=models.MarketType.BINARY,
+        volume=123.0,
+        close_time=9_999_999_999,
+        resolved=False,
+        resolution=None,
+        scalar_low=None,
+        scalar_high=None,
+    )
+
+    class FakeSource:
+        def get_markets_by_ids(self, market_ids, platform="all"):
+            assert market_ids == ["KXELONMARS-99"]
+            assert platform == "kalshi"
+            return [local_market]
+
+    class FakeClient:
+        def get_markets(self, **_kwargs):
+            raise AssertionError("PmxtClient.get_markets should not run when local sources resolve the explicit market_id")
+
+        def get_candlesticks_with_status(self, *_args, **_kwargs):
+            return {
+                "points": [models.PricePoint(timestamp=1_737_392_619, yes_price=0.55, no_price=0.45, volume=25.0)],
+                "status": "ok",
+                "error": None,
+            }
+
+        def get_orderbook_snapshots_with_status(self, *_args, **_kwargs):
+            return {"snapshots": [], "status": "empty", "error": None}
+
+    class FakeOrderBookStore:
+        def write(self, *_args, **_kwargs):
+            return 0
+
+    engine = create_engine(_sqlite_url(tmp_path / "sync-market-ids.sqlite"))
+    Base.metadata.create_all(engine)
+    cache = DataCache(engine)
+
+    monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: cache)
+    monkeypatch.setattr(mcp_server, "get_engine", lambda: engine)
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [(FakeSource(), "normalized-index")])
+    monkeypatch.setattr(mcp_server, "PmxtClient", lambda: FakeClient())
+    monkeypatch.setattr(mcp_server, "OrderBookStore", lambda: FakeOrderBookStore())
+
+    result = _run(
+        mcp_server.call_tool(
+            "sync_data",
+            {"platform": "kalshi", "market_ids": ["KXELONMARS-99"], "days": 1, "limit": 1},
+        )
+    )
+    payload = importlib.import_module("json").loads(result[0].text)
+    stored = cache.get_market("KXELONMARS-99")
+
+    assert payload["ok"] is True
+    assert payload["markets_synced"] == 1
+    assert stored is not None
+    assert stored.category == "kxelonmars"
+    assert stored.tags == []
