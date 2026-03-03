@@ -4,6 +4,9 @@ A toolkit for AI agents to research, backtest, and paper trade prediction market
 
 Works as an MCP server (for Claude Code, Cursor, Codex) or directly from the CLI.
 
+Live data and paper trading is available via [pmxt](https://github.com/pmxt-dev/pmxt) , an open source unified API for prediction markets.
+Backtesting is available via an open source [dataset](https://github.com/Jon-Becker/prediction-market-analysis), courtesy of Jon Becker.
+
 ---
 
 ## Install
@@ -64,16 +67,23 @@ Add to your MCP config (e.g. `.claude/mcp.json`):
 }
 ```
 
+## MCP Setup (Reference Links)
+
+Here are official docs for configuring MCP servers with popular clients:
+
+- **Claude / MCP**: https://developers.openai.com/resources/docs-mcp/
+- **Cursor MCP**: https://cursor.com/docs/context/mcp
+- **OpenCode MCP servers**: https://opencode.ai/docs/mcp-servers/
+- **VS Code MCP servers**: https://code.visualstudio.com/docs/copilot/customization/mcp-servers
+- **OpenAI Codex MCP**: https://platform.openai.com/docs/docs-mcp
+
 ### 2. Give your agent a prompt
 
 ```
-Use agenttrader to find liquid Polymarket politics markets,
-write a mean reversion strategy, backtest it from 2024-01-01
-to 2024-12-31, and iterate until Sharpe > 1.0. Then start
-paper trading with $10,000 and report the portfolio ID.
+Use agenttrader to find the top 10 highest volume markets on polymarket right now
 ```
 
-The agent handles research, strategy writing, validation, backtesting, iteration, and deployment.
+The agent will utilize the agenttrader MCP in order to make the correct API calls, and return the top 10 highest volume polymarket markets currently.
 
 ---
 
@@ -105,6 +115,8 @@ This is the loop an agent (or human) follows when using agenttrader. Every step 
  get_portfolio             Monitor positions and P&L
 ```
 
+The agent handles research, strategy writing, validation, backtesting, iteration, and deployment.
+
 ### Example: full autonomous session
 
 Here's a single prompt that exercises the complete workflow:
@@ -135,21 +147,33 @@ This prompt will trigger ~10-15 tool calls across research, validation, backtest
 ## Data Architecture
 
 ```
-              ┌──────────────┐
-              │   PMXT API   │  Live prices, orderbooks, candles
-              └──────┬───────┘
-                     │ sync_data
-                     ▼
-              ┌──────────────┐
-              │ SQLite Cache │  Paper trading, live lookups
-              │  db.sqlite   │
-              └──────────────┘
 
-   ┌─────────────────┐          ┌──────────────────┐
-   │ Parquet Dataset  │  build   │  DuckDB Index    │
-   │ ~36GB raw files  │────────▶│  ~13GB normalized │  Backtesting (fastest)
-   │ data/poly+kalshi │  index   │  backtest_index   │
-   └─────────────────┘          └──────────────────┘
+                  ┌──────────────┐
+                  │   PMXT API   │  live prices, candles, orderbooks
+                  └──────┬───────┘
+                         │ agenttrader sync / live fetch
+                         ▼
+                  ┌──────────────┐
+                  │ SQLite Cache │  ~/.agenttrader/db.sqlite
+                  │ (live cache) │  paper trading state + recent history
+                  └──────┬───────┘
+                         │ used by
+        ┌────────────────┼───────────────────────────────┐
+        │                │                               │
+        ▼                ▼                               ▼
+ research_markets   start_paper_trade                 get_portfolio
+ (live analytics)   (orders/positions)                (P&L/positions)
+
+   ┌─────────────────────┐       build-index        ┌──────────────────────┐
+   │ Parquet Dataset      │ ───────────────────────▶ │ DuckDB Backtest Index │
+   │ ~36GB raw (poly+kalshi)                        │ ~13GB normalized      │
+   │ ~/.agenttrader/data  │                         │ ~/.agenttrader/backtest_index.duckdb
+   └──────────┬──────────┘                         └──────────┬───────────┘
+              │ used by (fallback)                              │ used by (fastest)
+              └──────────────────────────────┬──────────────────┘
+                                             ▼
+                                   validate_and_backtest
+                                (strategy development loop)
 ```
 
 Tools automatically select the best available source: **DuckDB index > raw parquet > SQLite cache**. You don't need to specify which source to use.
