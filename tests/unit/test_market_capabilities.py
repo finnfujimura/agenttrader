@@ -193,3 +193,19 @@ def test_get_markets_no_capabilities_by_default():
     payload = json.loads(result[0].text)
     assert payload["ok"] is True
     assert "capabilities" not in payload["markets"][0]
+
+
+def test_get_markets_defaults_to_active_only():
+    """Broad get_markets discovery should request active markets by default."""
+    market = _make_market("m1")
+    mock_source = MagicMock()
+    mock_source.get_markets.return_value = [market]
+
+    with patch("agenttrader.mcp.server.is_initialized", return_value=True), \
+         patch("agenttrader.mcp.server.get_best_data_source", return_value=(mock_source, "normalized-index")):
+        from agenttrader.mcp.server import call_tool
+        result = _run(call_tool("get_markets", {"platform": "polymarket", "limit": 5}))
+
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is True
+    assert mock_source.get_markets.call_args.kwargs["active_only"] is True

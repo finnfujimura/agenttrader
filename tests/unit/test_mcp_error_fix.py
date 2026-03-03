@@ -375,6 +375,76 @@ def test_research_markets_min_history_points_filters(monkeypatch):
     assert payload["history"][0]["market_id"] == "0xgood"
 
 
+def test_research_markets_min_history_points_overfetches_candidates(monkeypatch):
+    """research_markets should widen candidate selection before applying min_history_points."""
+    now = int(time.time())
+
+    def _market(mid: str, volume: float) -> object:
+        return models.Market(
+            id=mid,
+            condition_id=f"cond-{mid}",
+            platform=models.Platform.POLYMARKET,
+            title=f"Market {mid}",
+            category="politics",
+            tags=["test"],
+            market_type=models.MarketType.BINARY,
+            volume=volume,
+            close_time=now + 86400,
+            resolved=False,
+            resolution=None,
+            scalar_low=None,
+            scalar_high=None,
+        )
+
+    all_markets = [
+        _market("m1", 1000.0),
+        _market("m2", 900.0),
+        _market("m3", 800.0),
+        _market("m4", 700.0),
+        _market("m5", 600.0),
+    ]
+
+    rich_history = [
+        models.PricePoint(timestamp=now - 7200, yes_price=0.45, no_price=0.55, volume=10),
+        models.PricePoint(timestamp=now - 3600, yes_price=0.47, no_price=0.53, volume=12),
+        models.PricePoint(timestamp=now, yes_price=0.50, no_price=0.50, volume=14),
+    ]
+
+    class FakeSource:
+        def get_markets(self, **kwargs):
+            return all_markets[: int(kwargs["limit"])]
+
+    histories = {
+        "m1": [],
+        "m2": [],
+        "m3": [],
+        "m4": rich_history,
+        "m5": rich_history,
+    }
+
+    def fake_select_freshest_history(market_id, platform, start_ts, end_ts, sources=None):  # noqa: ARG001
+        return ("sqlite-cache", histories[market_id])
+
+    monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: SimpleNamespace())
+    monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
+    monkeypatch.setattr(mcp_server, "get_best_data_source", lambda: (FakeSource(), "fake-source"))
+    monkeypatch.setattr(mcp_server, "get_all_sources", lambda: [])
+    monkeypatch.setattr(mcp_server, "_select_freshest_history", fake_select_freshest_history)
+    monkeypatch.setattr(mcp_server, "_compute_capabilities", lambda markets, cache: {})
+
+    result = _run(mcp_server.call_tool(
+        "research_markets",
+        {"platform": "polymarket", "days": 7, "limit": 2, "min_history_points": 2},
+    ))
+    payload = _payload(result)
+
+    assert payload["ok"] is True
+    assert payload["count"] == 2
+    assert [m["id"] for m in payload["markets"]] == ["m4", "m5"]
+    assert [h["market_id"] for h in payload["history"]] == ["m4", "m5"]
+
+
 def test_research_markets_inline_analytics(monkeypatch):
     """Change 5: Each market object should have inline analytics."""
     now = int(time.time())

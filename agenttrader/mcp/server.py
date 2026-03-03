@@ -24,7 +24,7 @@ from agenttrader.cli.validate import validate_strategy_file
 from agenttrader.config import is_initialized, load_config
 from agenttrader.core.backtest_engine import BacktestConfig, BacktestEngine
 from agenttrader.core.base_strategy import BaseStrategy
-from agenttrader.core.paper_daemon import PaperDaemon, read_runtime_status
+from agenttrader.core.paper_daemon import PaperDaemon, read_runtime_status, runtime_status_path
 from agenttrader.data.backtest_artifacts import read_backtest_artifact, write_backtest_artifact
 from agenttrader.data.cache import DataCache
 from agenttrader.data.models import ExecutionMode
@@ -265,6 +265,33 @@ def _is_market_resolved(market) -> bool:
     return bool(getattr(market, "resolved", False))
 
 
+def _normalize_runtime_status_for_portfolio(portfolio, runtime_status: dict | None) -> dict | None:
+    status = str(getattr(portfolio, "status", "") or "")
+    if status == "running":
+        return runtime_status
+
+    normalized = dict(runtime_status or {})
+    if not normalized:
+        updated_at = getattr(portfolio, "stopped_at", None) or int(time.time())
+        normalized = {
+            "portfolio_id": getattr(portfolio, "id", None),
+            "updated_at": updated_at,
+        }
+
+    normalized["portfolio_id"] = getattr(portfolio, "id", normalized.get("portfolio_id"))
+    normalized["state"] = status or normalized.get("state")
+
+    if status == "stopped":
+        normalized["markets"] = []
+        normalized["markets_with_live_price"] = 0
+        normalized["markets_degraded"] = 0
+        normalized["last_live_update"] = None
+    elif status in {"dead", "failed"}:
+        normalized["markets_with_live_price"] = 0
+
+    return normalized
+
+
 def _get_research_markets(source, source_name: str, *, platform: str, category: str | None, tags: list[str] | None, limit: int, market_ids: list[str] | None, active_only: bool):
     if market_ids and hasattr(source, "get_markets_by_ids"):
         return source.get_markets_by_ids(market_ids, platform=platform)
@@ -496,6 +523,11 @@ async def list_tools() -> list[types.Tool]:
                     "category": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
                     "market_ids": {"type": "array", "items": {"type": "string"}, "description": "Look up specific markets by ID. Bypasses volume/limit ordering."},
+                    "active_only": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "If true (default), prioritize unresolved markets for discovery. Set false to include resolved historical markets.",
+                    },
                     "include_capabilities": {"type": "boolean", "default": False, "description": "Include backtest/history/sync capability annotations per market."},
                     "limit": {"type": "integer", "default": 20},
                 },
@@ -704,6 +736,10 @@ async def call_tool(name: str, arguments: dict):
             source, source_name = get_best_data_source()
             platform = args.get("platform", "all")
             market_ids = args.get("market_ids")
+            category = args.get("category")
+            tags = args.get("tags")
+            limit = _bounded_int(args, "limit", 20, 1, 1000)
+            active_only = bool(args.get("active_only", True))
             if market_ids and hasattr(source, "get_markets_by_ids"):
                 markets = source.get_markets_by_ids(market_ids, platform=platform)
             elif market_ids and source_name == "sqlite-cache":
@@ -713,14 +749,19 @@ async def call_tool(name: str, arguments: dict):
                     if m and (platform == "all" or m.platform.value == platform):
                         markets.append(m)
             else:
-                kwargs = {
-                    "platform": platform,
-                    "category": args.get("category"),
-                    "limit": _bounded_int(args, "limit", 20, 1, 1000),
-                }
-                if source_name == "sqlite-cache" and args.get("tags"):
-                    kwargs["tags"] = args.get("tags")
-                markets = source.get_markets(**kwargs)
+                markets = _get_research_markets(
+                    source,
+                    source_name,
+                    platform=platform,
+                    category=category,
+                    tags=tags,
+                    limit=limit,
+                    market_ids=None,
+                    active_only=active_only,
+                )
+                if category:
+                    markets = [m for m in markets if _market_matches_category(m, category)]
+                markets = markets[:limit]
             include_caps = bool(args.get("include_capabilities", False))
             if include_caps:
                 caps = _compute_capabilities(markets, cache)
@@ -934,6 +975,12 @@ async def call_tool(name: str, arguments: dict):
             min_history_points = _bounded_int(args, "min_history_points", 0, 0, 100000)
             include_raw = bool(args.get("include_raw", False))
             active_only = bool(args.get("active_only", True))
+            candidate_limit = limit
+            if not market_ids:
+                if min_history_points > 0:
+                    candidate_limit = min(max(limit * 10, limit), 250)
+                elif category and active_only:
+                    candidate_limit = min(max(limit * 5, limit), 100)
 
             source, source_name = get_best_data_source()
             sync_payload = None
@@ -979,14 +1026,16 @@ async def call_tool(name: str, arguments: dict):
                 platform=platform,
                 category=category,
                 tags=tags,
-                limit=limit,
+                limit=candidate_limit,
                 market_ids=market_ids,
                 active_only=active_only,
             )
 
             # Filter out resolved markets unless active_only=false
             if active_only:
-                markets = [m for m in markets if not _is_market_resolved(m)][:limit]
+                markets = [m for m in markets if not _is_market_resolved(m)]
+            if category:
+                markets = [m for m in markets if _market_matches_category(m, category)]
 
             # Get history for each market — try all sources per market
             end_ts = int(time.time())
@@ -994,6 +1043,8 @@ async def call_tool(name: str, arguments: dict):
             all_sources = get_all_sources()
             history = []
             history_errors = []
+            selected_markets = []
+            target_count = len(markets) if market_ids else limit
             for market in markets:
                 try:
                     mid = market.id if hasattr(market, "id") else market["id"]
@@ -1001,24 +1052,20 @@ async def call_tool(name: str, arguments: dict):
                     freshest = _select_freshest_history(mid, plat, start_ts, end_ts, sources=all_sources)
                     pts = freshest[1] if freshest is not None else []
                     analytics = _compute_history_analytics(pts, end_ts)
+                    if analytics["points"] < min_history_points:
+                        continue
                     entry = {"ok": True, "market_id": mid, "days": days, "analytics": analytics}
                     if analytics["points"] == 0:
                         entry["warning"] = "No price data found in the requested lookback window."
                     if include_raw:
                         entry["history"] = [h.__dict__ for h in pts]
+                    selected_markets.append(market)
                     history.append(entry)
+                    if len(selected_markets) >= target_count:
+                        break
                 except Exception as exc:
                     history_errors.append({"market_id": getattr(market, "id", "?"), "error": str(exc)})
-
-            # Filter by min_history_points if requested
-            if min_history_points > 0:
-                passing_ids = {
-                    h["market_id"]
-                    for h in history
-                    if h.get("analytics", {}).get("points", 0) >= min_history_points
-                }
-                markets = [m for m in markets if m.id in passing_ids]
-                history = [h for h in history if h["market_id"] in passing_ids]
+            markets = selected_markets
 
             # Build analytics lookup for inline analytics on market objects
             analytics_by_id = {h["market_id"]: h.get("analytics", {}) for h in history}
@@ -1266,6 +1313,7 @@ async def call_tool(name: str, arguments: dict):
                         session.commit()
                 p = cache.get_portfolio(portfolio_id)
             runtime_status = read_runtime_status(p.id)
+            runtime_status = _normalize_runtime_status_for_portfolio(p, runtime_status)
             live_price_map = {
                 item["market_id"]: item.get("current_price")
                 for item in (runtime_status or {}).get("markets", [])
@@ -1343,6 +1391,12 @@ async def call_tool(name: str, arguments: dict):
                     row.status = "stopped"
                     row.stopped_at = int(datetime.now(tz=UTC).timestamp())
                     session.commit()
+            try:
+                status_path = runtime_status_path(p.id)
+                if status_path.exists():
+                    status_path.unlink()
+            except OSError:
+                pass
             return _respond({"ok": True, "portfolio_id": p.id, "stopped": True})
 
         if name == "list_paper_trades":
@@ -1358,7 +1412,7 @@ async def call_tool(name: str, arguments: dict):
                     p.status = "dead"
             portfolios = []
             for p in rows:
-                rs = read_runtime_status(p.id) or {}
+                rs = _normalize_runtime_status_for_portfolio(p, read_runtime_status(p.id)) or {}
                 portfolios.append({
                     "id": p.id,
                     "status": p.status,

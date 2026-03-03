@@ -19,7 +19,6 @@ DATA_DIR = Path.home() / ".agenttrader" / "data"
 
 
 _POLY_SLUG_CATEGORY = {
-    "will": "politics",
     "election": "politics",
     "politics": "politics",
     "presidential": "politics",
@@ -258,23 +257,23 @@ class ParquetDataAdapter:
         if min_volume is not None:
             where.append("volume >= ?")
             params.append(float(min_volume))
+        fetch_limit = int(limit)
         # When category is active, add SQL pre-filter using ILIKE on slug/question
         # to narrow rows before Python-level exact category inference.
         # The Python filter remains authoritative; this just avoids a full table scan.
         if category:
             keywords = _POLY_CATEGORY_KEYWORDS.get(category.lower(), [])
-            if keywords:
-                ilike_clauses = []
-                for kw in keywords:
-                    ilike_clauses.append("slug ILIKE ?")
-                    params.append(f"%{kw}%")
-                    ilike_clauses.append("question ILIKE ?")
-                    params.append(f"%{kw}%")
-                where.append(f"({' OR '.join(ilike_clauses)})")
-        limit_clause = ""
-        if not category:
-            params.append(int(limit))
-            limit_clause = "LIMIT ?"
+            if not keywords:
+                return []
+            ilike_clauses = []
+            for kw in keywords:
+                ilike_clauses.append("slug ILIKE ?")
+                params.append(f"%{kw}%")
+                ilike_clauses.append("question ILIKE ?")
+                params.append(f"%{kw}%")
+            where.append(f"({' OR '.join(ilike_clauses)})")
+            fetch_limit = min(max(int(limit) * 20, int(limit)), 5000)
+        params.append(fetch_limit)
         query = f"""
             SELECT
                 json_extract_string(clob_token_ids, '$[0]') AS id,
@@ -288,7 +287,7 @@ class ParquetDataAdapter:
             FROM {self._poly_markets_view}
             WHERE {' AND '.join(where)}
             ORDER BY volume DESC
-            {limit_clause}
+            LIMIT ?
         """
         rows = self._conn.execute(query, params).fetchall()
         out: list[Market] = []

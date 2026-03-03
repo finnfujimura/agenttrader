@@ -73,6 +73,18 @@ def test_index_provider_forwards_category():
     )
 
 
+def test_polymarket_category_inference_does_not_treat_generic_will_as_politics():
+    """Generic 'Will ...' prompts should not be auto-classified as politics."""
+    from agenttrader.data.parquet_adapter import ParquetDataAdapter
+
+    inferred = ParquetDataAdapter._infer_polymarket_category(
+        "will-sacramento-kings-win-the-2025-nba-finals",
+        "Will the Sacramento Kings win the 2025 NBA Finals?",
+    )
+
+    assert inferred == "sports"
+
+
 # ---------------------------------------------------------------------------
 # Bug 2: research_markets post-filters by market_ids
 # ---------------------------------------------------------------------------
@@ -143,7 +155,7 @@ def test_research_markets_without_ids_uses_get_markets(monkeypatch):
 
 
 def test_parquet_polymarket_category_adds_ilike_prefilter():
-    """When category is provided, SQL should have ILIKE pre-filter and no LIMIT."""
+    """When category is provided, SQL should use ILIKE pre-filter and a bounded LIMIT."""
     from agenttrader.data.parquet_adapter import ParquetDataAdapter
 
     adapter = ParquetDataAdapter.__new__(ParquetDataAdapter)
@@ -158,14 +170,15 @@ def test_parquet_polymarket_category_adds_ilike_prefilter():
     params = call_args[0][1]
     # Should have ILIKE pre-filter for crypto keywords (bitcoin, btc, ethereum, etc.)
     assert "ILIKE" in sql, f"SQL should have ILIKE pre-filter, got: {sql}"
-    # Should NOT have LIMIT (Python trims after exact category check)
-    assert "LIMIT" not in sql, f"SQL should not have LIMIT when polymarket category is set"
+    # Category queries should stay bounded to avoid full scans
+    assert "LIMIT" in sql
     # Params should contain the ILIKE patterns
     assert any("%bitcoin%" in str(p) for p in params), f"Expected bitcoin keyword in params, got {params}"
+    assert params[-1] == 200
 
 
 def test_parquet_polymarket_unknown_category_no_ilike():
-    """Unknown polymarket categories (e.g. 'kxfeddecision') get no ILIKE pre-filter but still no LIMIT."""
+    """Unknown polymarket categories should return quickly without querying."""
     from agenttrader.data.parquet_adapter import ParquetDataAdapter
 
     adapter = ParquetDataAdapter.__new__(ParquetDataAdapter)
@@ -173,13 +186,10 @@ def test_parquet_polymarket_unknown_category_no_ilike():
     adapter._poly_markets_view = "poly_markets"
     adapter._conn.execute.return_value.fetchall.return_value = []
 
-    adapter._get_polymarket_markets(category="randomcategory", resolved_only=False, min_volume=None, limit=10)
+    result = adapter._get_polymarket_markets(category="randomcategory", resolved_only=False, min_volume=None, limit=10)
 
-    call_args = adapter._conn.execute.call_args
-    sql = call_args[0][0]
-    # No known keywords -> no ILIKE, but still no LIMIT
-    assert "ILIKE" not in sql
-    assert "LIMIT" not in sql
+    assert result == []
+    adapter._conn.execute.assert_not_called()
 
 
 def test_parquet_polymarket_has_sql_limit_without_category():

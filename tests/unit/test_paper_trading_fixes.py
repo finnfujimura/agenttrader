@@ -391,6 +391,53 @@ def test_get_portfolio_no_correction_for_stopped(monkeypatch):
     assert payload["status"] == "stopped"
 
 
+def test_get_portfolio_normalizes_stale_runtime_status_for_stopped(monkeypatch):
+    """Stopped portfolios should not expose stale running live_status payloads."""
+
+    class FakePortfolio:
+        id = "p-stopped"
+        pid = 99999
+        status = "stopped"
+        initial_cash = 1000
+        cash_balance = 1000
+        last_reload = None
+        reload_count = 0
+        stopped_at = 1234567890
+
+    class FakeCache:
+        def get_portfolio(self, _pid):
+            return FakePortfolio()
+
+        def get_open_positions(self, _pid):
+            return []
+
+    monkeypatch.setattr(mcp_server, "is_initialized", lambda: True)
+    monkeypatch.setattr(mcp_server, "DataCache", lambda _engine: FakeCache())
+    monkeypatch.setattr(mcp_server, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        mcp_server,
+        "read_runtime_status",
+        lambda _pid: {
+            "portfolio_id": "p-stopped",
+            "state": "running",
+            "last_live_update": 9999999999,
+            "markets_with_live_price": 3,
+            "markets_degraded": 1,
+            "markets": [{"market_id": "m1", "current_price": 0.5}],
+        },
+    )
+
+    result = _run(mcp_server.call_tool("get_portfolio", {"portfolio_id": "p-stopped"}))
+    payload = _payload(result)
+    assert payload["ok"] is True
+    assert payload["status"] == "stopped"
+    assert payload["last_live_update"] is None
+    assert payload["markets_live"] == 0
+    assert payload["markets_degraded"] == 0
+    assert payload["live_status"]["state"] == "stopped"
+    assert payload["live_status"]["markets"] == []
+
+
 # ---------------------------------------------------------------------------
 # PaperDaemon.start_as_daemon platform-specific flags
 # ---------------------------------------------------------------------------
