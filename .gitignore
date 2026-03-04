@@ -23,18 +23,18 @@ docs/
 /agenttrader/db/data/
 db/
 # Test temp directories
-codex_tmp_test*/
-codex_tmp_bench/
+codex_tmp_*/
+codex_pytest_tmproot/
 pytest_tmp_*/
 .pytest_tmp*/
 .codex_pytest_tmp*/
-test_results.txt
+test_results*.txt
 
 # Dataset (large parquet files)
 /data/
 
 # Performance / test data
-*.jsonl
+.pytest_perf_*.jsonl
 
 # Markdown files
 *.md

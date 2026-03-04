@@ -19,8 +19,15 @@ from agenttrader.data.models import ExecutionMode, Market, Platform
 
 PROGRESS_INTERVAL_SECONDS = 2.5
 STREAM_BATCH_MARKET_COUNT = 512
+MARKET_METADATA_HYDRATION_CHUNK_SIZE = 2048
 LARGE_RUN_MARKET_WARNING = 5000
 LARGE_RUN_WORK_UNITS_WARNING = 1_000_000
+
+
+def _market_matches_subscription_tags(market: Market, tags: list[str] | None) -> bool:
+    if not tags:
+        return True
+    return any(tag in (market.tags or []) for tag in tags)
 
 
 @dataclass
@@ -48,6 +55,7 @@ class SubscriptionCollector:
     def __init__(self, market_map: dict[str, Market]):
         self._market_map = market_map
         self._subscribed_ids: set[str] = set()
+        self._subscription_requests: list[dict[str, object]] = []
 
     def subscribe(
         self,
@@ -56,20 +64,32 @@ class SubscriptionCollector:
         tags: list[str] | None = None,
         market_ids: list[str] | None = None,
     ) -> None:
+        normalized_market_ids = [str(market_id) for market_id in (market_ids or []) if str(market_id)]
+        self._subscription_requests.append(
+            {
+                "platform": str(platform or "all"),
+                "category": category,
+                "tags": list(tags) if tags else None,
+                "market_ids": normalized_market_ids or None,
+            }
+        )
         if market_ids:
-            self._subscribed_ids.update(market_ids)
+            self._subscribed_ids.update(normalized_market_ids)
             return
         for market_id, market in self._market_map.items():
             if platform != "all" and market.platform.value != platform:
                 continue
             if not _market_matches_category(market, category):
                 continue
-            if tags and not any(tag in market.tags for tag in tags):
+            if not _market_matches_subscription_tags(market, tags):
                 continue
             self._subscribed_ids.add(market_id)
 
     def get_subscribed_ids(self) -> list[str]:
         return list(self._subscribed_ids)
+
+    def get_subscription_requests(self) -> list[dict[str, object]]:
+        return [dict(request) for request in self._subscription_requests]
 
     def search_markets(self, query, platform="all"):  # noqa: ANN001
         return []
@@ -268,25 +288,128 @@ class BacktestEngine:
         return chunks
 
     @staticmethod
-    def _hydrate_market_map_for_ids(data_source, market_map: dict[str, Market], market_ids) -> dict[str, Market]:
+    def _iter_id_chunks(market_ids, chunk_size: int = MARKET_METADATA_HYDRATION_CHUNK_SIZE):
+        ids = [str(mid) for mid in market_ids if str(mid)]
+        for start in range(0, len(ids), chunk_size):
+            yield ids[start:start + chunk_size]
+
+    @classmethod
+    def _hydrate_market_map_for_ids(
+        cls,
+        data_source,
+        market_map: dict[str, Market],
+        market_ids,
+        *,
+        platform_hints: dict[str, str] | None = None,
+    ) -> dict[str, Market]:
         missing_ids = [str(mid) for mid in market_ids if str(mid) and str(mid) not in market_map]
         if not missing_ids or not hasattr(data_source, "get_markets_by_ids"):
             return market_map
 
-        try:
-            loaded = data_source.get_markets_by_ids(missing_ids, platform="all")
-        except TypeError:
-            loaded = data_source.get_markets_by_ids(missing_ids)
-        except Exception:
-            loaded = []
-
-        if not loaded:
-            return market_map
-
         hydrated = dict(market_map)
-        for market in loaded:
-            hydrated[market.id] = market
+        grouped_ids: dict[str, list[str]] = defaultdict(list)
+        if platform_hints:
+            fallback_ids: list[str] = []
+            for market_id in missing_ids:
+                platform = str(platform_hints.get(market_id, "") or "").strip().lower()
+                if platform in {"polymarket", "kalshi"}:
+                    grouped_ids[platform].append(market_id)
+                else:
+                    fallback_ids.append(market_id)
+            if fallback_ids:
+                grouped_ids["all"].extend(fallback_ids)
+        else:
+            grouped_ids["all"] = missing_ids
+
+        for platform, ids_for_platform in grouped_ids.items():
+            for chunk in cls._iter_id_chunks(ids_for_platform):
+                try:
+                    if platform == "all":
+                        loaded = data_source.get_markets_by_ids(chunk, platform="all")
+                    else:
+                        loaded = data_source.get_markets_by_ids(chunk, platform=platform)
+                except TypeError:
+                    loaded = data_source.get_markets_by_ids(chunk)
+                except Exception:
+                    loaded = []
+                for market in loaded or []:
+                    hydrated[market.id] = market
         return hydrated
+
+    @classmethod
+    def _resolve_streaming_subscription_ids(
+        cls,
+        parquet,
+        candidate_rows: list[tuple[str, str, int]],
+        collector: SubscriptionCollector,
+    ) -> tuple[set[str], dict[str, Market], dict[str, str]]:
+        candidate_ids: set[str] = set()
+        candidate_ids_by_platform: dict[str, set[str]] = defaultdict(set)
+        candidate_platform_by_id: dict[str, str] = {}
+        for market_id, market_platform, _count in candidate_rows:
+            market_id_str = str(market_id)
+            platform_value = str(market_platform or "").strip().lower()
+            candidate_ids.add(market_id_str)
+            candidate_platform_by_id[market_id_str] = platform_value
+            candidate_ids_by_platform[platform_value].add(market_id_str)
+
+        final_ids: set[str] = set()
+        hydrated_map: dict[str, Market] = {}
+        requests = collector.get_subscription_requests()
+
+        for request in requests:
+            requested_market_ids = [str(mid) for mid in (request.get("market_ids") or []) if str(mid)]
+            if requested_market_ids:
+                final_ids.update(mid for mid in requested_market_ids if mid in candidate_ids)
+                continue
+
+            platform = str(request.get("platform") or "all")
+            category = request.get("category")
+            tags = request.get("tags")
+
+            if platform == "all":
+                scoped_ids = candidate_ids
+            else:
+                scoped_ids = candidate_ids_by_platform.get(platform, set())
+            if not scoped_ids:
+                continue
+
+            if not category and not tags:
+                final_ids.update(scoped_ids)
+                continue
+
+            matching_scoped_ids = []
+            for market_id in scoped_ids:
+                market = hydrated_map.get(market_id)
+                if market is None:
+                    matching_scoped_ids.append(market_id)
+                    continue
+                if not _market_matches_category(market, category):
+                    continue
+                if not _market_matches_subscription_tags(market, tags):
+                    continue
+                final_ids.add(market_id)
+
+            if not matching_scoped_ids:
+                continue
+
+            platform_hint = platform if platform in {"polymarket", "kalshi"} else "all"
+            for chunk in cls._iter_id_chunks(matching_scoped_ids):
+                try:
+                    loaded = parquet.get_markets_by_ids(chunk, platform=platform_hint)
+                except TypeError:
+                    loaded = parquet.get_markets_by_ids(chunk)
+                except Exception:
+                    loaded = []
+                for market in loaded or []:
+                    hydrated_map[market.id] = market
+                    if not _market_matches_category(market, category):
+                        continue
+                    if not _market_matches_subscription_tags(market, tags):
+                        continue
+                    final_ids.add(market.id)
+
+        return final_ids, hydrated_map, candidate_platform_by_id
 
     def _run_legacy(
         self,
@@ -502,20 +625,21 @@ class BacktestEngine:
                 "message": "Parquet metadata unavailable. Run: agenttrader dataset download",
             }
 
-        all_markets = parquet.get_markets(platform="all", limit=50_000)
-        candidate_ids = {market_id for market_id, _platform, _count in candidate_rows}
-        counts = {market_id: int(count) for market_id, _platform, count in candidate_rows}
-        market_map: dict[str, Market] = {m.id: m for m in all_markets if m.id in candidate_ids}
-        if not market_map:
-            market_map = {m.id: m for m in all_markets}
-
-        collector = SubscriptionCollector(market_map)
+        counts = {str(market_id): int(count) for market_id, _platform, count in candidate_rows}
+        collector = SubscriptionCollector({})
         probe = strategy_class(collector)
         probe.on_start()
-        subscribed_ids = set(collector.get_subscribed_ids())
-
-        final_ids = subscribed_ids & candidate_ids
-        market_map = self._hydrate_market_map_for_ids(parquet, market_map, final_ids)
+        final_ids, market_map, candidate_platform_by_id = self._resolve_streaming_subscription_ids(
+            parquet,
+            candidate_rows,
+            collector,
+        )
+        market_map = self._hydrate_market_map_for_ids(
+            parquet,
+            market_map,
+            final_ids,
+            platform_hints=candidate_platform_by_id,
+        )
         subscribed_markets = [market_map[mid] for mid in final_ids if mid in market_map]
         if not subscribed_markets:
             return {

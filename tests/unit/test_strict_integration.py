@@ -54,6 +54,11 @@ def test_strict_backtest_buy_and_hold(monkeypatch):
         def get_markets(self, platform="all", limit=50000):
             return [market]
 
+        def get_markets_by_ids(self, market_ids, platform="all"):
+            if "m1" in set(market_ids):
+                return [market]
+            return []
+
     class FakeIndex:
         def get_market_ids(self, platform="all", start_ts=None, end_ts=None):
             return [("m1", "polymarket")]
@@ -108,6 +113,11 @@ def test_strict_backtest_orderbook_strategy_graceful(monkeypatch):
         def get_markets(self, platform="all", limit=50000):
             return [market]
 
+        def get_markets_by_ids(self, market_ids, platform="all"):
+            if "m1" in set(market_ids):
+                return [market]
+            return []
+
     class FakeIndex:
         def get_market_ids(self, **kwargs):
             return [("m1", "polymarket")]
@@ -157,6 +167,11 @@ def test_synthetic_mode_backtest_still_works(monkeypatch):
 
         def get_markets(self, platform="all", limit=50000):
             return [market]
+
+        def get_markets_by_ids(self, market_ids, platform="all"):
+            if "m1" in set(market_ids):
+                return [market]
+            return []
 
     class FakeIndex:
         def get_market_ids(self, **kwargs):

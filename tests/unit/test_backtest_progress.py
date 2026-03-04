@@ -53,6 +53,11 @@ def test_streaming_backtest_emits_preflight_and_progress(monkeypatch):
         def get_markets(self, platform="all", limit=50000):  # noqa: ARG002
             return [market]
 
+        def get_markets_by_ids(self, market_ids, platform="all"):  # noqa: ARG002
+            if "m1" in set(market_ids):
+                return [market]
+            return []
+
     class FakeIndex:
         def get_market_ids_with_counts(self, platform="all", start_ts=None, end_ts=None):  # noqa: ARG002
             return [("m1", "polymarket", 2)]
