@@ -46,6 +46,21 @@ sudo apt install aria2 zstd
 agenttrader dataset download      # ~36GB, one-time
 agenttrader dataset build-index   # ~5-10 min, one-time
 ```
+> **Memory requirements**
+>
+> Building the dataset index is a **RAM-intensive operation**. We recommend **at least 8 GB of system memory** for reliable performance.
+>
+> If you encounter errors while running:
+>
+> ```bash
+> agenttrader dataset build-index
+> ```
+>
+> the most common cause is **DuckDB running out of available memory**.
+>
+> This can usually be resolved by increasing DuckDB's memory allocation.
+>
+> If you're unsure how to do this, simply paste the error message into any LLM and ask how to **increase DuckDB memory limits** for your environment.
 
 > **Don't want to download 36GB?** Backtesting still works using live-synced data. Run `agenttrader sync` before backtesting and it'll use whatever is cached locally.
 ---
@@ -122,22 +137,28 @@ The agent handles research, strategy writing, validation, backtesting, iteration
 Here's a single prompt that exercises the complete workflow:
 
 ```
-I want to trade Polymarket politics markets using a contrarian strategy.
+Use agenttrader to build, test, and launch a Polymarket politics contrarian strategy using only a category-level
+  universe.
 
-1. Use research_markets to find 10 active politics markets with 30 days
-   of history. Check their capabilities to confirm they're backtestable.
-
-2. Write a strategy that buys YES when the price drops more than 10%
-   below its 7-day average, and sells when it recovers to the average.
-   Use position sizing of 5% of portfolio per trade.
-
-3. Backtest from 2024-01-01 to 2024-12-31 with $10,000.
-
-4. If Sharpe < 0.5, adjust the entry threshold and retest. Iterate
-   up to 3 times.
-
-5. Once satisfied, start paper trading with the best-performing version
-   and report the portfolio ID and initial positions.
+  Please do this end to end:
+  1. Research current active Polymarket politics markets and summarize the last 30 days of behavior (trend, volatility,
+  and data quality).
+  2. Do not use fixed market IDs anywhere. The strategy must subscribe broadly to the politics category.
+  3. Strategy rules:
+     - Buy YES when price is more than 10% below its 7-day average.
+     - Sell when price recovers to the 7-day average or higher.
+     - Use 5% of portfolio value per new position.
+  4. Backtest with $10,000 on a date range that actually has coverage for the politics category.
+     - Prefer 2024-01-01 to 2024-12-31 if data supports it.
+     - If not, automatically choose the nearest full-year covered window and state which dates were used.
+  5. If Sharpe is below 0.5, adjust entry threshold and rerun (up to 3 total attempts), then select the best-performing
+  version.
+  6. Start paper trading with the best version and report:
+     - strategy version chosen
+     - backtest metrics for each attempt (Sharpe, return, drawdown, trades)
+     - portfolio ID
+     - initial cash and positions
+     - number of live subscribed markets
 ```
 
 This prompt will trigger ~10-15 tool calls across research, validation, backtesting (with iteration), and paper trading deployment.
