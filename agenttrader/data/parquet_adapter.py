@@ -147,10 +147,9 @@ class ParquetDataAdapter:
         self._conn.execute(f"DROP TABLE IF EXISTS {table_name}")
         self._conn.execute(f"CREATE TEMP TABLE {table_name} (market_id VARCHAR)")
         try:
-            self._conn.executemany(
-                f"INSERT INTO {table_name} VALUES (?)",
-                [(market_id,) for market_id in unique_ids],
-            )
+            loaded = self._populate_temp_market_ids_fast(table_name, unique_ids)
+            if not loaded:
+                self._populate_temp_market_ids_fallback(table_name, unique_ids)
 
             wanted = platform.lower()
             results: list[Market] = []
@@ -161,6 +160,25 @@ class ParquetDataAdapter:
             return results
         finally:
             self._conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+    def _populate_temp_market_ids_fast(self, table_name: str, market_ids: list[str]) -> bool:
+        """Populate temp ID table using set-based bind + UNNEST when supported."""
+        try:
+            self._conn.execute(
+                f"INSERT INTO {table_name} "
+                "SELECT requested_id FROM UNNEST(?::VARCHAR[]) AS requested(requested_id)",
+                [list(market_ids)],
+            )
+            return True
+        except Exception:
+            LOGGER.debug("Falling back to row-wise temp ID inserts for bulk hydration", exc_info=True)
+            return False
+
+    def _populate_temp_market_ids_fallback(self, table_name: str, market_ids: list[str]) -> None:
+        self._conn.executemany(
+            f"INSERT INTO {table_name} VALUES (?)",
+            [(market_id,) for market_id in market_ids],
+        )
 
     def _get_polymarket_markets_by_ids(self, market_ids: list[str]) -> list[Market]:
         """Look up polymarket markets where the yes-token ID or condition_id matches."""

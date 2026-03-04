@@ -416,6 +416,107 @@ def test_streaming_backtest_broad_platform_prefers_bulk_metadata_loader(monkeypa
     assert calls["bulk"] == 1
 
 
+def test_streaming_backtest_broad_polymarket_subscription_uses_all_candidate_ids_without_cap(monkeypatch):
+    now_ts = int(datetime(2024, 1, 1, tzinfo=UTC).timestamp())
+    polymarket_ids = [f"poly-{idx}" for idx in range(120)]
+    kalshi_id = "kalshi-1"
+    markets = {
+        market_id: Market(
+            id=market_id,
+            condition_id=market_id,
+            platform=Platform.POLYMARKET,
+            title=f"Poly {market_id}",
+            category="politics",
+            tags=[],
+            market_type=MarketType.BINARY,
+            volume=100.0,
+            close_time=now_ts + 86400,
+            resolved=False,
+            resolution=None,
+            scalar_low=None,
+            scalar_high=None,
+        )
+        for market_id in polymarket_ids
+    }
+    markets[kalshi_id] = Market(
+        id=kalshi_id,
+        condition_id=kalshi_id,
+        platform=Platform.KALSHI,
+        title="Kalshi 1",
+        category="politics",
+        tags=[],
+        market_type=MarketType.BINARY,
+        volume=80.0,
+        close_time=now_ts + 86400,
+        resolved=False,
+        resolution=None,
+        scalar_low=None,
+        scalar_high=None,
+    )
+    bulk_calls: list[tuple[str, list[str]]] = []
+
+    class FakeParquet:
+        def __init__(self, *args, **kwargs):
+            return
+
+        def is_available(self):
+            return True
+
+        def get_markets(self, *args, **kwargs):  # noqa: ARG002
+            raise AssertionError("Streaming broad subscription should not use capped get_markets() discovery")
+
+        def get_markets_by_ids(self, market_ids, platform="all"):  # noqa: ARG002
+            raise AssertionError("Bulk metadata loader should be preferred for this path")
+
+        def get_markets_by_ids_bulk(self, market_ids, platform="all"):  # noqa: ARG002
+            bulk_calls.append((platform, list(market_ids)))
+            return [markets[mid] for mid in market_ids if mid in markets]
+
+    class FakeIndex:
+        def get_market_rows(self, platform="all", start_ts=None, end_ts=None):  # noqa: ARG002
+            rows = [(market_id, "polymarket", 2, now_ts + 60, now_ts + 120) for market_id in polymarket_ids]
+            rows.append((kalshi_id, "kalshi", 2, now_ts + 60, now_ts + 120))
+            return rows
+
+        def stream_market_history(self, market_id, platform, start_ts, end_ts):  # noqa: ARG002
+            yield PricePoint(timestamp=now_ts + 60, yes_price=0.55, no_price=0.45, volume=10.0)
+
+        def stream_market_history_resampled(self, market_id, platform, start_ts, end_ts, bar_seconds):  # noqa: ARG002
+            yield from self.stream_market_history(market_id, platform, start_ts, end_ts)
+
+        def get_latest_price_before(self, market_id, platform, ts):  # noqa: ARG002
+            return 0.50
+
+    class Strategy(BaseStrategy):
+        def on_start(self):
+            self.subscribe(platform="polymarket")
+
+        def on_market_data(self, market, price, orderbook):  # noqa: ARG002
+            return
+
+    monkeypatch.setattr("agenttrader.data.parquet_adapter.ParquetDataAdapter", FakeParquet)
+    engine = BacktestEngine(data_source=None)
+    result = engine._run_streaming(
+        Strategy,
+        BacktestConfig(
+            strategy_path="test",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            initial_cash=1000.0,
+            execution_mode=ExecutionMode.SYNTHETIC_EXECUTION_MODEL,
+        ),
+        FakeIndex(),
+    )
+
+    assert result["ok"] is True
+    assert result["markets_tested"] == len(polymarket_ids)
+    assert len(bulk_calls) == 1
+    requested_platform, requested_ids = bulk_calls[0]
+    assert requested_platform == "polymarket"
+    assert len(requested_ids) == len(polymarket_ids)
+    assert set(requested_ids) == set(polymarket_ids)
+
+
 def test_streaming_backtest_broad_all_subscription_uses_full_candidate_set(monkeypatch):
     now_ts = int(datetime(2024, 1, 1, tzinfo=UTC).timestamp())
     markets = {

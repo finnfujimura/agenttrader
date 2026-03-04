@@ -169,3 +169,74 @@ def test_parquet_adapter_ignores_appledouble_files(tmp_path):
     adapter = ParquetDataAdapter(data_dir=tmp_path)
     markets = adapter.get_markets(platform="polymarket", limit=5)
     assert len(markets) > 0
+
+
+def test_parquet_get_markets_by_ids_bulk_fast_path(tmp_path, monkeypatch):
+    _write_parquet_dataset(tmp_path)
+    adapter = ParquetDataAdapter(data_dir=tmp_path)
+
+    calls = {"fast": 0, "fallback": 0}
+    original_fast = adapter._populate_temp_market_ids_fast
+    original_fallback = adapter._populate_temp_market_ids_fallback
+
+    def wrapped_fast(table_name, market_ids):
+        calls["fast"] += 1
+        return original_fast(table_name, market_ids)
+
+    def wrapped_fallback(table_name, market_ids):
+        calls["fallback"] += 1
+        return original_fallback(table_name, market_ids)
+
+    monkeypatch.setattr(adapter, "_populate_temp_market_ids_fast", wrapped_fast)
+    monkeypatch.setattr(adapter, "_populate_temp_market_ids_fallback", wrapped_fallback)
+
+    results = adapter.get_markets_by_ids_bulk(["yes-token-1", "KXBTC-24JAN01-T50000"], platform="all")
+    result_ids = {market.id for market in results}
+
+    assert "yes-token-1" in result_ids
+    assert "KXBTC-24JAN01-T50000" in result_ids
+    assert calls["fast"] == 1
+    assert calls["fallback"] == 0
+
+
+def test_parquet_get_markets_by_ids_bulk_fallback_path(tmp_path, monkeypatch):
+    _write_parquet_dataset(tmp_path)
+    adapter = ParquetDataAdapter(data_dir=tmp_path)
+
+    calls = {"fast": 0, "fallback": 0}
+    original_fallback = adapter._populate_temp_market_ids_fallback
+
+    def unavailable_fast(table_name, market_ids):  # noqa: ARG001
+        calls["fast"] += 1
+        return False
+
+    def wrapped_fallback(table_name, market_ids):
+        calls["fallback"] += 1
+        return original_fallback(table_name, market_ids)
+
+    monkeypatch.setattr(adapter, "_populate_temp_market_ids_fast", unavailable_fast)
+    monkeypatch.setattr(adapter, "_populate_temp_market_ids_fallback", wrapped_fallback)
+
+    results = adapter.get_markets_by_ids_bulk(["cond-1", "KXBTC-24JAN01-T50000"], platform="all")
+    result_ids = {market.id for market in results}
+
+    assert "yes-token-1" in result_ids
+    assert "KXBTC-24JAN01-T50000" in result_ids
+    assert calls["fast"] == 1
+    assert calls["fallback"] == 1
+
+
+def test_parquet_get_markets_by_ids_bulk_mixed_platform_matching(tmp_path):
+    _write_parquet_dataset(tmp_path)
+    adapter = ParquetDataAdapter(data_dir=tmp_path)
+
+    results = adapter.get_markets_by_ids_bulk(
+        ["yes-token-1", "cond-1", "KXBTC-24JAN01-T50000", "KXBTC-24JAN01-T50000", "missing"],
+        platform="all",
+    )
+
+    by_id = {market.id: market for market in results}
+    assert set(by_id) == {"yes-token-1", "KXBTC-24JAN01-T50000"}
+    assert by_id["yes-token-1"].platform == Platform.POLYMARKET
+    assert by_id["yes-token-1"].condition_id == "cond-1"
+    assert by_id["KXBTC-24JAN01-T50000"].platform == Platform.KALSHI
