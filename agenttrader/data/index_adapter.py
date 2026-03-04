@@ -38,12 +38,12 @@ class BacktestIndexAdapter:
         rows = self.get_market_ids_with_counts(platform=platform, start_ts=start_ts, end_ts=end_ts)
         return [(market_id, market_platform) for market_id, market_platform, _ in rows]
 
-    def get_market_ids_with_counts(
+    def get_market_rows(
         self,
         platform: str = "all",
         start_ts: int | None = None,
         end_ts: int | None = None,
-    ) -> list[tuple[str, str, int]]:
+    ) -> list[tuple[str, str, int, int, int]]:
         if self._conn is None:
             return []
 
@@ -62,14 +62,26 @@ class BacktestIndexAdapter:
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         rows = self._conn.execute(
             f"""
-            SELECT market_id, platform, n_trades
+            SELECT market_id, platform, n_trades, min_ts, max_ts
             FROM market_metadata
             {where}
             ORDER BY n_trades DESC
             """,
             params,
         ).fetchall()
-        return [(str(r[0]), str(r[1]), int(r[2])) for r in rows]
+        return [
+            (str(market_id), str(market_platform), int(n_trades), int(min_ts), int(max_ts))
+            for market_id, market_platform, n_trades, min_ts, max_ts in rows
+        ]
+
+    def get_market_ids_with_counts(
+        self,
+        platform: str = "all",
+        start_ts: int | None = None,
+        end_ts: int | None = None,
+    ) -> list[tuple[str, str, int]]:
+        rows = self.get_market_rows(platform=platform, start_ts=start_ts, end_ts=end_ts)
+        return [(market_id, market_platform, n_trades) for market_id, market_platform, n_trades, _min_ts, _max_ts in rows]
 
     def get_market_date_ranges(self, market_ids: list[str]) -> dict[str, tuple[int, int]]:
         """Batch query min_ts/max_ts for a list of market IDs from market_metadata."""

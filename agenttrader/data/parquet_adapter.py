@@ -132,6 +132,36 @@ class ParquetDataAdapter:
             results.extend(self._get_kalshi_markets_by_ids(market_ids))
         return results
 
+    def get_markets_by_ids_bulk(
+        self,
+        market_ids: list[str],
+        platform: str = "all",
+    ) -> list[Market]:
+        """Bulk ID lookup optimized for large hydration batches via a temp join table."""
+        self._require_conn()
+        unique_ids = [str(market_id).strip() for market_id in dict.fromkeys(market_ids or []) if str(market_id).strip()]
+        if not unique_ids:
+            return []
+
+        table_name = "_agenttrader_tmp_market_ids"
+        self._conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+        self._conn.execute(f"CREATE TEMP TABLE {table_name} (market_id VARCHAR)")
+        try:
+            self._conn.executemany(
+                f"INSERT INTO {table_name} VALUES (?)",
+                [(market_id,) for market_id in unique_ids],
+            )
+
+            wanted = platform.lower()
+            results: list[Market] = []
+            if wanted in ("polymarket", "all") and self._poly_markets_view:
+                results.extend(self._get_polymarket_markets_by_ids_bulk(table_name))
+            if wanted in ("kalshi", "all") and self._kalshi_markets_view:
+                results.extend(self._get_kalshi_markets_by_ids_bulk(table_name))
+            return results
+        finally:
+            self._conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+
     def _get_polymarket_markets_by_ids(self, market_ids: list[str]) -> list[Market]:
         """Look up polymarket markets where the yes-token ID or condition_id matches."""
         placeholders = ", ".join("?" for _ in market_ids)
@@ -183,6 +213,33 @@ class ParquetDataAdapter:
             )
         return out
 
+    def _get_polymarket_markets_by_ids_bulk(self, id_table_name: str) -> list[Market]:
+        query = f"""
+            WITH source AS (
+                SELECT
+                    json_extract_string(clob_token_ids, '$[0]') AS id,
+                    condition_id,
+                    question AS title,
+                    slug,
+                    volume,
+                    closed,
+                    end_date,
+                    json_extract_string(outcome_prices, '$[0]') AS yes_price_str
+                FROM {self._poly_markets_view} AS markets
+            ),
+            matched AS (
+                SELECT DISTINCT source.*
+                FROM source
+                INNER JOIN {id_table_name} AS requested
+                    ON requested.market_id = source.id
+                    OR requested.market_id = source.condition_id
+            )
+            SELECT id, condition_id, title, slug, volume, closed, end_date, yes_price_str
+            FROM matched
+        """
+        rows = self._conn.execute(query).fetchall()
+        return self._build_polymarket_market_rows(rows)
+
     def _get_kalshi_markets_by_ids(self, market_ids: list[str]) -> list[Market]:
         """Look up kalshi markets where the ticker matches."""
         placeholders = ", ".join("?" for _ in market_ids)
@@ -225,6 +282,24 @@ class ParquetDataAdapter:
                 )
             )
         return out
+
+    def _get_kalshi_markets_by_ids_bulk(self, id_table_name: str) -> list[Market]:
+        query = f"""
+            SELECT
+                ticker,
+                event_ticker,
+                title,
+                market_type,
+                status,
+                volume / 100.0 AS volume_dollars,
+                close_time,
+                result
+            FROM {self._kalshi_markets_view} AS markets
+            INNER JOIN {id_table_name} AS requested
+                ON requested.market_id = markets.ticker
+        """
+        rows = self._conn.execute(query).fetchall()
+        return self._build_kalshi_market_rows(rows)
 
     def get_price_history(
         self,
@@ -295,38 +370,7 @@ class ParquetDataAdapter:
             LIMIT ?
         """
         rows = self._conn.execute(query, params).fetchall()
-        out: list[Market] = []
-        for row in rows:
-            market_id, condition_id, title, slug, volume, closed, end_date, yes_price_str = row
-            if not market_id:
-                continue
-            yes_price = self._to_float(yes_price_str)
-            resolution = None
-            if bool(closed) and yes_price is not None:
-                if yes_price >= 0.999:
-                    resolution = "yes"
-                elif yes_price <= 0.001:
-                    resolution = "no"
-            inferred_category = self._infer_polymarket_category(str(slug or ""), str(title or ""))
-            if category and inferred_category.lower() != category.lower():
-                continue
-            out.append(
-                Market(
-                    id=str(market_id),
-                    condition_id=str(condition_id or market_id),
-                    platform=Platform.POLYMARKET,
-                    title=str(title or ""),
-                    category=inferred_category,
-                    tags=[],
-                    market_type=MarketType.BINARY,
-                    volume=float(volume or 0.0),
-                    close_time=self._to_unix_ts(end_date),
-                    resolved=bool(closed),
-                    resolution=resolution,
-                    scalar_low=None,
-                    scalar_high=None,
-                )
-            )
+        out = self._build_polymarket_market_rows(rows, category=category)
         return out[:limit]
 
     def _get_kalshi_markets(
@@ -371,6 +415,45 @@ class ParquetDataAdapter:
             LIMIT ?
         """
         rows = self._conn.execute(query, params).fetchall()
+        out = self._build_kalshi_market_rows(rows, category=category)
+        return out[:limit]
+
+    def _build_polymarket_market_rows(self, rows, *, category: str | None = None) -> list[Market]:
+        out: list[Market] = []
+        for row in rows:
+            market_id, condition_id, title, slug, volume, closed, end_date, yes_price_str = row
+            if not market_id:
+                continue
+            yes_price = self._to_float(yes_price_str)
+            resolution = None
+            if bool(closed) and yes_price is not None:
+                if yes_price >= 0.999:
+                    resolution = "yes"
+                elif yes_price <= 0.001:
+                    resolution = "no"
+            inferred_category = self._infer_polymarket_category(str(slug or ""), str(title or ""))
+            if category and inferred_category.lower() != category.lower():
+                continue
+            out.append(
+                Market(
+                    id=str(market_id),
+                    condition_id=str(condition_id or market_id),
+                    platform=Platform.POLYMARKET,
+                    title=str(title or ""),
+                    category=inferred_category,
+                    tags=[],
+                    market_type=MarketType.BINARY,
+                    volume=float(volume or 0.0),
+                    close_time=self._to_unix_ts(end_date),
+                    resolved=bool(closed),
+                    resolution=resolution,
+                    scalar_low=None,
+                    scalar_high=None,
+                )
+            )
+        return out
+
+    def _build_kalshi_market_rows(self, rows, *, category: str | None = None) -> list[Market]:
         out: list[Market] = []
         for row in rows:
             ticker, event_ticker, title, market_type, status, volume, close_time, result = row
@@ -397,7 +480,7 @@ class ParquetDataAdapter:
                     scalar_high=None,
                 )
             )
-        return out[:limit]
+        return out
 
     def _get_polymarket_price_history(self, market_id: str, start_ts: int, end_ts: int) -> list[PricePoint]:
         self._require_conn()

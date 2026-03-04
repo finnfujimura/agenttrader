@@ -294,6 +294,61 @@ class BacktestEngine:
             yield ids[start:start + chunk_size]
 
     @classmethod
+    def _load_markets_by_ids(
+        cls,
+        data_source,
+        market_ids,
+        *,
+        platform: str = "all",
+    ) -> list[Market]:
+        ids = [str(mid) for mid in market_ids if str(mid)]
+        if not ids:
+            return []
+
+        if hasattr(data_source, "get_markets_by_ids_bulk"):
+            try:
+                return list(data_source.get_markets_by_ids_bulk(ids, platform=platform))
+            except TypeError:
+                try:
+                    return list(data_source.get_markets_by_ids_bulk(ids))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        if not hasattr(data_source, "get_markets_by_ids"):
+            return []
+
+        loaded: list[Market] = []
+        for chunk in cls._iter_id_chunks(ids):
+            try:
+                if platform == "all":
+                    batch = data_source.get_markets_by_ids(chunk, platform="all")
+                else:
+                    batch = data_source.get_markets_by_ids(chunk, platform=platform)
+            except TypeError:
+                batch = data_source.get_markets_by_ids(chunk)
+            except Exception:
+                batch = []
+            loaded.extend(batch or [])
+        return loaded
+
+    @staticmethod
+    def _warmup_candidate_ids(
+        market_ids: list[str],
+        *,
+        market_min_ts: dict[str, int],
+        start_ts: int,
+    ) -> list[str]:
+        if not market_min_ts:
+            return list(market_ids)
+        return [
+            market_id
+            for market_id in market_ids
+            if int(market_min_ts.get(market_id, start_ts - 1)) < int(start_ts)
+        ]
+
+    @classmethod
     def _hydrate_market_map_for_ids(
         cls,
         data_source,
@@ -303,7 +358,9 @@ class BacktestEngine:
         platform_hints: dict[str, str] | None = None,
     ) -> dict[str, Market]:
         missing_ids = [str(mid) for mid in market_ids if str(mid) and str(mid) not in market_map]
-        if not missing_ids or not hasattr(data_source, "get_markets_by_ids"):
+        if not missing_ids or not (
+            hasattr(data_source, "get_markets_by_ids") or hasattr(data_source, "get_markets_by_ids_bulk")
+        ):
             return market_map
 
         hydrated = dict(market_map)
@@ -322,18 +379,9 @@ class BacktestEngine:
             grouped_ids["all"] = missing_ids
 
         for platform, ids_for_platform in grouped_ids.items():
-            for chunk in cls._iter_id_chunks(ids_for_platform):
-                try:
-                    if platform == "all":
-                        loaded = data_source.get_markets_by_ids(chunk, platform="all")
-                    else:
-                        loaded = data_source.get_markets_by_ids(chunk, platform=platform)
-                except TypeError:
-                    loaded = data_source.get_markets_by_ids(chunk)
-                except Exception:
-                    loaded = []
-                for market in loaded or []:
-                    hydrated[market.id] = market
+            loaded = cls._load_markets_by_ids(data_source, ids_for_platform, platform=platform)
+            for market in loaded:
+                hydrated[market.id] = market
         return hydrated
 
     @classmethod
@@ -394,20 +442,14 @@ class BacktestEngine:
                 continue
 
             platform_hint = platform if platform in {"polymarket", "kalshi"} else "all"
-            for chunk in cls._iter_id_chunks(matching_scoped_ids):
-                try:
-                    loaded = parquet.get_markets_by_ids(chunk, platform=platform_hint)
-                except TypeError:
-                    loaded = parquet.get_markets_by_ids(chunk)
-                except Exception:
-                    loaded = []
-                for market in loaded or []:
-                    hydrated_map[market.id] = market
-                    if not _market_matches_category(market, category):
-                        continue
-                    if not _market_matches_subscription_tags(market, tags):
-                        continue
-                    final_ids.add(market.id)
+            loaded = cls._load_markets_by_ids(parquet, matching_scoped_ids, platform=platform_hint)
+            for market in loaded:
+                hydrated_map[market.id] = market
+                if not _market_matches_category(market, category):
+                    continue
+                if not _market_matches_subscription_tags(market, tags):
+                    continue
+                final_ids.add(market.id)
 
         return final_ids, hydrated_map, candidate_platform_by_id
 
@@ -603,7 +645,18 @@ class BacktestEngine:
         start_ts = int(start_dt.timestamp())
         end_ts = int(end_dt.timestamp())
 
-        if hasattr(index, "get_market_ids_with_counts"):
+        candidate_min_ts: dict[str, int] = {}
+        if hasattr(index, "get_market_rows"):
+            candidate_rows_with_bounds = index.get_market_rows(platform="all", start_ts=start_ts, end_ts=end_ts)
+            candidate_rows = [
+                (market_id, market_platform, count)
+                for market_id, market_platform, count, _min_ts, _max_ts in candidate_rows_with_bounds
+            ]
+            candidate_min_ts = {
+                str(market_id): int(min_ts)
+                for market_id, _market_platform, _count, min_ts, _max_ts in candidate_rows_with_bounds
+            }
+        elif hasattr(index, "get_market_ids_with_counts"):
             candidate_rows = index.get_market_ids_with_counts(platform="all", start_ts=start_ts, end_ts=end_ts)
         else:
             candidate_rows = [
@@ -649,6 +702,17 @@ class BacktestEngine:
                     "Strategy subscribed to 0 markets with data in the requested date range. "
                     "Check your subscribe() call and date range."
                 ),
+            }
+
+        if not candidate_min_ts and hasattr(index, "get_market_date_ranges"):
+            try:
+                date_ranges = index.get_market_date_ranges([market.id for market in subscribed_markets])
+            except Exception:
+                date_ranges = {}
+            candidate_min_ts = {
+                str(market_id): int(bounds[0])
+                for market_id, bounds in date_ranges.items()
+                if bounds
             }
 
         max_markets_applied = None
@@ -711,7 +775,11 @@ class BacktestEngine:
 
         if batch_enabled:
             for chunk_idx, (platform, market_ids) in enumerate(chunk_specs):
-                previous_map = index.get_latest_prices_before_batch(market_ids, platform, start_ts)
+                warmup_ids = self._warmup_candidate_ids(market_ids, market_min_ts=candidate_min_ts, start_ts=start_ts)
+                if warmup_ids:
+                    previous_map = index.get_latest_prices_before_batch(warmup_ids, platform, start_ts)
+                else:
+                    previous_map = {}
                 for market_id, previous in previous_map.items():
                     context.set_price_cursor(market_id, previous)
 
@@ -737,7 +805,11 @@ class BacktestEngine:
                     heapq.heappush(heap, (int(point.timestamp), market_id, iterator_key, point))
         else:
             for market in subscribed_markets:
-                previous = index.get_latest_price_before(market.id, market.platform.value, start_ts)
+                market_min = candidate_min_ts.get(market.id)
+                if market_min is not None and int(market_min) >= int(start_ts):
+                    previous = None
+                else:
+                    previous = index.get_latest_price_before(market.id, market.platform.value, start_ts)
                 if previous is not None:
                     context.set_price_cursor(market.id, previous)
 

@@ -320,6 +320,102 @@ def test_streaming_backtest_broad_platform_subscription_uses_full_candidate_set(
     assert calls["get_markets_by_ids"] >= 1
 
 
+def test_streaming_backtest_broad_platform_prefers_bulk_metadata_loader(monkeypatch):
+    now_ts = int(datetime(2024, 1, 1, tzinfo=UTC).timestamp())
+    markets = {
+        "poly-1": Market(
+            id="poly-1",
+            condition_id="poly-1",
+            platform=Platform.POLYMARKET,
+            title="Poly 1",
+            category="politics",
+            tags=[],
+            market_type=MarketType.BINARY,
+            volume=100.0,
+            close_time=now_ts + 86400,
+            resolved=False,
+            resolution=None,
+            scalar_low=None,
+            scalar_high=None,
+        ),
+        "poly-2": Market(
+            id="poly-2",
+            condition_id="poly-2",
+            platform=Platform.POLYMARKET,
+            title="Poly 2",
+            category="sports",
+            tags=[],
+            market_type=MarketType.BINARY,
+            volume=90.0,
+            close_time=now_ts + 86400,
+            resolved=False,
+            resolution=None,
+            scalar_low=None,
+            scalar_high=None,
+        ),
+    }
+    calls = {"bulk": 0}
+
+    class FakeParquet:
+        def __init__(self, *args, **kwargs):
+            return
+
+        def is_available(self):
+            return True
+
+        def get_markets(self, *args, **kwargs):  # noqa: ARG002
+            raise AssertionError("Streaming broad subscription should not use capped get_markets() discovery")
+
+        def get_markets_by_ids(self, market_ids, platform="all"):  # noqa: ARG002
+            raise AssertionError("Bulk metadata loader should be preferred for this path")
+
+        def get_markets_by_ids_bulk(self, market_ids, platform="all"):  # noqa: ARG002
+            calls["bulk"] += 1
+            return [markets[mid] for mid in market_ids if mid in markets]
+
+    class FakeIndex:
+        def get_market_rows(self, platform="all", start_ts=None, end_ts=None):  # noqa: ARG002
+            return [
+                ("poly-1", "polymarket", 5, now_ts + 60, now_ts + 120),
+                ("poly-2", "polymarket", 4, now_ts + 60, now_ts + 120),
+            ]
+
+        def stream_market_history(self, market_id, platform, start_ts, end_ts):  # noqa: ARG002
+            yield PricePoint(timestamp=now_ts + 60, yes_price=0.55, no_price=0.45, volume=10.0)
+
+        def stream_market_history_resampled(self, market_id, platform, start_ts, end_ts, bar_seconds):  # noqa: ARG002
+            yield from self.stream_market_history(market_id, platform, start_ts, end_ts)
+
+        def get_latest_price_before(self, market_id, platform, ts):  # noqa: ARG002
+            return 0.50
+
+    class Strategy(BaseStrategy):
+        def on_start(self):
+            self.subscribe(platform="polymarket")
+
+        def on_market_data(self, market, price, orderbook):  # noqa: ARG002
+            return
+
+    monkeypatch.setattr("agenttrader.data.parquet_adapter.ParquetDataAdapter", FakeParquet)
+    engine = BacktestEngine(data_source=None)
+    index = FakeIndex()
+    result = engine._run_streaming(
+        Strategy,
+        BacktestConfig(
+            strategy_path="test",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            initial_cash=1000.0,
+            execution_mode=ExecutionMode.SYNTHETIC_EXECUTION_MODEL,
+        ),
+        index,
+    )
+
+    assert result["ok"] is True
+    assert result["markets_tested"] == 2
+    assert calls["bulk"] == 1
+
+
 def test_streaming_backtest_broad_all_subscription_uses_full_candidate_set(monkeypatch):
     now_ts = int(datetime(2024, 1, 1, tzinfo=UTC).timestamp())
     markets = {
@@ -523,6 +619,102 @@ def test_streaming_backtest_broad_category_and_tags_subscription_uses_candidate_
     assert result["ok"] is True
     assert result["markets_tested"] == 1
     assert requested_chunks
+
+
+def test_streaming_backtest_skips_warmup_queries_when_start_is_at_earliest_candidate_timestamp(monkeypatch):
+    now_ts = int(datetime(2024, 1, 1, tzinfo=UTC).timestamp())
+    markets = {
+        "poly-1": Market(
+            id="poly-1",
+            condition_id="poly-1",
+            platform=Platform.POLYMARKET,
+            title="Poly 1",
+            category="politics",
+            tags=[],
+            market_type=MarketType.BINARY,
+            volume=100.0,
+            close_time=now_ts + 86400,
+            resolved=False,
+            resolution=None,
+            scalar_low=None,
+            scalar_high=None,
+        ),
+        "poly-2": Market(
+            id="poly-2",
+            condition_id="poly-2",
+            platform=Platform.POLYMARKET,
+            title="Poly 2",
+            category="politics",
+            tags=[],
+            market_type=MarketType.BINARY,
+            volume=90.0,
+            close_time=now_ts + 86400,
+            resolved=False,
+            resolution=None,
+            scalar_low=None,
+            scalar_high=None,
+        ),
+    }
+
+    class FakeParquet:
+        def __init__(self, *args, **kwargs):
+            return
+
+        def is_available(self):
+            return True
+
+        def get_markets(self, *args, **kwargs):  # noqa: ARG002
+            raise AssertionError("Streaming broad subscription should not use capped get_markets() discovery")
+
+        def get_markets_by_ids(self, market_ids, platform="all"):  # noqa: ARG002
+            return [markets[mid] for mid in market_ids if mid in markets]
+
+    class FakeIndex:
+        def __init__(self):
+            self.warmup_calls = 0
+
+        def get_market_rows(self, platform="all", start_ts=None, end_ts=None):  # noqa: ARG002
+            return [
+                ("poly-1", "polymarket", 5, now_ts + 60, now_ts + 180),
+                ("poly-2", "polymarket", 4, now_ts + 120, now_ts + 180),
+            ]
+
+        def get_latest_prices_before_batch(self, market_ids, platform, ts):  # noqa: ARG002
+            self.warmup_calls += 1
+            raise AssertionError("Warmup should be skipped when no prior data can exist")
+
+        def stream_market_history_batch(self, market_ids, platform, start_ts, end_ts):  # noqa: ARG002
+            for market_id in market_ids:
+                yield (market_id, PricePoint(timestamp=now_ts + 60, yes_price=0.55, no_price=0.45, volume=10.0))
+
+        def stream_market_history_resampled_batch(self, market_ids, platform, start_ts, end_ts, bar_seconds):  # noqa: ARG002
+            yield from self.stream_market_history_batch(market_ids, platform, start_ts, end_ts)
+
+    class Strategy(BaseStrategy):
+        def on_start(self):
+            self.subscribe(platform="polymarket")
+
+        def on_market_data(self, market, price, orderbook):  # noqa: ARG002
+            return
+
+    monkeypatch.setattr("agenttrader.data.parquet_adapter.ParquetDataAdapter", FakeParquet)
+    engine = BacktestEngine(data_source=None)
+    index = FakeIndex()
+    result = engine._run_streaming(
+        Strategy,
+        BacktestConfig(
+            strategy_path="test",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            initial_cash=1000.0,
+            execution_mode=ExecutionMode.SYNTHETIC_EXECUTION_MODEL,
+        ),
+        index,
+    )
+
+    assert result["ok"] is True
+    assert result["markets_tested"] == 2
+    assert index.warmup_calls == 0
 
 
 def test_legacy_backtest_hydrates_missing_exact_id_metadata(monkeypatch):
