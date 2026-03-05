@@ -41,3 +41,7 @@ test_results*.txt
 !README.md
 !COMMANDS.md
 !SCHEMA.md
+
+# Allow markdown files inside planning folder
+!.planning/
+!.planning/*.md
