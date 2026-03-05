@@ -42,6 +42,6 @@ test_results*.txt
 !COMMANDS.md
 !SCHEMA.md
 
-# Allow markdown files inside planning folder
+# Allow everything inside .planning
 !.planning/
-!.planning/*.md
+!.planning/**
