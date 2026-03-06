@@ -638,8 +638,6 @@ class BacktestEngine:
         index,
         progress_callback: BacktestProgressCallback | None = None,
     ) -> dict:
-        from agenttrader.data.parquet_adapter import ParquetDataAdapter
-
         start_dt = datetime.strptime(config.start_date, "%Y-%m-%d").replace(tzinfo=UTC)
         end_dt = datetime.strptime(config.end_date, "%Y-%m-%d").replace(tzinfo=UTC) + timedelta(days=1) - timedelta(seconds=1)
         start_ts = int(start_dt.timestamp())
@@ -670,25 +668,30 @@ class BacktestEngine:
                 "message": "No normalized data available for the requested date range. Run dataset build-index or adjust dates.",
             }
 
-        parquet = ParquetDataAdapter()
-        if not parquet.is_available():
-            return {
-                "ok": False,
-                "error": "DatasetNotFound",
-                "message": "Parquet metadata unavailable. Run: agenttrader dataset download",
-            }
+        metadata_source = index
+        if not hasattr(metadata_source, "get_markets_by_ids") or not getattr(metadata_source, "has_market_catalog", lambda: False)():
+            from agenttrader.data.parquet_adapter import ParquetDataAdapter
+
+            parquet = ParquetDataAdapter()
+            if not parquet.is_available():
+                return {
+                    "ok": False,
+                    "error": "DatasetNotFound",
+                    "message": "Index metadata unavailable. Rebuild the index or run: agenttrader dataset download",
+                }
+            metadata_source = parquet
 
         counts = {str(market_id): int(count) for market_id, _platform, count in candidate_rows}
         collector = SubscriptionCollector({})
         probe = strategy_class(collector)
         probe.on_start()
         final_ids, market_map, candidate_platform_by_id = self._resolve_streaming_subscription_ids(
-            parquet,
+            metadata_source,
             candidate_rows,
             collector,
         )
         market_map = self._hydrate_market_map_for_ids(
-            parquet,
+            metadata_source,
             market_map,
             final_ids,
             platform_hints=candidate_platform_by_id,

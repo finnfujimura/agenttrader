@@ -8,16 +8,15 @@ import click
 import duckdb
 
 from agenttrader.config import BACKTEST_INDEX_PATH, SHARED_DATA_DIR, ensure_data_root
+from agenttrader.data.parquet_discovery import discover_parquet_file_strings
 
 INDEX_PATH = BACKTEST_INDEX_PATH
 DATA_DIR = SHARED_DATA_DIR
 
 
 def _safe_parquet_list(directory: Path) -> list[str]:
-    """Return sorted parquet paths recursively, excluding AppleDouble (._*) files."""
-    if not directory.exists():
-        return []
-    return sorted(str(f) for f in directory.rglob("*.parquet") if not f.name.startswith("._"))
+    """Return sorted parquet paths recursively, excluding hidden sidecars."""
+    return discover_parquet_file_strings(directory)
 
 
 def _resolve_data_dir(data_dir: Path | None) -> Path:
@@ -227,6 +226,158 @@ def _build_metadata_table(conn: duckdb.DuckDBPyConnection, stats: dict) -> None:
     click.echo(f"  Metadata: {market_count:,} markets indexed (total: {time.time() - t0:.1f}s)")
 
 
+def _build_market_catalog(conn: duckdb.DuckDBPyConnection, data_dir: Path, stats: dict) -> None:
+    click.echo("  Catalog: building market catalog...")
+    t0 = time.time()
+
+    poly_markets = _safe_parquet_list(data_dir / "polymarket" / "markets")
+    if poly_markets:
+        conn.execute(f"CREATE OR REPLACE VIEW raw_poly_markets AS SELECT * FROM {_parquet_read_expr(poly_markets)}")
+    kalshi_markets = _safe_parquet_list(data_dir / "kalshi" / "markets")
+    if kalshi_markets:
+        conn.execute(f"CREATE OR REPLACE VIEW raw_kalshi_markets AS SELECT * FROM {_parquet_read_expr(kalshi_markets)}")
+
+    conn.execute(
+        """
+        CREATE OR REPLACE TABLE market_catalog (
+            market_id TEXT,
+            condition_id TEXT,
+            platform TEXT,
+            title TEXT,
+            category TEXT,
+            tags_json TEXT,
+            market_type TEXT,
+            volume DOUBLE,
+            close_time BIGINT,
+            resolved BOOLEAN,
+            resolution TEXT,
+            scalar_low DOUBLE,
+            scalar_high DOUBLE
+        )
+        """
+    )
+
+    if poly_markets:
+        conn.execute(
+            """
+            INSERT INTO market_catalog
+            WITH ranked AS (
+                SELECT
+                    json_extract_string(clob_token_ids, '$[0]') AS market_id,
+                    condition_id,
+                    question AS title,
+                    slug,
+                    volume,
+                    closed,
+                    end_date,
+                    json_extract_string(outcome_prices, '$[0]') AS yes_price_str,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY json_extract_string(clob_token_ids, '$[0]')
+                        ORDER BY _fetched_at DESC NULLS LAST, volume DESC NULLS LAST
+                    ) AS rn
+                FROM raw_poly_markets
+                WHERE json_extract_string(clob_token_ids, '$[0]') IS NOT NULL
+            )
+            SELECT
+                market_id,
+                COALESCE(condition_id, market_id) AS condition_id,
+                'polymarket' AS platform,
+                COALESCE(title, '') AS title,
+                CASE
+                    WHEN LOWER(COALESCE(slug, title, '')) LIKE '%election%'
+                      OR LOWER(COALESCE(slug, title, '')) LIKE '%politics%'
+                      OR LOWER(COALESCE(slug, title, '')) LIKE '%presidential%' THEN 'politics'
+                    WHEN LOWER(COALESCE(slug, title, '')) LIKE '%bitcoin%'
+                      OR LOWER(COALESCE(slug, title, '')) LIKE '%btc%'
+                      OR LOWER(COALESCE(slug, title, '')) LIKE '%ethereum%'
+                      OR LOWER(COALESCE(slug, title, '')) LIKE '%eth%'
+                      OR LOWER(COALESCE(slug, title, '')) LIKE '%solana%'
+                      OR LOWER(COALESCE(slug, title, '')) LIKE '%crypto%' THEN 'crypto'
+                    WHEN LOWER(COALESCE(slug, title, '')) LIKE '%sports%'
+                      OR LOWER(COALESCE(slug, title, '')) LIKE '%nba%'
+                      OR LOWER(COALESCE(slug, title, '')) LIKE '%nfl%'
+                      OR LOWER(COALESCE(slug, title, '')) LIKE '%mlb%'
+                      OR LOWER(COALESCE(slug, title, '')) LIKE '%soccer%' THEN 'sports'
+                    ELSE 'other'
+                END AS category,
+                '[]' AS tags_json,
+                'binary' AS market_type,
+                CAST(volume AS DOUBLE) AS volume,
+                CASE
+                    WHEN TRY_CAST(end_date AS BIGINT) IS NOT NULL THEN TRY_CAST(end_date AS BIGINT)
+                    WHEN TRY_CAST(end_date AS TIMESTAMP) IS NOT NULL THEN CAST(EPOCH(TRY_CAST(end_date AS TIMESTAMP)) AS BIGINT)
+                    ELSE 0
+                END AS close_time,
+                CAST(closed AS BOOLEAN) AS resolved,
+                CASE
+                    WHEN CAST(closed AS BOOLEAN) = FALSE THEN NULL
+                    WHEN TRY_CAST(yes_price_str AS DOUBLE) >= 0.999 THEN 'yes'
+                    WHEN TRY_CAST(yes_price_str AS DOUBLE) <= 0.001 THEN 'no'
+                    ELSE NULL
+                END AS resolution,
+                NULL AS scalar_low,
+                NULL AS scalar_high
+            FROM ranked
+            WHERE rn = 1
+            """
+        )
+
+    if kalshi_markets:
+        conn.execute(
+            """
+            INSERT INTO market_catalog
+            WITH ranked AS (
+                SELECT
+                    ticker,
+                    event_ticker,
+                    title,
+                    market_type,
+                    status,
+                    volume,
+                    close_time,
+                    result,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ticker
+                        ORDER BY _fetched_at DESC NULLS LAST, volume DESC NULLS LAST
+                    ) AS rn
+                FROM raw_kalshi_markets
+                WHERE ticker IS NOT NULL
+            )
+            SELECT
+                ticker AS market_id,
+                COALESCE(event_ticker, ticker) AS condition_id,
+                'kalshi' AS platform,
+                COALESCE(title, ticker) AS title,
+                COALESCE(LOWER(REGEXP_EXTRACT(event_ticker, '^([A-Z]+)', 1)), 'other') AS category,
+                '[]' AS tags_json,
+                CASE
+                    WHEN LOWER(COALESCE(market_type, '')) = 'scalar' THEN 'scalar'
+                    WHEN LOWER(COALESCE(market_type, '')) = 'categorical' THEN 'categorical'
+                    ELSE 'binary'
+                END AS market_type,
+                CAST(volume AS DOUBLE) / 100.0 AS volume,
+                CASE
+                    WHEN TRY_CAST(close_time AS BIGINT) IS NOT NULL THEN TRY_CAST(close_time AS BIGINT)
+                    WHEN TRY_CAST(close_time AS TIMESTAMP) IS NOT NULL THEN CAST(EPOCH(TRY_CAST(close_time AS TIMESTAMP)) AS BIGINT)
+                    ELSE 0
+                END AS close_time,
+                LOWER(COALESCE(status, '')) = 'finalized' AS resolved,
+                NULLIF(LOWER(TRIM(COALESCE(result, ''))), '') AS resolution,
+                NULL AS scalar_low,
+                NULL AS scalar_high
+            FROM ranked
+            WHERE rn = 1
+            """
+        )
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_catalog_market_platform ON market_catalog(market_id, platform)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_catalog_condition_id ON market_catalog(condition_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_catalog_platform_category ON market_catalog(platform, category)")
+    catalog_count = conn.execute("SELECT COUNT(*) FROM market_catalog").fetchone()[0]
+    stats["catalog_markets"] = int(catalog_count)
+    click.echo(f"  Catalog: {catalog_count:,} markets cataloged ({time.time() - t0:.1f}s)")
+
+
 def build_index(force: bool = False, data_dir: Path | None = None, index_path: Path | None = None) -> dict:
     data_dir = _resolve_data_dir(data_dir)
     index_path = index_path or INDEX_PATH
@@ -279,6 +430,7 @@ def build_index(force: bool = False, data_dir: Path | None = None, index_path: P
         _build_polymarket_normalized(conn, data_dir, stats)
         _build_kalshi_normalized(conn, data_dir, stats)
         _build_metadata_table(conn, stats)
+        _build_market_catalog(conn, data_dir, stats)
     except Exception:
         conn.close()
         index_path.unlink(missing_ok=True)

@@ -13,7 +13,7 @@ from rich.table import Table
 from agenttrader.cli.utils import emit_json, ensure_initialized, json_errors
 from agenttrader.data.cache import DataCache
 from agenttrader.data.models import Market
-from agenttrader.data.parquet_adapter import ParquetDataAdapter
+from agenttrader.data.source_selector import get_best_data_source
 from agenttrader.db import get_engine
 from agenttrader.errors import AgentTraderError, MarketNotCachedError
 
@@ -50,7 +50,7 @@ def markets_list(platform: str, category: str | None, tags: str | None, min_volu
     ensure_initialized()
     source_name, source = _get_market_source()
     tag_list = [t.strip() for t in tags.split(",")] if tags else None
-    if source_name == "parquet":
+    if source_name in {"normalized-index", "raw-parquet"}:
         markets = source.get_markets(
             platform=platform,
             category=category,
@@ -98,14 +98,16 @@ def markets_list(platform: str, category: str | None, tags: str | None, min_volu
     table.add_column("Price")
     table.add_column("Volume")
 
-    if source_name == "parquet":
+    if source_name == "normalized-index":
+        click.echo("Data source: DuckDB backtest index -- normalized historical dataset")
+    elif source_name == "raw-parquet":
         click.echo("Data source: Jon Becker dataset (parquet) -- 2021-present")
     else:
         click.echo("Data source: local sync cache (SQLite) -- run 'agenttrader dataset download' for full history")
 
     now = int(time.time())
     for m in markets:
-        if source_name == "parquet":
+        if source_name in {"normalized-index", "raw-parquet"}:
             points = source.get_price_history(m.id, m.platform, now - 7 * 86400, now)
             latest = points[-1] if points else None
         else:
@@ -281,7 +283,7 @@ def _compute_market_metrics(market_id: str, cache: DataCache) -> dict:
     }
 
 
-def _compute_market_metrics_parquet(market: Market, adapter: ParquetDataAdapter) -> dict:
+def _compute_market_metrics_dataset(market: Market, adapter) -> dict:
     now = int(time.time())
     history_7d = adapter.get_price_history(market.id, market.platform, now - 7 * 86400, now)
     history_24h = adapter.get_price_history(market.id, market.platform, now - 86400, now)
@@ -299,10 +301,8 @@ def _compute_market_metrics_parquet(market: Market, adapter: ParquetDataAdapter)
 
 
 def _get_market_source() -> tuple[str, object]:
-    adapter = ParquetDataAdapter()
-    if adapter.is_available():
-        return "parquet", adapter
-    return "sqlite", DataCache(get_engine())
+    source, source_name = get_best_data_source()
+    return source_name, source
 
 
 @markets_group.command("screen")
@@ -328,16 +328,16 @@ def markets_screen(
     source_name, source = _get_market_source()
     now = int(time.time())
 
-    if source_name == "parquet":
+    if source_name in {"normalized-index", "raw-parquet"}:
         markets = source.get_markets(platform=platform, category=category, min_volume=min_volume, limit=5000)
     else:
         markets = source.get_markets(platform=platform, category=category, min_volume=min_volume, limit=5000)
     matches = []
 
     for market in markets:
-        if source_name == "parquet":
+        if source_name in {"normalized-index", "raw-parquet"}:
             history = source.get_price_history(market.id, market.platform, now - max(min_history_days, 1) * 86400, now)
-            metrics = _compute_market_metrics_parquet(market, source)
+            metrics = _compute_market_metrics_dataset(market, source)
         else:
             history = source.get_price_history(market.id, now - max(min_history_days, 1) * 86400, now)
             metrics = _compute_market_metrics(market.id, source)

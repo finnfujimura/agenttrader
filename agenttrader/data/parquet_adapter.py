@@ -12,6 +12,7 @@ except ImportError:  # pragma: no cover
     duckdb = None
 
 from agenttrader.config import SHARED_DATA_DIR
+from agenttrader.data.parquet_discovery import discover_parquet_file_strings
 from agenttrader.data.models import DataProvenance, Market, MarketType, Platform, PricePoint
 
 
@@ -43,12 +44,8 @@ for _kw, _cat in _POLY_SLUG_CATEGORY.items():
 
 
 def _safe_parquet_glob(directory: str) -> list[str]:
-    """Return sorted parquet files excluding AppleDouble metadata files."""
-    path = Path(directory)
-    if not path.exists():
-        return []
-    files = [str(f) for f in path.glob("*.parquet") if not f.name.startswith("._")]
-    return sorted(files)
+    """Return sorted parquet files recursively, excluding hidden sidecars."""
+    return discover_parquet_file_strings(Path(directory))
 
 
 class ParquetDataAdapter:
@@ -683,3 +680,8 @@ class ParquetDataAdapter:
     def _require_conn(self) -> None:
         if self._conn is None:
             raise RuntimeError("duckdb is not installed. Install with: pip install duckdb")
+
+    def close(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None

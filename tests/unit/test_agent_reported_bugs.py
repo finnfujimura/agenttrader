@@ -58,19 +58,22 @@ def _make_market(mid="m1", platform=Platform.POLYMARKET, category="crypto"):
 # ---------------------------------------------------------------------------
 
 
-def test_index_provider_forwards_category():
-    """IndexProvider.get_markets(category=X) must forward category to parquet adapter."""
+def test_index_provider_forwards_category_to_index():
+    """IndexProvider.get_markets(category=X) should use the normalized index when available."""
     from agenttrader.data.index_provider import IndexProvider
 
     provider = IndexProvider.__new__(IndexProvider)
+    provider._index = MagicMock()
+    provider._index.is_available.return_value = True
+    provider._index.get_markets.return_value = []
     provider._parquet = MagicMock()
-    provider._parquet.get_markets.return_value = []
 
     provider.get_markets(platform="polymarket", category="crypto", limit=50)
 
-    provider._parquet.get_markets.assert_called_once_with(
+    provider._index.get_markets.assert_called_once_with(
         platform="polymarket", category="crypto", limit=50
     )
+    provider._parquet.get_markets.assert_not_called()
 
 
 def test_polymarket_category_inference_does_not_treat_generic_will_as_politics():

@@ -13,14 +13,16 @@ import click
 
 from agenttrader.config import BACKTEST_INDEX_PATH, SHARED_DATA_DIR, ensure_app_dir, ensure_data_root
 from agenttrader.cli.utils import json_errors
+from agenttrader.data.parquet_discovery import discover_parquet_files
 
 
 DATA_DIR = SHARED_DATA_DIR
 DOWNLOAD_URL = "https://s3.jbecker.dev/data.tar.zst"
 DOWNLOAD_USER_AGENT = "agenttrader/0.3.4 (+https://github.com/finnfujimura/agenttrader)"
 
-
-def _resolve_verify_data_dir() -> Path:
+def _resolve_dataset_dir(explicit_dir: Path | None = None) -> Path:
+    if explicit_dir is not None:
+        return explicit_dir
     local_data_dir = Path.cwd() / "data"
     if local_data_dir.exists():
         return local_data_dir
@@ -224,16 +226,17 @@ def dataset_download_cmd() -> None:
 
 
 @dataset_group.command("verify")
+@click.option("--data-dir", type=click.Path(path_type=Path, file_okay=False, dir_okay=True), default=None)
 @json_errors
-def dataset_verify_cmd() -> None:
+def dataset_verify_cmd(data_dir: Path | None) -> None:
     """Verify expected parquet dataset folders are present."""
-    data_dir = _resolve_verify_data_dir()
-    click.echo(f"Using dataset path: {_pretty_path(data_dir)}")
+    resolved_data_dir = _resolve_dataset_dir(data_dir)
+    click.echo(f"Using dataset path: {_pretty_path(resolved_data_dir)}")
 
-    expected = _expected_dataset_dirs(data_dir)
+    expected = _expected_dataset_dirs(resolved_data_dir)
     all_ok = True
     for path in expected:
-        files = list(path.rglob("*.parquet")) if path.exists() else []
+        files = discover_parquet_files(path)
         status = "OK" if files else "MISSING"
         click.echo(f"  {status}  {_pretty_path(path)} ({len(files)} parquet files)")
         if not files:
@@ -246,9 +249,10 @@ def dataset_verify_cmd() -> None:
 
 @dataset_group.command("build-index")
 @click.option("--force", is_flag=True, default=False, help="Rebuild index even if it already exists")
+@click.option("--data-dir", type=click.Path(path_type=Path, file_okay=False, dir_okay=True), default=None)
 @click.option("--json", "json_output", is_flag=True, default=False)
 @json_errors
-def build_index_cmd(force: bool, json_output: bool) -> None:
+def build_index_cmd(force: bool, data_dir: Path | None, json_output: bool) -> None:
     """
     One-time normalization of raw parquet files into a fast DuckDB index.
     Run once after 'agenttrader dataset download'.
@@ -256,7 +260,7 @@ def build_index_cmd(force: bool, json_output: bool) -> None:
     """
     from agenttrader.data.index_builder import build_index
 
-    result = build_index(force=force)
+    result = build_index(force=force, data_dir=_resolve_dataset_dir(data_dir))
     if json_output:
         click.echo(json.dumps(result, default=str))
         return

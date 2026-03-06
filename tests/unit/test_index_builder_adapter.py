@@ -129,6 +129,14 @@ def test_build_index_and_streaming_adapter(tmp_path: Path):
 
     adapter = BacktestIndexAdapter(index_path=index_path)
     assert adapter.is_available() is True
+    assert adapter.is_available(require_market_catalog=True) is True
+
+    markets = adapter.get_markets(platform="all", limit=10)
+    assert len(markets) == 2
+    assert {market.platform.value for market in markets} == {"polymarket", "kalshi"}
+
+    matched = adapter.get_markets_by_ids(["yes-token-1", "KXBTC-24JAN01-T50000"], platform="all")
+    assert {market.id for market in matched} == {"yes-token-1", "KXBTC-24JAN01-T50000"}
 
     ids = adapter.get_market_ids(platform="polymarket", start_ts=1700000000, end_ts=1710000000)
     assert len(ids) > 0
@@ -139,6 +147,9 @@ def test_build_index_and_streaming_adapter(tmp_path: Path):
     assert len(points) > 0
     assert [p.timestamp for p in points] == sorted(p.timestamp for p in points)
     assert all(0.0 <= p.yes_price <= 1.0 for p in points)
+
+    point_list = adapter.get_price_history(market_id, platform, 1700000000, 1710000000)
+    assert len(point_list) == len(points)
 
     bars = list(adapter.stream_market_history_resampled(market_id, platform, 1700000000, 1710000000, 3600))
     assert len(bars) > 0

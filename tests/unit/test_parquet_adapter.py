@@ -171,6 +171,29 @@ def test_parquet_adapter_ignores_appledouble_files(tmp_path):
     assert len(markets) > 0
 
 
+def test_parquet_adapter_discovers_recursive_partitioned_files(tmp_path):
+    _write_parquet_dataset(tmp_path)
+
+    paths = [
+        tmp_path / "polymarket" / "markets" / "part-000.parquet",
+        tmp_path / "polymarket" / "trades" / "part-000.parquet",
+        tmp_path / "polymarket" / "blocks" / "part-000.parquet",
+        tmp_path / "kalshi" / "markets" / "part-000.parquet",
+        tmp_path / "kalshi" / "trades" / "part-000.parquet",
+    ]
+    for src in paths:
+        nested = src.parent / "year=2024" / "month=01"
+        nested.mkdir(parents=True, exist_ok=True)
+        src.rename(nested / src.name)
+
+    adapter = ParquetDataAdapter(data_dir=tmp_path)
+    markets = adapter.get_markets(platform="all", limit=10)
+    ids = {market.id for market in markets}
+
+    assert "yes-token-1" in ids
+    assert "KXBTC-24JAN01-T50000" in ids
+
+
 def test_parquet_get_markets_by_ids_bulk_fast_path(tmp_path, monkeypatch):
     _write_parquet_dataset(tmp_path)
     adapter = ParquetDataAdapter(data_dir=tmp_path)

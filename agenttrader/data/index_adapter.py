@@ -1,12 +1,13 @@
 # DO NOT import pmxt here. Use agenttrader.data.pmxt_client only.
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import duckdb
 
 from agenttrader.config import BACKTEST_INDEX_PATH
-from agenttrader.data.models import PricePoint
+from agenttrader.data.models import Market, MarketType, Platform, PricePoint
 
 INDEX_PATH = BACKTEST_INDEX_PATH
 
@@ -24,15 +25,197 @@ class BacktestIndexAdapter:
         else:
             self._conn = None
 
-    def is_available(self) -> bool:
+    def _has_tables(self, *table_names: str) -> bool:
         if self._conn is None:
             return False
         try:
-            self._conn.execute("SELECT 1 FROM normalized_trades LIMIT 1")
-            self._conn.execute("SELECT 1 FROM market_metadata LIMIT 1")
+            for table_name in table_names:
+                self._conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1")
             return True
         except Exception:
             return False
+
+    def is_available(self, require_market_catalog: bool = False) -> bool:
+        required = ["normalized_trades", "market_metadata"]
+        if require_market_catalog:
+            required.append("market_catalog")
+        return self._has_tables(*required)
+
+    def has_market_catalog(self) -> bool:
+        return self._has_tables("market_catalog")
+
+    def _market_from_row(self, row) -> Market:
+        (
+            market_id,
+            condition_id,
+            platform,
+            title,
+            category,
+            tags_json,
+            market_type,
+            volume,
+            close_time,
+            resolved,
+            resolution,
+            scalar_low,
+            scalar_high,
+        ) = row
+        try:
+            tags = list(json.loads(tags_json or "[]"))
+        except (TypeError, json.JSONDecodeError):
+            tags = []
+        normalized_platform = Platform(str(platform))
+        market_type_value = str(market_type or "binary").lower()
+        if market_type_value == "scalar":
+            normalized_market_type = MarketType.SCALAR
+        elif market_type_value == "categorical":
+            normalized_market_type = MarketType.CATEGORICAL
+        else:
+            normalized_market_type = MarketType.BINARY
+        return Market(
+            id=str(market_id),
+            condition_id=str(condition_id or market_id),
+            platform=normalized_platform,
+            title=str(title or ""),
+            category=str(category or "other"),
+            tags=[str(tag) for tag in tags],
+            market_type=normalized_market_type,
+            volume=float(volume or 0.0),
+            close_time=int(close_time or 0),
+            resolved=bool(resolved),
+            resolution=str(resolution) if resolution is not None else None,
+            scalar_low=float(scalar_low) if scalar_low is not None else None,
+            scalar_high=float(scalar_high) if scalar_high is not None else None,
+        )
+
+    @staticmethod
+    def _platform_value(platform: str | Platform) -> str:
+        if isinstance(platform, Platform):
+            return platform.value
+        return str(platform)
+
+    def get_markets(
+        self,
+        platform: str = "all",
+        category: str | None = None,
+        active_only: bool = False,
+        resolved_only: bool = False,
+        min_volume: float | None = None,
+        limit: int = 100,
+    ) -> list[Market]:
+        if self._conn is None or not self.has_market_catalog():
+            return []
+
+        conditions: list[str] = []
+        params: list[object] = []
+        if platform != "all":
+            conditions.append("platform = ?")
+            params.append(str(platform))
+        if category:
+            conditions.append("LOWER(category) = ?")
+            params.append(str(category).lower())
+        if active_only:
+            conditions.append("resolved = FALSE")
+        if resolved_only:
+            conditions.append("resolved = TRUE")
+        if min_volume is not None:
+            conditions.append("volume >= ?")
+            params.append(float(min_volume))
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        params.append(int(limit))
+        rows = self._conn.execute(
+            f"""
+            SELECT
+                market_id,
+                condition_id,
+                platform,
+                title,
+                category,
+                tags_json,
+                market_type,
+                volume,
+                close_time,
+                resolved,
+                resolution,
+                scalar_low,
+                scalar_high
+            FROM market_catalog
+            {where}
+            ORDER BY volume DESC, market_id ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [self._market_from_row(row) for row in rows]
+
+    def get_markets_by_ids(self, market_ids: list[str], platform: str = "all") -> list[Market]:
+        if self._conn is None or not self.has_market_catalog() or not market_ids:
+            return []
+        placeholders = ", ".join("?" for _ in market_ids)
+        conditions = [f"(market_id IN ({placeholders}) OR condition_id IN ({placeholders}))"]
+        params: list[object] = [*market_ids, *market_ids]
+        if platform != "all":
+            conditions.append("platform = ?")
+            params.append(str(platform))
+        rows = self._conn.execute(
+            f"""
+            SELECT
+                market_id,
+                condition_id,
+                platform,
+                title,
+                category,
+                tags_json,
+                market_type,
+                volume,
+                close_time,
+                resolved,
+                resolution,
+                scalar_low,
+                scalar_high
+            FROM market_catalog
+            WHERE {' AND '.join(conditions)}
+            """,
+            params,
+        ).fetchall()
+        return [self._market_from_row(row) for row in rows]
+
+    def get_markets_by_ids_bulk(self, market_ids: list[str], platform: str = "all") -> list[Market]:
+        return self.get_markets_by_ids(market_ids=market_ids, platform=platform)
+
+    def get_price_history(
+        self,
+        market_id: str,
+        platform: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> list[PricePoint]:
+        return list(self.stream_market_history(market_id, platform, start_ts, end_ts))
+
+    def get_latest_price(self, market_id: str, platform: str) -> PricePoint | None:
+        if self._conn is None:
+            return None
+        row = self._conn.execute(
+            """
+            SELECT ts, yes_price, volume
+            FROM normalized_trades
+            WHERE market_id = ?
+              AND platform = ?
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            [market_id, self._platform_value(platform)],
+        ).fetchone()
+        if row is None:
+            return None
+        ts, yes_price, volume = row
+        return PricePoint(
+            timestamp=int(ts),
+            yes_price=float(yes_price),
+            no_price=round(1.0 - float(yes_price), 6),
+            volume=float(volume or 0.0),
+        )
 
     def get_market_ids(self, platform: str = "all", start_ts: int | None = None, end_ts: int | None = None) -> list[tuple[str, str]]:
         rows = self.get_market_ids_with_counts(platform=platform, start_ts=start_ts, end_ts=end_ts)
@@ -117,7 +300,7 @@ class BacktestIndexAdapter:
               AND ts BETWEEN ? AND ?
             ORDER BY ts ASC
             """,
-            [market_id, platform, int(start_ts), int(end_ts)],
+            [market_id, self._platform_value(platform), int(start_ts), int(end_ts)],
         )
         while True:
             batch = result.fetchmany(batch_size)
@@ -142,7 +325,7 @@ class BacktestIndexAdapter:
         if self._conn is None or not market_ids:
             return
         placeholders = ", ".join("?" for _ in market_ids)
-        params = [*market_ids, platform, int(start_ts), int(end_ts)]
+        params = [*market_ids, self._platform_value(platform), int(start_ts), int(end_ts)]
         result = self._conn.execute(
             f"""
             SELECT market_id, ts, yes_price, volume
@@ -190,7 +373,7 @@ class BacktestIndexAdapter:
             GROUP BY bar_ts
             ORDER BY bar_ts ASC
             """,
-            [int(bar_seconds), int(bar_seconds), market_id, platform, int(start_ts), int(end_ts)],
+            [int(bar_seconds), int(bar_seconds), market_id, self._platform_value(platform), int(start_ts), int(end_ts)],
         )
         while True:
             batch = result.fetchmany(batch_size)
@@ -222,7 +405,7 @@ class BacktestIndexAdapter:
             int(bar_seconds),
             int(bar_seconds),
             *market_ids,
-            platform,
+            self._platform_value(platform),
             int(start_ts),
             int(end_ts),
         ]
@@ -269,7 +452,7 @@ class BacktestIndexAdapter:
             ORDER BY ts DESC
             LIMIT 1
             """,
-            [market_id, platform, int(ts)],
+            [market_id, self._platform_value(platform), int(ts)],
         ).fetchone()
         return float(row[0]) if row else None
 
@@ -292,7 +475,7 @@ class BacktestIndexAdapter:
             ) ranked
             WHERE rn = 1
             """,
-            [*market_ids, platform, int(ts)],
+            [*market_ids, self._platform_value(platform), int(ts)],
         ).fetchall()
         return {str(market_id): float(yes_price) for market_id, yes_price in rows}
 
