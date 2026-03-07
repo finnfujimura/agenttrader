@@ -524,9 +524,10 @@ class StreamingBacktestContext(ExecutionContext):
 
     def get_history(self, market_id: str, lookback_hours: int = 24) -> list[PricePoint]:
         cutoff = self._current_ts - int(lookback_hours * 3600)
-        if self._active_market_id is not None and market_id != self._active_market_id:
-            return [p for p in self._history[market_id] if cutoff <= p.timestamp < self._current_ts]
-        return [p for p in self._history[market_id] if cutoff <= p.timestamp <= self._current_ts]
+        ts_upper = self._current_ts if (
+            self._active_market_id is None or market_id == self._active_market_id
+        ) else self._current_ts - 1
+        return [p for p in self._history[market_id] if cutoff <= p.timestamp <= ts_upper]
 
     def get_orderbook(self, market_id: str) -> OrderBook:
         if self._execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
@@ -736,6 +737,295 @@ class StreamingBacktestContext(ExecutionContext):
             "avg_slippage": (sum(self._slippage_samples) / len(self._slippage_samples)) if self._slippage_samples else 0.0,
             "execution_mode": self._execution_mode.value,
         }
+
+    def _synthesize_orderbook(self, price: float, market_id: str) -> OrderBook:
+        from agenttrader.data.models import OrderLevel
+
+        spread = 0.01
+        return OrderBook(
+            market_id=market_id,
+            timestamp=self._current_ts,
+            bids=[OrderLevel(price=max(0.0, price - spread), size=1_000_000.0)],
+            asks=[OrderLevel(price=min(1.0, price + spread), size=1_000_000.0)],
+        )
+
+
+class RustBackedContext(ExecutionContext):
+    """
+    Thin Python wrapper over Rust-owned backtest state (RustBacktestKernel).
+
+    Python drives the event loop and computes fills (via PriceOnlyFillModel).
+    Rust owns cash, positions, history, trades, and equity snapshots.
+    This context is a drop-in replacement for StreamingBacktestContext
+    when config.use_rust=True.
+    """
+
+    def __init__(
+        self,
+        initial_cash: float,
+        market_map: dict[str, Market],
+        fill_model: FillModel,
+        history_buffer_hours: int = 168,
+        execution_mode: ExecutionMode = ExecutionMode.STRICT_PRICE_ONLY,
+    ):
+        from agenttrader_kernel import RustBacktestKernel  # late import; raises ImportError if unavailable
+
+        if execution_mode != ExecutionMode.STRICT_PRICE_ONLY:
+            raise AgentTraderError(
+                "UnsupportedExecutionMode",
+                f"RustBackedContext only supports STRICT_PRICE_ONLY; got {execution_mode.value!r}. "
+                "Set use_rust=False to use other execution modes.",
+            )
+
+        self._kernel = RustBacktestKernel(float(initial_cash), int(history_buffer_hours))
+        self._market_map = dict(market_map)
+        self._fill_model = fill_model
+        self._current_ts = 0
+        self._active_market_id: str | None = None
+        self._execution_mode = execution_mode
+        if execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
+            from agenttrader.core.price_fill_model import PriceOnlyFillModel
+            self._price_fill_model = PriceOnlyFillModel()
+        else:
+            self._price_fill_model = None
+        self._logs: list[dict[str, Any]] = []
+        self._state: dict[str, Any] = {}
+        self._subscriptions: set[str] = set()  # set by engine before strategy runs
+        # Python-side history mirror for fast get_history() reads (no FFI)
+        max_buffer = max(int(history_buffer_hours) * 12, 1)
+        self._history_mirror: dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=max_buffer)
+        )
+
+    # ── Engine-called methods ─────────────────────────────────────────────
+
+    def advance_time(self, ts: int) -> None:
+        if ts < self._current_ts:
+            raise AgentTraderError("TimeOrderViolation", f"Time must advance: {ts} < {self._current_ts}")
+        self._current_ts = ts
+
+    def set_active_market(self, market_id: str | None) -> None:
+        self._active_market_id = market_id
+
+    def set_price_cursor(self, market_id: str, price: float) -> None:
+        self._kernel.set_price_cursor(market_id, float(price), self._current_ts)
+
+    def push_history(self, market_id: str, point: PricePoint) -> None:
+        self._kernel.push_history(
+            market_id,
+            int(point.timestamp),
+            float(point.yes_price),
+            float(point.no_price) if point.no_price is not None else None,
+            float(point.volume) if point.volume is not None else 0.0,
+        )
+        self._history_mirror[market_id].append(point)  # mirror update
+
+    def _push_history_mirror(self, market_id: str, point: "PricePoint") -> None:
+        """Called by the event bridge; not for direct strategy use."""
+        self._history_mirror[market_id].append(point)
+
+    def portfolio_changed_since_last_check(self) -> bool:
+        return self._kernel.portfolio_changed_since_last_check()
+
+    def record_snapshot(self, ts: int | None = None) -> None:
+        if ts is not None:
+            self._current_ts = int(ts)
+        value = self.get_portfolio_value()  # Python computes to preserve look-ahead semantics
+        self._kernel.push_snapshot(self._current_ts, value)
+
+    def settle_positions(self, market_id: str, outcome: str) -> float:
+        market = self._market_map.get(market_id)
+        trade_id = str(uuid.uuid4())
+        pnl = self._kernel.record_settle(
+            market_id,
+            outcome,
+            market.title if market else market_id,
+            trade_id,
+            self._current_ts,
+        )
+        return pnl
+
+    # ── ExecutionContext interface (strategy-called) ───────────────────────
+
+    def subscribe(self, platform="all", category=None, tags=None, market_ids=None) -> None:
+        return None  # no-op: engine resolves subscriptions ahead of runtime
+
+    def search_markets(self, query, platform="all") -> list[Market]:
+        q = str(query or "").lower()
+        return [
+            m
+            for m in self._market_map.values()
+            if q in m.title.lower() and (platform == "all" or m.platform.value == platform)
+        ]
+
+    def get_price(self, market_id: str) -> float:
+        price = self._kernel.get_price(market_id, self._active_market_id, self._current_ts)
+        if price is None:
+            raise MarketNotCachedError(market_id)
+        return price
+
+    def get_orderbook(self, market_id: str) -> OrderBook:
+        if self._execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
+            raise AgentTraderError(
+                "NoObservedOrderbook",
+                f"No observed orderbook data for {market_id}. "
+                "In strict_price_only mode, orderbook access is not available. "
+                "Use execution_mode='synthetic_execution_model' to enable synthetic orderbooks.",
+            )
+        if self._execution_mode == ExecutionMode.OBSERVED_ORDERBOOK:
+            raise AgentTraderError(
+                "NoObservedOrderbook",
+                f"No observed orderbook history for {market_id}. "
+                "Historical orderbook data must be collected via PMXT sync before use.",
+            )
+        price = self._kernel.get_price(market_id, None, self._current_ts) or 0.5
+        return self._synthesize_orderbook(price, market_id)
+
+    def get_history(self, market_id: str, lookback_hours: int = 24) -> list[PricePoint]:
+        cutoff = self._current_ts - int(lookback_hours * 3600)
+        ts_upper = self._current_ts if (
+            self._active_market_id is None or market_id == self._active_market_id
+        ) else self._current_ts - 1
+        return [p for p in self._history_mirror[market_id] if cutoff <= p.timestamp <= ts_upper]
+
+    def get_position(self, market_id: str) -> PositionModel | None:
+        state = self._kernel.get_position_state(market_id)
+        if state is None:
+            return None
+        side, contracts, avg_cost, opened_at = state
+        market = self._market_map.get(market_id)
+        from agenttrader.data.models import Platform as PlatformModel
+        return PositionModel(
+            id=f"rust_{market_id}",
+            market_id=market_id,
+            platform=market.platform if market else PlatformModel.POLYMARKET,
+            side=side,
+            contracts=contracts,
+            avg_cost=avg_cost,
+            opened_at=opened_at,
+        )
+
+    def get_cash(self) -> float:
+        return self._kernel.get_cash()
+
+    def get_portfolio_value(self) -> float:
+        return self._kernel.get_portfolio_value(self._active_market_id, self._current_ts)
+
+    def buy(self, market_id, contracts, side="yes", order_type="market", limit_price=None) -> str:
+        _validate_buy_params(contracts, order_type, limit_price)
+        contracts = float(contracts)
+
+        if self._execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
+            # Use raw cursor (no look-ahead): matches Python's _price_cursors.get(market_id)
+            price = self._kernel.get_price_cursor(market_id)
+            if price is None:
+                raise MarketNotCachedError(market_id)
+            fill = self._price_fill_model.fill_buy(
+                contracts, price,
+                limit_price=limit_price if order_type == "limit" else None,
+            )
+        else:
+            ob = self.get_orderbook(market_id)
+            fill = self._fill_model.simulate_buy(contracts, ob, order_type=order_type, limit_price=limit_price)
+
+        if not fill.filled or fill.contracts <= 0:
+            raise AgentTraderError("OrderNotFilled", f"Buy not filled for market {market_id}")
+
+        market = self._market_map.get(market_id)
+        if market is None:
+            raise MarketNotCachedError(market_id)
+
+        trade_id = str(uuid.uuid4())
+        try:
+            self._kernel.record_buy(
+                market_id, side, fill.contracts, fill.fill_price, fill.slippage,
+                trade_id, market.title, self._current_ts,
+            )
+        except ValueError as exc:
+            raise AgentTraderError("InsufficientCashError", str(exc)) from exc
+
+        return trade_id
+
+    def sell(self, market_id, contracts=None) -> str:
+        pos_state = self._kernel.get_position_state(market_id)
+        if pos_state is None:
+            raise AgentTraderError("NoPositionError", f"No open position for market {market_id}")
+        _, pos_contracts, _, _ = pos_state
+        contracts_to_sell = float(contracts if contracts is not None else pos_contracts)
+        contracts_to_sell = min(contracts_to_sell, pos_contracts)
+        if contracts_to_sell <= 0:
+            raise AgentTraderError("InvalidOrder", "contracts must be > 0")
+
+        if self._execution_mode == ExecutionMode.STRICT_PRICE_ONLY:
+            # Use raw cursor (no look-ahead): matches Python's _price_cursors.get(market_id)
+            price = self._kernel.get_price_cursor(market_id)
+            if price is None:
+                raise MarketNotCachedError(market_id)
+            fill = self._price_fill_model.fill_sell(contracts_to_sell, price)
+        else:
+            ob = self.get_orderbook(market_id)
+            fill = self._fill_model.simulate_sell(contracts_to_sell, ob)
+
+        if not fill.filled:
+            raise AgentTraderError("OrderNotFilled", f"Sell not filled for market {market_id}")
+
+        market = self._market_map.get(market_id)
+        trade_id = str(uuid.uuid4())
+        try:
+            self._kernel.record_sell(
+                market_id, fill.contracts, fill.fill_price, fill.slippage,
+                trade_id, market.title if market else market_id, self._current_ts,
+            )
+        except ValueError as exc:
+            raise AgentTraderError("NoPositionError", str(exc)) from exc
+
+        return trade_id
+
+    def log(self, message: str) -> None:
+        self._logs.append({"timestamp": self._current_ts, "message": message})
+
+    def set_state(self, key: str, value) -> None:
+        self._state[key] = value
+
+    def get_state(self, key: str, default=None):
+        return self._state.get(key, default)
+
+    def compile_results(self) -> dict:
+        equity_curve = [
+            {"timestamp": ts, "value": v}
+            for ts, v in self._kernel.equity_curve()
+        ]
+        trades = []
+        for record in self._kernel.trade_records():
+            tid, mid, mtitle, action, side, cnts, price, slippage, filled_at, pnl, resolved_correctly = record
+            trades.append({
+                "id": tid,
+                "market_id": mid,
+                "market_title": mtitle,
+                "action": action,
+                "side": side,
+                "contracts": cnts,
+                "price": price,
+                "slippage": slippage,
+                "filled_at": filled_at,
+                "pnl": pnl,
+                "resolved_correctly": resolved_correctly,
+            })
+        # Compute avg_slippage from Rust trade records (buy+sell only, not resolution)
+        slippage_vals = [r[7] for r in self._kernel.trade_records() if r[3] in ("buy", "sell")]
+        avg_slippage = sum(slippage_vals) / len(slippage_vals) if slippage_vals else 0.0
+        return {
+            "initial_cash": self._kernel.initial_cash(),
+            "final_value": self._kernel.get_portfolio_value(None, self._current_ts),
+            "equity_curve": equity_curve,
+            "trades": trades,
+            "logs": self._logs,
+            "avg_slippage": avg_slippage,
+            "execution_mode": self._execution_mode.value,
+        }
+
+    def get_market(self, market_id: str) -> Market | None:
+        return self._market_map.get(market_id)
 
     def _synthesize_orderbook(self, price: float, market_id: str) -> OrderBook:
         from agenttrader.data.models import OrderLevel

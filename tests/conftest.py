@@ -60,3 +60,12 @@ def tmp_path() -> Path:
 @pytest.fixture(autouse=True)
 def _stub_pmxt_sidecar_scan(monkeypatch):
     monkeypatch.setattr(mcp_server, "_list_process_command_lines", lambda: [])
+
+
+@pytest.fixture(autouse=True)
+def _clear_backtest_engine_cache():
+    """Clear BacktestEngine class-level market cache between tests to prevent cross-test pollution."""
+    from agenttrader.core.backtest_engine import BacktestEngine
+    BacktestEngine._market_cache.clear()
+    yield
+    BacktestEngine._market_cache.clear()

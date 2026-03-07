@@ -2,6 +2,10 @@
 .DS_Store
 .Rhistory
 
+# Rust build artifacts
+target/
+rust/*/target/
+
 # Python
 __pycache__/
 *.py[cod]
