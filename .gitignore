@@ -35,6 +35,7 @@ test_results*.txt
 
 # Performance / test data
 .pytest_perf_*.jsonl
+benchmarks/runtime/
 
 # Markdown files
 *.md

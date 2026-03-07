@@ -81,3 +81,8 @@ agenttrader = [
   "dashboard/static/*",
   "dashboard/static/**/*",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+  "live: tests that require live PMXT/network-backed data and sidecar availability",
+]

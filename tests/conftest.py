@@ -1,5 +1,6 @@
 import importlib
 import itertools
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -60,3 +61,21 @@ def tmp_path() -> Path:
 @pytest.fixture(autouse=True)
 def _stub_pmxt_sidecar_scan(monkeypatch):
     monkeypatch.setattr(mcp_server, "_list_process_command_lines", lambda: [])
+
+
+def pytest_collection_modifyitems(config, items):
+    run_live = os.getenv("AGENTTRADER_RUN_LIVE_TESTS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if run_live:
+        return
+
+    skip_live = pytest.mark.skip(
+        reason="live tests disabled; set AGENTTRADER_RUN_LIVE_TESTS=1 to enable"
+    )
+    for item in items:
+        if "live" in item.keywords:
+            item.add_marker(skip_live)

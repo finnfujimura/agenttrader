@@ -1,0 +1,430 @@
+{
+  "captured_at_utc": "2026-03-06T07:55:40.781727+00:00",
+  "host": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.14.0 (tags/v3.14.0:ebf955d, Oct  7 2025, 10:15:03) [MSC v.1944 64 bit (AMD64)]",
+    "executable": "C:\\Users\\finnf\\Desktop\\agenttrader-tests\\venv\\Scripts\\python.exe"
+  },
+  "config": {
+    "iterations": 5,
+    "warmups": 1,
+    "backtest_iterations": 1,
+    "backtest_warmups": 0,
+    "backtest_from": "2024-01-01",
+    "backtest_to": "2025-12-31"
+  },
+  "seed_data": {
+    "state_dir": "C:\\Users\\finnf\\Desktop\\agenttrader-tests\\benchmarks\\runtime\\state",
+    "data_root": "C:\\Users\\finnf\\Desktop\\agenttrader-tests\\benchmarks\\runtime\\shared",
+    "polymarket_markets": 96,
+    "kalshi_markets": 24,
+    "total_markets": 120,
+    "points_per_market": 336,
+    "total_price_points": 40320,
+    "seed_start_utc": "2026-02-20T08:00:00+00:00",
+    "seed_end_utc": "2026-03-06T07:00:00+00:00"
+  },
+  "backtest_dataset": {
+    "mode": "real-normalized-index",
+    "data_root": "C:\\Users\\finnf\\.agenttrader",
+    "index_path": "C:\\Users\\finnf\\.agenttrader\\backtest_index.duckdb",
+    "parquet_dir": "C:\\Users\\finnf\\.agenttrader\\data",
+    "from_date": "2024-01-01",
+    "to_date": "2025-12-31",
+    "fidelity": "exact_trade",
+    "strategy": "C:\\Users\\finnf\\Desktop\\agenttrader-tests\\tests\\fixtures\\sample_strategy.py"
+  },
+  "commands": [
+    {
+      "name": "init",
+      "command": "init",
+      "warmup_runs": 1,
+      "iterations": 5,
+      "warmup_ms": [
+        829.432
+      ],
+      "samples_ms": [
+        865.683,
+        845.177,
+        843.566,
+        854.161,
+        846.752
+      ],
+      "stats": {
+        "min_ms": 843.566,
+        "max_ms": 865.683,
+        "mean_ms": 851.068,
+        "median_ms": 846.752,
+        "stdev_ms": 9.121
+      }
+    },
+    {
+      "name": "validate",
+      "command": "validate C:\\Users\\finnf\\Desktop\\agenttrader-tests\\tests\\fixtures\\sample_strategy.py --json",
+      "warmup_runs": 1,
+      "iterations": 5,
+      "warmup_ms": [
+        752.962
+      ],
+      "samples_ms": [
+        748.231,
+        742.414,
+        745.576,
+        749.994,
+        746.29
+      ],
+      "stats": {
+        "min_ms": 742.414,
+        "max_ms": 749.994,
+        "mean_ms": 746.501,
+        "median_ms": 746.29,
+        "stdev_ms": 2.863
+      },
+      "last_payload_keys": [
+        "errors",
+        "ok",
+        "valid",
+        "warnings"
+      ],
+      "payload_summary": {
+        "ok": true,
+        "valid": true
+      }
+    },
+    {
+      "name": "markets_list",
+      "command": "markets list --platform polymarket --limit 100 --json",
+      "warmup_runs": 1,
+      "iterations": 5,
+      "warmup_ms": [
+        803.805
+      ],
+      "samples_ms": [
+        767.832,
+        755.532,
+        784.314,
+        780.979,
+        785.416
+      ],
+      "stats": {
+        "min_ms": 755.532,
+        "max_ms": 785.416,
+        "mean_ms": 774.814,
+        "median_ms": 780.979,
+        "stdev_ms": 12.857
+      },
+      "last_payload_keys": [
+        "count",
+        "data_source",
+        "markets",
+        "ok"
+      ],
+      "payload_summary": {
+        "ok": true,
+        "data_source": "sqlite",
+        "count": 96,
+        "markets_count": 96
+      }
+    },
+    {
+      "name": "markets_price",
+      "command": "markets price poly-bench-000 --json",
+      "warmup_runs": 1,
+      "iterations": 5,
+      "warmup_ms": [
+        779.44
+      ],
+      "samples_ms": [
+        834.16,
+        771.542,
+        774.84,
+        800.159,
+        781.275
+      ],
+      "stats": {
+        "min_ms": 771.542,
+        "max_ms": 834.16,
+        "mean_ms": 792.395,
+        "median_ms": 781.275,
+        "stdev_ms": 25.842
+      },
+      "last_payload_keys": [
+        "market_id",
+        "no_price",
+        "ok",
+        "platform",
+        "timestamp",
+        "volume",
+        "yes_price"
+      ],
+      "payload_summary": {
+        "ok": true,
+        "market_id": "poly-bench-000",
+        "platform": "polymarket",
+        "timestamp": 1772780400,
+        "yes_price": 0.5255,
+        "no_price": 0.4745,
+        "volume": 2835.0
+      }
+    },
+    {
+      "name": "markets_history",
+      "command": "markets history poly-bench-000 --days 7 --json",
+      "warmup_runs": 1,
+      "iterations": 5,
+      "warmup_ms": [
+        787.389
+      ],
+      "samples_ms": [
+        756.991,
+        750.783,
+        753.002,
+        734.236,
+        747.697
+      ],
+      "stats": {
+        "min_ms": 734.236,
+        "max_ms": 756.991,
+        "mean_ms": 748.542,
+        "median_ms": 750.783,
+        "stdev_ms": 8.684
+      },
+      "last_payload_keys": [
+        "days",
+        "history",
+        "market_id",
+        "ok"
+      ],
+      "payload_summary": {
+        "ok": true,
+        "market_id": "poly-bench-000",
+        "days": 7,
+        "history_count": 168
+      }
+    },
+    {
+      "name": "markets_screen",
+      "command": "markets screen --condition current_price > 0.45 --platform polymarket --limit 20 --json",
+      "warmup_runs": 1,
+      "iterations": 5,
+      "warmup_ms": [
+        908.623
+      ],
+      "samples_ms": [
+        901.456,
+        903.09,
+        891.639,
+        907.649,
+        850.281
+      ],
+      "stats": {
+        "min_ms": 850.281,
+        "max_ms": 907.649,
+        "mean_ms": 890.823,
+        "median_ms": 901.456,
+        "stdev_ms": 23.404
+      },
+      "last_payload_keys": [
+        "condition",
+        "count",
+        "data_source",
+        "markets",
+        "ok"
+      ],
+      "payload_summary": {
+        "ok": true,
+        "data_source": "sqlite",
+        "condition": "current_price > 0.45",
+        "count": 20,
+        "markets_count": 20
+      }
+    },
+    {
+      "name": "backtest_run",
+      "command": "backtest C:\\Users\\finnf\\Desktop\\agenttrader-tests\\tests\\fixtures\\sample_strategy.py --from 2024-01-01 --to 2025-12-31 --cash 1000 --json",
+      "warmup_runs": 0,
+      "iterations": 1,
+      "warmup_ms": [],
+      "samples_ms": [
+        413872.803
+      ],
+      "stats": {
+        "min_ms": 413872.803,
+        "max_ms": 413872.803,
+        "mean_ms": 413872.803,
+        "median_ms": 413872.803,
+        "stdev_ms": 0.0
+      },
+      "last_payload_keys": [
+        "artifact_path",
+        "by_category",
+        "data_source",
+        "end_date",
+        "execution_mode",
+        "fidelity",
+        "final_value",
+        "initial_cash",
+        "markets_tested",
+        "max_markets_applied",
+        "metrics",
+        "ok",
+        "resolution_accuracy",
+        "run_id",
+        "start_date",
+        "status",
+        "strategy_path",
+        "warnings"
+      ],
+      "payload_summary": {
+        "ok": true,
+        "strategy_path": "C:\\Users\\finnf\\Desktop\\agenttrader-tests\\tests\\fixtures\\sample_strategy.py",
+        "start_date": "2024-01-01",
+        "end_date": "2025-12-31",
+        "initial_cash": 1000.0,
+        "data_source": "normalized-index",
+        "fidelity": "exact_trade",
+        "max_markets_applied": null,
+        "markets_tested": 221225,
+        "final_value": 1000.0,
+        "metrics": {
+          "total_return_pct": 0.0,
+          "annualized_return_pct": 0.0,
+          "sharpe_ratio": 0.0,
+          "sortino_ratio": 0.0,
+          "max_drawdown_pct": 0.0,
+          "win_rate": null,
+          "profit_factor": null,
+          "calmar_ratio": 0.0,
+          "total_trades": 0,
+          "closed_trades": 0,
+          "open_positions_at_end": 0,
+          "avg_slippage": 0.0
+        },
+        "resolution_accuracy": {
+          "bought_yes_resolved_yes_pct": null,
+          "bought_no_resolved_no_pct": null,
+          "sample_size": null,
+          "note": "No markets resolved in this date range. Use --resolved flag when syncing to increase sample."
+        },
+        "execution_mode": "strict_price_only",
+        "artifact_path": "C:\\Users\\finnf\\Desktop\\agenttrader-tests\\benchmarks\\runtime\\state\\.agenttrader\\backtest_artifacts\\74d4dbf9-3d51-4b8f-9eb4-7bcc788dc2d9.msgpack.gz",
+        "run_id": "74d4dbf9-3d51-4b8f-9eb4-7bcc788dc2d9",
+        "status": "complete"
+      }
+    },
+    {
+      "name": "backtest_list",
+      "command": "backtest list --json",
+      "warmup_runs": 1,
+      "iterations": 5,
+      "warmup_ms": [
+        1067.897
+      ],
+      "samples_ms": [
+        746.535,
+        747.698,
+        760.022,
+        761.101,
+        739.431
+      ],
+      "stats": {
+        "min_ms": 739.431,
+        "max_ms": 761.101,
+        "mean_ms": 750.957,
+        "median_ms": 747.698,
+        "stdev_ms": 9.329
+      },
+      "last_payload_keys": [
+        "ok",
+        "runs"
+      ],
+      "payload_summary": {
+        "ok": true,
+        "runs_count": 1
+      }
+    },
+    {
+      "name": "backtest_show",
+      "command": "backtest show 74d4dbf9-3d51-4b8f-9eb4-7bcc788dc2d9 --json",
+      "warmup_runs": 1,
+      "iterations": 5,
+      "warmup_ms": [
+        753.107
+      ],
+      "samples_ms": [
+        760.286,
+        750.288,
+        759.173,
+        757.061,
+        748.323
+      ],
+      "stats": {
+        "min_ms": 748.323,
+        "max_ms": 760.286,
+        "mean_ms": 755.026,
+        "median_ms": 757.061,
+        "stdev_ms": 5.394
+      },
+      "last_payload_keys": [
+        "artifact_path",
+        "by_category",
+        "data_source",
+        "end_date",
+        "equity_curve",
+        "execution_mode",
+        "fidelity",
+        "final_value",
+        "initial_cash",
+        "markets_tested",
+        "max_markets_applied",
+        "metrics",
+        "ok",
+        "resolution_accuracy",
+        "run_id",
+        "start_date",
+        "status",
+        "strategy_path",
+        "trades",
+        "warnings"
+      ],
+      "payload_summary": {
+        "ok": true,
+        "strategy_path": "C:\\Users\\finnf\\Desktop\\agenttrader-tests\\tests\\fixtures\\sample_strategy.py",
+        "start_date": "2024-01-01",
+        "end_date": "2025-12-31",
+        "initial_cash": 1000.0,
+        "data_source": "normalized-index",
+        "fidelity": "exact_trade",
+        "max_markets_applied": null,
+        "markets_tested": 221225,
+        "final_value": 1000.0,
+        "metrics": {
+          "total_return_pct": 0.0,
+          "annualized_return_pct": 0.0,
+          "sharpe_ratio": 0.0,
+          "sortino_ratio": 0.0,
+          "max_drawdown_pct": 0.0,
+          "win_rate": null,
+          "profit_factor": null,
+          "calmar_ratio": 0.0,
+          "total_trades": 0,
+          "closed_trades": 0,
+          "open_positions_at_end": 0,
+          "avg_slippage": 0.0
+        },
+        "resolution_accuracy": {
+          "bought_yes_resolved_yes_pct": null,
+          "bought_no_resolved_no_pct": null,
+          "sample_size": null,
+          "note": "No markets resolved in this date range. Use --resolved flag when syncing to increase sample."
+        },
+        "execution_mode": "strict_price_only",
+        "artifact_path": "C:\\Users\\finnf\\Desktop\\agenttrader-tests\\benchmarks\\runtime\\state\\.agenttrader\\backtest_artifacts\\74d4dbf9-3d51-4b8f-9eb4-7bcc788dc2d9.msgpack.gz",
+        "run_id": "74d4dbf9-3d51-4b8f-9eb4-7bcc788dc2d9",
+        "status": "complete",
+        "equity_curve_count": 10995,
+        "trades_count": 0
+      }
+    }
+  ]
+}

@@ -1,81 +1,59 @@
-# Integrations
+# External Integrations Map
 
-## External APIs and Market Data Providers
-- Primary live-market integration: PMXT SDK via `agenttrader/data/pmxt_client.py`.
-- PMXT clients instantiated as:
-  - `pmxt.Polymarket()`
-  - `pmxt.Kalshi()`
-  (`agenttrader/data/pmxt_client.py`).
-- Live integration capabilities used by this codebase:
+## Integration Inventory
+| Integration | Type | Direction | Where Wired |
+|---|---|---|---|
+| PMXT SDK + sidecar | External SDK/service bridge | Outbound (market data fetch) | `agenttrader/data/pmxt_client.py`, `agenttrader/cli/sync.py`, `agenttrader/core/paper_daemon.py`, `agenttrader/mcp/server.py` |
+| Polymarket + Kalshi (via PMXT) | External market platforms | Outbound via PMXT abstraction | `agenttrader/data/pmxt_client.py` |
+| Jon Becker historical dataset | External dataset download | Outbound HTTP download + local ingest | `agenttrader/cli/dataset.py`, `agenttrader/data/index_builder.py`, `README.md` |
+| MCP host clients (Claude/Cursor/Codex/etc.) | Protocol integration | Inbound stdio RPC | `agenttrader/cli/main.py`, `agenttrader/mcp/server.py`, `COMMANDS.md` |
+| Local dashboard consumers | Local HTTP API integration | Inbound HTTP on localhost | `agenttrader/cli/dashboard.py`, `agenttrader/dashboard/server.py`, `agenttrader/dashboard/static/app.js` |
+
+## PMXT Integration Details
+- Client wrapper initializes both PMXT backends (`Polymarket`, `Kalshi`) in one adapter: `agenttrader/data/pmxt_client.py`.
+- Live capabilities used:
   - Market discovery/search (`get_markets`, `search_markets`).
-  - OHLCV/candles (`get_candlesticks_with_status` path).
-  - Live orderbook snapshots (`get_live_snapshot`, `get_orderbook_snapshots_with_status`).
-  - Cross-platform matching helpers (`get_matching_markets`).
-- PMXT is treated as the only direct network market API abstraction inside app code (`agenttrader/data/pmxt_client.py`).
-- Architectural rule repeated across modules: avoid direct PMXT imports outside wrapper (`# DO NOT import pmxt here...` header in many `agenttrader/*.py` files).
+  - Live order book snapshots and midpoint pricing.
+  - OHLCV/candlestick history pulls for sync.
+  - Cross-platform market matching helpers.
+- Reliability behavior:
+  - Exponential retry wrapper (`tenacity`) around network-facing calls in `agenttrader/data/pmxt_client.py`.
+  - Sidecar conflict guard (detect duplicate PMXT node sidecars) in `agenttrader/mcp/server.py`.
+- Runtime dependency note:
+  - PMXT path explicitly states Node.js sidecar requirement in `agenttrader/data/pmxt_client.py`.
+  - Install guidance also references `pmxtjs` in `README.md`.
 
-## PMXT Sidecar and Runtime Coupling
-- PMXT requires Node-based sidecar; code explicitly warns about this in `agenttrader/data/pmxt_client.py`.
-- MCP server guards against duplicate PMXT sidecars to prevent token/port mismatch (`agenttrader/mcp/server.py` with `PMXT_SIDECAR_PATH_FRAGMENT` and conflict detection helpers).
-- Guarded MCP tools that rely on PMXT health: `match_markets`, `start_paper_trade`, `sync_data` (`agenttrader/mcp/server.py`).
-- README operational prerequisite includes `npm install -g pmxtjs` (`README.md`).
+## Historical Data Integration
+- Source archive is downloaded from S3 URL in `agenttrader/cli/dataset.py` (`DOWNLOAD_URL`).
+- Download/extract paths:
+  - Uses `aria2c` when present, otherwise Python downloader.
+  - Extracts `.tar.zst` using system `tar+unzstd` or Python `zstandard` fallback.
+- Ingestion pipeline:
+  - Raw parquet folders under configured shared root (`agenttrader/config.py`, `agenttrader/cli/dataset.py`).
+  - Normalization job writes DuckDB index (`agenttrader/data/index_builder.py`).
+  - Runtime readers choose data source by priority (`agenttrader/data/source_selector.py`).
 
-## Data Backends and Persistence Integrations
-- SQLite integration:
-  - Engine/session setup in `agenttrader/db/__init__.py`.
-  - Table models in `agenttrader/db/schema.py`.
-  - Migration application through Alembic in `agenttrader/cli/config.py`.
-- DuckDB integration:
-  - Read-only normalized index access in `agenttrader/data/index_adapter.py`.
-  - Index construction from parquet in `agenttrader/data/index_builder.py`.
-- Parquet dataset integration:
-  - Adapter reads local parquet into DuckDB views in `agenttrader/data/parquet_adapter.py`.
-  - Dataset download/extract/verify commands in `agenttrader/cli/dataset.py`.
-- Source routing integration:
-  - Runtime priority chain `normalized-index -> raw-parquet -> sqlite-cache` in `agenttrader/data/source_selector.py`.
+## MCP Protocol Surface
+- `agenttrader mcp` starts stdio transport server (`agenttrader/cli/main.py`, `agenttrader/mcp/server.py`).
+- Tool contract and argument surface are documented in `COMMANDS.md`.
+- Server includes schema/init and data-source diagnostics (`debug_data_sources`) in `agenttrader/mcp/server.py`.
 
-## External Dataset and Download Endpoints
-- Historical dataset download endpoint hardcoded as `https://s3.jbecker.dev/data.tar.zst` in `agenttrader/cli/dataset.py`.
-- Download path uses:
-  - `aria2c` if available.
-  - Python `urllib.request` fallback.
-  - Extraction via system `tar --use-compress-program=unzstd` or Python `zstandard` fallback.
-- Dataset is treated as external input for backtesting and index build (`agenttrader/cli/dataset.py`, `agenttrader/data/index_builder.py`).
+## Persistence And File-System Boundaries
+- SQLite operational DB (market cache, paper state, backtest runs): `agenttrader/db/schema.py`, `agenttrader/data/cache.py`.
+- Alembic-managed schema migrations executed during init: `agenttrader/cli/config.py`, `alembic/versions/*.py`.
+- File-backed integrations:
+  - Orderbook snapshots as `msgpack.gz`: `agenttrader/data/orderbook_store.py`.
+  - Backtest artifacts as `msgpack.gz`: `agenttrader/data/backtest_artifacts.py`.
+  - Runtime status/log files: `agenttrader/core/paper_daemon.py`, `agenttrader/config.py`.
 
-## Protocol and Server Integrations
-- MCP integration:
-  - Server object and tool registry in `agenttrader/mcp/server.py`.
-  - Stdio transport (`mcp.server.stdio`) in `agenttrader/mcp/server.py`.
-  - CLI bridge command `agenttrader mcp` in `agenttrader/cli/main.py`.
-- Local dashboard API integration:
-  - FastAPI endpoints in `agenttrader/dashboard/server.py`.
-  - Served by Uvicorn from `agenttrader/cli/dashboard.py`.
-  - Static dashboard assets in `agenttrader/dashboard/static/`.
+## Config And Environment Touchpoints
+- Path/environment overrides:
+  - `AGENTTRADER_STATE_DIR`
+  - `AGENTTRADER_DATA_ROOT`
+  - Resolved in `agenttrader/config.py`.
+- Sensitive keys are masked on `config set` output in `agenttrader/cli/config.py`.
 
-## Process and OS-Level Integrations
-- Paper trading daemon spawns detached subprocesses (`agenttrader/core/paper_daemon.py` and `agenttrader/core/paper_daemon_runner.py`).
-- Strategy hot-reload integrates filesystem monitoring via watchdog observer (`agenttrader/core/paper_daemon.py`).
-- Runtime status written to JSON files under runtime dir (`agenttrader/core/paper_daemon.py` helpers `runtime_status_path` / `read_runtime_status`).
-
-## Auth Providers and Secrets
-- No first-party auth provider (no OAuth/OIDC/JWT/session framework integration) is implemented in code under `agenttrader/`.
-- No inbound user auth middleware is configured for FastAPI dashboard routes in `agenttrader/dashboard/server.py`.
-- Secret handling is minimal:
-  - Config display redacts key names like `token`, `password`, `api_key` in `agenttrader/cli/config.py`.
-  - PMXT credential/auth logic is delegated to the external PMXT SDK and sidecar (`agenttrader/data/pmxt_client.py`, `PMXT_API_REFERENCE.md`).
-
-## Webhooks and Callback Surfaces
-- No webhook receiver endpoints are defined (no `/webhook`-style routes in `agenttrader/dashboard/server.py` or `agenttrader/mcp/server.py`).
-- Integration model is pull/poll based:
-  - PMXT polling for live market snapshots in `agenttrader/core/context.py`.
-  - Scheduled sync operations in `agenttrader/cli/sync.py` and MCP `sync_data` in `agenttrader/mcp/server.py`.
-
-## Integration Constraints for User Strategies
-- Strategy code is intentionally prevented from direct external API usage.
-- Validator blocks imports like `requests`, `httpx`, `aiohttp`, `urllib`, and `pmxt` in `agenttrader/cli/validate.py`.
-- Strategy interaction surface is restricted to `BaseStrategy` methods in `agenttrader/core/base_strategy.py`.
-
-## Practical Summary
-- Live external connectivity is concentrated in PMXT integration (`agenttrader/data/pmxt_client.py`).
-- Historical backtesting integration is file/data-lake oriented (S3 dataset -> parquet -> DuckDB index).
-- Operational tool integration surfaces are MCP stdio and local FastAPI dashboard; neither includes built-in user auth.
+## Planning Risks Around Integrations
+- PMXT sidecar duplication can break auth/port pairing; guarded in `agenttrader/mcp/server.py`.
+- Dataset/index availability materially changes backtest behavior and performance (`agenttrader/data/source_selector.py`, `agenttrader/data/index_adapter.py`).
+- Live sync/data quality issues are surfaced as warnings/errors in `agenttrader/cli/sync.py` and `agenttrader/mcp/server.py`.

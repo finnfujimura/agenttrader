@@ -1,62 +1,55 @@
-# Tech Stack
+# Tech Stack Map
 
-## Languages and Runtime
-- Primary language: Python, required as `>=3.12` in `pyproject.toml`.
-- Frontend/dashboard scripting: vanilla JavaScript in `agenttrader/dashboard/static/app.js`.
-- Static markup/styling: HTML/CSS in `agenttrader/dashboard/static/index.html`.
-- Python package build backend: setuptools (`setuptools.build_meta`) in `pyproject.toml`.
-- Runtime split:
-  - Python runtime for CLI/MCP/backtest/paper engine (`agenttrader/cli/main.py`, `agenttrader/mcp/server.py`).
-  - Node runtime indirectly required by PMXT sidecar (see `agenttrader/data/pmxt_client.py` runtime error text and `README.md` install notes).
+## Snapshot
+- Language/runtime: Python package targeting `>=3.12` (`pyproject.toml`).
+- Delivery modes: CLI (`agenttrader`), MCP stdio server, and local HTTP dashboard.
+- Primary domain: prediction-market research, backtesting, and paper trading across Polymarket/Kalshi.
 
-## Application Frameworks and Core Libraries
-- CLI framework: Click (`agenttrader/cli/main.py` and subcommands under `agenttrader/cli/`).
-- MCP framework: `mcp` SDK over stdio transport (`agenttrader/mcp/server.py`).
-- HTTP server framework: FastAPI (`agenttrader/dashboard/server.py`).
-- ASGI server: Uvicorn startup in `agenttrader/cli/dashboard.py`.
-- ORM/data layer: SQLAlchemy models/sessions in `agenttrader/db/schema.py` and `agenttrader/db/__init__.py`.
-- DB migrations: Alembic migration flow in `agenttrader/cli/config.py`, migration files in `alembic/versions/`.
-- Data/analytics engine: DuckDB in `agenttrader/data/index_adapter.py`, `agenttrader/data/parquet_adapter.py`, `agenttrader/data/index_builder.py`.
-- Retry/resilience: Tenacity decorators in `agenttrader/data/pmxt_client.py`.
-- File watching for hot reload: watchdog observer in `agenttrader/core/paper_daemon.py`.
+## Runtime And Packaging
+| Area | Stack | Evidence |
+|---|---|---|
+| Language | Python 3.12+ | `pyproject.toml` |
+| Packaging | `setuptools` + `wheel` | `pyproject.toml` |
+| CLI entrypoint | `click` group + subcommands | `agenttrader/cli/main.py` |
+| Distributable assets | Dashboard static assets + Alembic migration files in package data | `MANIFEST.in`, `pyproject.toml` |
 
-## Declared Dependencies (from `pyproject.toml`)
-- Runtime deps: `pmxt`, `duckdb`, `click`, `zstandard`, `mcp`, `sqlalchemy`, `alembic`, `pyyaml`, `watchdog`, `msgpack`, `tenacity`, `fastapi`, `uvicorn`, `websockets`, `rich`, `numpy`, `pytz`.
-- Dev deps: `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, `mypy`, `pytz`.
-- Notes from code usage:
-  - `websockets` is declared but no direct import found under `agenttrader/` via repository grep.
-  - `numpy`/`rich` are declared; core trading/data paths are mostly standard library + SQLAlchemy + DuckDB + PMXT.
+## Application Layers
+| Layer | Key Modules | Role |
+|---|---|---|
+| CLI | `agenttrader/cli/main.py`, `agenttrader/cli/*.py` | User/agent command surface (`backtest`, `paper`, `sync`, `dataset`, `dashboard`, `mcp`, etc.) |
+| MCP server | `agenttrader/mcp/server.py` | Tool API for MCP clients over stdio |
+| Strategy/runtime core | `agenttrader/core/backtest_engine.py`, `agenttrader/core/context.py`, `agenttrader/core/paper_daemon.py` | Backtest execution, live paper loop, strategy callbacks |
+| Data access/adapters | `agenttrader/data/source_selector.py`, `agenttrader/data/pmxt_client.py`, `agenttrader/data/parquet_adapter.py`, `agenttrader/data/index_adapter.py` | Unified market/history reads from live + historical sources |
+| Persistence | `agenttrader/db/schema.py`, `agenttrader/data/cache.py`, `alembic/versions/*.py` | Operational DB models and migrations |
+| Web dashboard | `agenttrader/dashboard/server.py`, `agenttrader/dashboard/static/index.html`, `agenttrader/dashboard/static/app.js` | Local API + SPA monitoring UI |
 
-## Data and Storage Stack
-- Primary operational DB: SQLite, created with SQLAlchemy engine `sqlite:///...` in `agenttrader/db/__init__.py`.
-- Schema managed by SQLAlchemy declarative models in `agenttrader/db/schema.py`.
-- Schema evolution managed by Alembic revisions in `alembic/versions/0001_initial.py` through `0004_drop_legacy_price_history_constraint.py`.
-- Historical backtest index: DuckDB file at configured `BACKTEST_INDEX_PATH` (`agenttrader/config.py`, `agenttrader/data/index_adapter.py`).
-- Raw historical dataset: parquet files under configured shared data dir (`agenttrader/data/parquet_adapter.py`, `agenttrader/cli/dataset.py`).
-- Orderbook snapshots: gzip+msgpack files in `ORDERBOOK_DIR` handled by `agenttrader/data/orderbook_store.py`.
-- Backtest artifacts: gzip+msgpack files in `ARTIFACTS_DIR` via `agenttrader/data/backtest_artifacts.py`.
+## Core Libraries By Concern
+| Concern | Libraries | Evidence |
+|---|---|---|
+| CLI UX | `click`, `rich` | `agenttrader/cli/*.py`, `pyproject.toml` |
+| MCP protocol | `mcp` | `agenttrader/mcp/server.py`, `pyproject.toml` |
+| Local web API | `fastapi`, `uvicorn` | `agenttrader/dashboard/server.py`, `agenttrader/cli/dashboard.py`, `pyproject.toml` |
+| SQL/ORM | `sqlalchemy`, `alembic` | `agenttrader/db/__init__.py`, `agenttrader/cli/config.py`, `alembic/env.py` |
+| Historical analytics | `duckdb`, `numpy` | `agenttrader/data/index_builder.py`, `agenttrader/data/index_adapter.py`, `agenttrader/core/backtest_engine.py` |
+| Live market connectivity | `pmxt`, retry via `tenacity` | `agenttrader/data/pmxt_client.py`, `pyproject.toml` |
+| File serialization | `msgpack` + `gzip` | `agenttrader/data/orderbook_store.py`, `agenttrader/data/backtest_artifacts.py` |
+| Config | `pyyaml` | `agenttrader/config.py` |
+| File watching/hot reload | `watchdog` | `agenttrader/core/paper_daemon.py` |
+| Dataset extraction | `zstandard` fallback path | `agenttrader/cli/dataset.py` |
 
-## Process and Execution Model
-- Main CLI entrypoint: `agenttrader` console script from `pyproject.toml` pointing to `agenttrader.cli.main:cli`.
-- MCP server launched as `agenttrader mcp` with stdio transport (`agenttrader/cli/main.py`, `agenttrader/mcp/server.py`).
-- Paper trading uses a detached subprocess daemon (`agenttrader/core/paper_daemon.py`, `agenttrader/core/paper_daemon_runner.py`).
-- Paper daemon loop uses asyncio with threaded file watcher trigger for strategy hot reload (`agenttrader/core/paper_daemon.py`).
-- Backtesting supports multiple fidelity/execution modes configured through MCP/CLI tooling (`agenttrader/mcp/server.py`, `COMMANDS.md`).
+## Data Stack
+- Operational store: SQLite DB with WAL mode (`agenttrader/db/__init__.py`), schema in `agenttrader/db/schema.py`.
+- Historical fast path: normalized DuckDB index at configured path (`agenttrader/config.py`, `agenttrader/data/index_adapter.py`).
+- Historical raw fallback: parquet dataset adapter backed by DuckDB views (`agenttrader/data/parquet_adapter.py`).
+- Source priority is explicit: normalized index > raw parquet > SQLite cache (`agenttrader/data/source_selector.py`).
+- Extra persisted artifacts:
+  - Orderbooks in `*.msgpack.gz` (`agenttrader/data/orderbook_store.py`).
+  - Backtest artifact payloads in `*.msgpack.gz` (`agenttrader/data/backtest_artifacts.py`).
 
-## Configuration Surfaces
-- Global/project path resolution and defaults in `agenttrader/config.py`.
-- Environment variable overrides:
-  - `AGENTTRADER_STATE_DIR`
-  - `AGENTTRADER_DATA_ROOT`
-  (resolved in `agenttrader/config.py`).
-- Project-local path override file: `.agenttrader-paths.json` (read/write logic in `agenttrader/config.py` and init flow in `agenttrader/cli/config.py`).
-- User config file: `config.yaml` generated/validated by `agenttrader/config.py`.
-- Alembic runtime config:
-  - Repo-level `alembic.ini` + `alembic/env.py`.
-  - Packaged migration config `agenttrader/db/alembic.ini`.
+## Testing And Quality Tooling
+- Test framework: `pytest`, async tests via `pytest-asyncio`, coverage via `pytest-cov` (`pyproject.toml`, `tests/unit/*.py`, `tests/integration/*.py`).
+- Static analysis/formatting deps: `ruff`, `mypy` (`pyproject.toml`).
 
-## Packaging and Delivery
-- Python package metadata and dependency definitions are centralized in `pyproject.toml`.
-- Published package includes dashboard static assets and DB migration files via `[tool.setuptools.package-data]` in `pyproject.toml`.
-- GitHub Actions publish workflow in `.github/workflows/publish.yml`.
-- Versioning caveat: `pyproject.toml` version (`0.4.1`) differs from `agenttrader/__init__.py` (`0.1.1`), which is relevant for runtime version reporting.
+## Practical Notes For Planning
+- This is a Python-first monorepo with no JS build toolchain; dashboard UI is plain static HTML/JS served by FastAPI (`agenttrader/dashboard/static/*`).
+- Backtest and live paths share core strategy interfaces but operate on different data sources (`agenttrader/core/backtest_engine.py`, `agenttrader/core/paper_daemon.py`).

@@ -1,61 +1,96 @@
-# Architecture
+# Architecture Map
 
-## System Overview
-`agenttrader` is a Python application that exposes the same trading engine through three front doors: CLI, MCP server, and dashboard API.
-The package entrypoint is wired in `pyproject.toml` (`agenttrader = agenttrader.cli.main:cli`).
-Core runtime surfaces are implemented in `agenttrader/cli/main.py`, `agenttrader/mcp/server.py`, and `agenttrader/dashboard/server.py`.
-The strategy contract is a single abstract base class in `agenttrader/core/base_strategy.py`.
+## Scope
+This repository is a Python prediction-market toolkit with three user-facing surfaces:
+- CLI via `agenttrader` script (`agenttrader/cli/main.py`).
+- MCP server for agent clients (`agenttrader/mcp/server.py`).
+- Local dashboard API/UI (`agenttrader/dashboard/server.py` with `agenttrader/dashboard/static/`).
 
-## Primary Entry Points
-- CLI process starts at `agenttrader/cli/main.py`, which registers command groups from `agenttrader/cli/*.py`.
-- MCP stdio server starts from the `mcp` subcommand in `agenttrader/cli/main.py`, then runs `agenttrader/mcp/server.py:main`.
-- Dashboard HTTP process starts in `agenttrader/cli/dashboard.py` and serves `agenttrader/dashboard/server.py`.
-- Paper daemon subprocess starts with `agenttrader/core/paper_daemon_runner.py` and executes `agenttrader/core/paper_daemon.py`.
+Core capabilities are strategy validation, market research, backtesting, and live paper trading.
 
-## Layered Design
-- Surface layer: transport and command adapters in `agenttrader/cli/*`, `agenttrader/mcp/server.py`, `agenttrader/dashboard/server.py`.
-- Orchestration layer: workflow sequencing in `agenttrader/core/backtest_engine.py` and `agenttrader/core/paper_daemon.py`.
-- Strategy boundary layer: runtime API and lifecycle hooks in `agenttrader/core/base_strategy.py` and `agenttrader/core/context.py`.
-- Data-access layer: source adapters and selection in `agenttrader/data/source_selector.py`, `agenttrader/data/index_provider.py`, `agenttrader/data/parquet_adapter.py`, `agenttrader/data/cache.py`, `agenttrader/data/pmxt_client.py`.
-- Persistence layer: SQLAlchemy schema/session utilities in `agenttrader/db/schema.py` and `agenttrader/db/__init__.py`; binary artifacts in `agenttrader/data/orderbook_store.py` and `agenttrader/data/backtest_artifacts.py`.
+## System Layers
 
-## Core Architectural Patterns
-- Dependency inversion by protocol/interface: `agenttrader/data/provider.py` defines a provider contract; callers use provider-shaped objects rather than raw backends.
-- Multi-source routing with fallback: `agenttrader/data/source_selector.py` chooses `normalized-index -> raw-parquet -> sqlite-cache`.
-- Shared strategy API across modes: `ExecutionContext` in `agenttrader/core/context.py` is implemented by `BacktestContext`, `StreamingBacktestContext`, and `LiveContext`.
-- Event-driven strategy execution: engines call `on_start`, `on_market_data`, `on_schedule`, `on_resolution`, `on_stop` from `agenttrader/core/base_strategy.py`.
-- Mode-specific execution model: fill behavior is selected by `ExecutionMode` in `agenttrader/data/models.py` and implemented in `agenttrader/core/price_fill_model.py` or `agenttrader/core/fill_model.py`.
+### 1) Interface Layer
+- CLI command router and command groups: `agenttrader/cli/main.py`.
+- Command handlers:
+  - setup/config: `agenttrader/cli/config.py`
+  - dataset/index lifecycle: `agenttrader/cli/dataset.py`
+  - sync/markets access: `agenttrader/cli/sync.py`, `agenttrader/cli/markets.py`
+  - strategy workflows: `agenttrader/cli/validate.py`, `agenttrader/cli/backtest.py`, `agenttrader/cli/paper.py`
+  - ops/observability: `agenttrader/cli/dashboard.py`, `agenttrader/cli/prune.py`, `agenttrader/cli/experiments.py`
+- MCP API surface and tool contract: `agenttrader/mcp/server.py`.
+- Dashboard HTTP API + static SPA serving: `agenttrader/dashboard/server.py`.
 
-## Backtest Flow (CLI + MCP)
-1. Input strategy file is validated in `agenttrader/cli/validate.py`.
-2. Run metadata is persisted in `backtest_runs` via `agenttrader/db/schema.py` and `agenttrader/data/cache.py`.
-3. `BacktestEngine` in `agenttrader/core/backtest_engine.py` prefers DuckDB index (`agenttrader/data/index_adapter.py`) and falls back when needed.
-4. Strategy receives market events through `StreamingBacktestContext` or `BacktestContext` in `agenttrader/core/context.py`.
-5. Metrics are computed in `agenttrader/core/backtest_engine.py` and large outputs are written by `agenttrader/data/backtest_artifacts.py`.
-6. MCP path in `agenttrader/mcp/server.py` wraps the same engine and stores progress snapshots in `backtest_runs.results_json`.
+### 2) Strategy Runtime Layer
+- Strategy contract (`BaseStrategy`) exposed to user strategy files: `agenttrader/core/base_strategy.py`.
+- Execution contexts:
+  - historical backtest context: `BacktestContext` in `agenttrader/core/context.py`
+  - streaming backtest context: `StreamingBacktestContext` in `agenttrader/core/context.py`
+  - live paper context: `LiveContext` in `agenttrader/core/context.py`
+- Backtest orchestration engine (streaming index-first with fallback): `agenttrader/core/backtest_engine.py`.
+- Live daemon lifecycle + hot reload: `agenttrader/core/paper_daemon.py` and runner `agenttrader/core/paper_daemon_runner.py`.
+- Fill semantics:
+  - orderbook-based model: `agenttrader/core/fill_model.py`
+  - strict price-only model: `agenttrader/core/price_fill_model.py`
 
-## Paper Trading Flow
-1. Start request creates portfolio row (`paper_portfolios`) through `agenttrader/cli/paper.py` or `agenttrader/mcp/server.py`.
-2. Detached daemon process is spawned by `agenttrader/core/paper_daemon.py:start_as_daemon`.
-3. Daemon builds a `LiveContext` from `agenttrader/core/context.py` using `DataCache`, `OrderBookStore`, and `PmxtClient`.
-4. Live polling and orderbook retrieval come from `agenttrader/data/pmxt_client.py`.
-5. Orders update `trades`, `positions`, and cash balance via SQL writes in `agenttrader/core/context.py`.
-6. Runtime heartbeat/status is written to `RUNTIME_DIR` JSON files via `agenttrader/core/paper_daemon.py`.
+### 3) Data Access Layer
+- Source selection and priority caching: `agenttrader/data/source_selector.py`.
+- Provider protocol: `agenttrader/data/provider.py`.
+- Backends:
+  - normalized index + parquet metadata provider: `agenttrader/data/index_provider.py`
+  - raw parquet adapter (DuckDB views): `agenttrader/data/parquet_adapter.py`
+  - SQLite cache provider: `agenttrader/data/cache.py`, `agenttrader/data/cache_provider.py`
+  - PMXT live API client: `agenttrader/data/pmxt_client.py`
+  - historical orderbook file store: `agenttrader/data/orderbook_store.py`
+  - backtest index reader/writer: `agenttrader/data/index_adapter.py`, `agenttrader/data/index_builder.py`
+  - large result artifact storage: `agenttrader/data/backtest_artifacts.py`
 
-## Data Ingestion and Normalization Flow
-1. Historical dataset download/extract is handled by `agenttrader/cli/dataset.py`.
-2. Normalized DuckDB index is built in `agenttrader/data/index_builder.py` into `BACKTEST_INDEX_PATH`.
-3. Live sync pulls PMXT candles/orderbooks in `agenttrader/cli/sync.py` or MCP `sync_data` in `agenttrader/mcp/server.py`.
-4. Candles are normalized and repaired before cache persistence in `agenttrader/mcp/server.py` helper functions.
-5. Orderbooks are compressed by day and written to filesystem via `agenttrader/data/orderbook_store.py`.
+### 4) Persistence and Configuration Layer
+- Path/config resolution and app layout: `agenttrader/config.py`.
+- DB engine/session setup: `agenttrader/db/__init__.py`.
+- ORM schema: `agenttrader/db/schema.py`.
+- Schema health checks: `agenttrader/db/health.py`.
+- Migrations:
+  - package migrations used by init: `agenttrader/db/migrations/versions/`
+  - top-level Alembic tree also present: `alembic/versions/`
 
-## State and Configuration Boundaries
-- Filesystem/data roots are centrally resolved in `agenttrader/config.py`.
-- DB schema lifecycle is migration-driven from `agenttrader/cli/config.py` using packaged Alembic config in `agenttrader/db/alembic.ini` and migrations in `agenttrader/db/migrations/versions`.
-- Runtime schema checks are enforced in `agenttrader/db/health.py` before server startup in `agenttrader/mcp/server.py`.
+## Primary Runtime Flows
 
-## Cross-Cutting Concerns
-- Structured error model is centralized in `agenttrader/errors.py` and surfaced uniformly by CLI wrappers in `agenttrader/cli/utils.py` and MCP payload builders in `agenttrader/mcp/server.py`.
-- Performance telemetry is emitted to JSONL by `agenttrader/perf_logging.py` from both CLI and MCP call sites.
-- PMXT sidecar conflict detection and safety guards are enforced in `agenttrader/mcp/server.py` before guarded operations.
+### Backtest Flow
+1. Strategy file is validated (`agenttrader/cli/validate.py`).
+2. Run metadata row is inserted into `backtest_runs` (`agenttrader/cli/backtest.py` + `agenttrader/db/schema.py`).
+3. `BacktestEngine` executes with index-first strategy:
+   - tries normalized index stream (`agenttrader/data/index_adapter.py`)
+   - falls back to legacy parquet/cache mode if needed.
+4. Metrics are written to DB; full curve/trades are moved to compressed artifact file via `agenttrader/data/backtest_artifacts.py`.
 
+### Paper Trading Flow
+1. `paper start` writes a `paper_portfolios` row (`agenttrader/cli/paper.py`).
+2. Detached daemon process launches (`agenttrader/core/paper_daemon.py`).
+3. `LiveContext` subscribes markets, polls PMXT live snapshots, persists selective data to SQLite/orderbook store (`agenttrader/core/context.py` + `agenttrader/data/cache.py` + `agenttrader/data/orderbook_store.py`).
+4. Orders are simulated/filled and persisted to `positions`/`trades`.
+5. Runtime heartbeat/status is written to `runtime` JSON files for status and MCP reads.
+
+### MCP Tooling Flow
+1. Tool registry and schema live in `agenttrader/mcp/server.py`.
+2. Tool handlers reuse the same core modules as CLI (validation, backtest engine, cache/providers, daemon lifecycle).
+3. Output contracts enforce structured `{ok, error, message, fix}` payload conventions for agent clients.
+
+## Data Source Strategy (Important for Planning)
+- Priority order is explicit: `normalized-index` -> `raw-parquet` -> `sqlite-cache` (`agenttrader/data/source_selector.py`).
+- Implication: features should usually be implemented against provider interfaces and context methods, not against one backend directly.
+- Backtest and research behavior can differ based on which source is available; this is a recurring testing concern.
+
+## Guardrails and Cross-Cutting Concerns
+- Strategy safety constraints are AST-enforced (forbidden imports, required `BaseStrategy` shape): `agenttrader/cli/validate.py`.
+- Execution mode policy is centralized in `ExecutionMode` and context/fill-model branches:
+  - `strict_price_only`
+  - `observed_orderbook`
+  - `synthetic_execution_model`
+  (`agenttrader/data/models.py`, `agenttrader/core/context.py`, `agenttrader/core/backtest_engine.py`).
+- Operational telemetry is centralized in JSONL perf logs: `agenttrader/perf_logging.py`.
+- Shared error model for CLI/MCP surfaces: `agenttrader/errors.py`, `agenttrader/cli/utils.py`, `agenttrader/mcp/server.py`.
+
+## Architecture Notes for Future Work
+- The repository includes both top-level `alembic/` and package-local `agenttrader/db/migrations/`; `init` currently uses the package-local tree.
+- Most feature work should touch interface + core + data layers together; test updates typically span both `tests/unit/` and `tests/integration/`.

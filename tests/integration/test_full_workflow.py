@@ -9,6 +9,7 @@ import pytest
 
 
 AGENTTRADER_CLI = f"{sys.executable} -m agenttrader.cli.main"
+pytestmark = pytest.mark.live
 
 
 def run(cmd: str) -> dict:
